@@ -496,19 +496,19 @@ bool N64Recomp::discover_function_bounds(
                     // jr $ra — return.
                     break;
                 }
-                // jr <other reg> — jump table OR computed tail call.
+                // jr <other reg> -- jump table OR computed tail call.
                 // analyze_instruction recorded a JumpTable entry in
                 // local_stats if the lui+addiu+addu+lw pattern lined
                 // up. If we have one, read its entries from body
                 // bytes and add to BFS worklist.
                 if (local_stats.jump_tables.empty()) {
-                    error_out = fmt::format(
-                        "indirect jr at offset 0x{:X} (vram 0x{:08X}) — "
-                        "register-state simulator did NOT detect a "
-                        "jump-table pattern. May be a tail call or "
-                        "an analysis gap. Cannot bound this function.",
-                        cursor, vram_base + uint32_t(cursor));
-                    return false;
+                    // A computed jump that is not a recognized jump table is
+                    // a terminal transfer for sizing purposes. The emitter
+                    // still compiles the instruction as an indirect tail call,
+                    // so this is not stubbing behavior; it only prevents a
+                    // tiny synthetic handler from absorbing every byte until
+                    // the next ELF symbol.
+                    break;
                 }
                 // The most recently appended jump table corresponds to
                 // this jr. Read its entries from the body bytes.

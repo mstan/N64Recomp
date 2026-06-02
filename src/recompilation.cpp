@@ -22,7 +22,7 @@ enum class JalResolutionResult {
     Error
 };
 
-JalResolutionResult resolve_jal(const N64Recomp::Context& context, size_t cur_section_index, uint32_t target_func_vram, size_t& matched_function_index) {
+JalResolutionResult resolve_jal(const N64Recomp::Context& context, size_t cur_section_index, uint32_t target_func_vram, size_t& matched_function_index, size_t& static_section_index) {
     // Skip resolution if all function calls should use lookup and just return Ambiguous.
     if (context.use_lookup_for_all_function_calls) {
         return JalResolutionResult::Ambiguous;
@@ -35,6 +35,7 @@ JalResolutionResult resolve_jal(const N64Recomp::Context& context, size_t cur_se
     uint32_t section_vram_end = cur_section.ram_addr + cur_section.size;
     bool in_current_section = target_func_vram >= section_vram_start && target_func_vram < section_vram_end;
     bool exact_match_found = false;
+    static_section_index = cur_section_index;
 
     // Use a thread local to prevent reallocation across runs and to allow multi-threading in the future.
     thread_local std::vector<size_t> matched_funcs{};
@@ -82,9 +83,41 @@ JalResolutionResult resolve_jal(const N64Recomp::Context& context, size_t cur_se
     }
     // Otherwise, disambiguate based on the matches found.
     else {
-        // If there were no matches then JAL resolution has failed.
-        // A static can't be created as the target section is unknown.
+        // If there were no symbol matches, try to create a static function
+        // in the unique section that contains the target. This catches direct
+        // JALs from overlays into code that only has linker-script symbols,
+        // such as libultra helpers that live outside the caller's section.
         if (matched_funcs.size() == 0) {
+            size_t containing_section = (size_t)-1;
+            for (size_t section_index = 0; section_index < context.sections.size(); section_index++) {
+                const auto& candidate_section = context.sections[section_index];
+                const uint32_t section_start = candidate_section.ram_addr;
+                const uint32_t section_end = section_start + candidate_section.size;
+                if (target_func_vram >= section_start && target_func_vram < section_end) {
+                    if (containing_section != (size_t)-1) {
+                        return JalResolutionResult::Ambiguous;
+                    }
+                    containing_section = section_index;
+                }
+            }
+
+            if (containing_section != (size_t)-1) {
+                for (size_t target_func_index = 0; target_func_index < context.functions.size(); target_func_index++) {
+                    const auto& target_func = context.functions[target_func_index];
+                    if (target_func.vram == target_func_vram &&
+                        target_func.section_index == containing_section &&
+                        (!target_func.words.empty() ||
+                         target_func.reimplemented ||
+                         N64Recomp::is_manual_patch_symbol(target_func.vram))) {
+                        matched_function_index = target_func_index;
+                        return JalResolutionResult::Match;
+                    }
+                }
+
+                static_section_index = containing_section;
+                return JalResolutionResult::CreateStatic;
+            }
+
             return JalResolutionResult::NoMatch;
         }
         // If there was an exact match, use it.
@@ -102,6 +135,132 @@ JalResolutionResult resolve_jal(const N64Recomp::Context& context, size_t cur_se
     return JalResolutionResult::Error;
 }
 
+bool discover_static_code_entrypoint(
+    const N64Recomp::Context& context,
+    size_t section_index,
+    uint32_t target_vram) {
+    if (section_index >= context.sections.size()) {
+        return false;
+    }
+
+    const auto& section = context.sections[section_index];
+    if (!section.executable || (target_vram & 3u) != 0) {
+        return false;
+    }
+
+    const uint32_t section_start = section.ram_addr;
+    const uint32_t section_end = section_start + section.size;
+    if (target_vram < section_start || target_vram >= section_end) {
+        return false;
+    }
+
+    if (uint64_t(section.rom_addr) + uint64_t(section.size) > context.rom.size()) {
+        return false;
+    }
+
+    size_t discovered_size = 0;
+    std::string discover_error;
+    if (!N64Recomp::discover_function_bounds(
+            context.rom.data() + section.rom_addr,
+            section.size,
+            section.ram_addr,
+            target_vram - section.ram_addr,
+            discovered_size,
+            discover_error)) {
+        return false;
+    }
+
+    return discovered_size != 0;
+}
+
+bool section_has_backing_rom(const N64Recomp::Context& context, size_t section_index) {
+    if (section_index >= context.sections.size()) {
+        return false;
+    }
+
+    const auto& section = context.sections[section_index];
+    return section.rom_addr < 0xF0000000u &&
+        uint64_t(section.rom_addr) + uint64_t(section.size) <= context.rom.size();
+}
+
+bool static_entry_requested(
+    std::span<std::vector<uint32_t>> static_funcs_out,
+    size_t section_index,
+    uint32_t target_vram) {
+    if (section_index >= static_funcs_out.size()) {
+        return false;
+    }
+
+    for (uint32_t static_vram : static_funcs_out[section_index]) {
+        if (static_vram == target_vram) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool function_can_be_called_by_name(const N64Recomp::Function& func) {
+    return func.reimplemented ||
+        (!func.ignored && (!func.words.empty() || N64Recomp::is_manual_patch_symbol(func.vram)));
+}
+
+size_t find_callable_function_in_section(
+    const N64Recomp::Context& context,
+    uint32_t target_vram,
+    size_t section_index) {
+    auto find_it = context.functions_by_vram.find(target_vram);
+    if (find_it == context.functions_by_vram.end()) {
+        return (size_t)-1;
+    }
+
+    for (size_t function_index : find_it->second) {
+        const auto& candidate = context.functions[function_index];
+        if (candidate.section_index == section_index && function_can_be_called_by_name(candidate)) {
+            return function_index;
+        }
+    }
+
+    return (size_t)-1;
+}
+
+bool control_instruction_allows_fallthrough(const rabbitizer::InstructionCpu& instr) {
+    using InstrId = rabbitizer::InstrId::UniqueId;
+    const auto id = instr.getUniqueId();
+
+    switch (id) {
+    case InstrId::cpu_j:
+    case InstrId::cpu_b:
+    case InstrId::cpu_jr:
+    case InstrId::cpu_syscall:
+    case InstrId::cpu_break:
+        return false;
+    case InstrId::cpu_jalr:
+        return int(instr.GetO32_rd()) == int(rabbitizer::Registers::Cpu::GprO32::GPR_O32_ra);
+    default:
+        return true;
+    }
+}
+
+bool function_end_allows_fallthrough(const std::vector<rabbitizer::InstructionCpu>& instructions) {
+    if (instructions.empty()) {
+        return false;
+    }
+
+    const auto& last = instructions.back();
+    if (instructions.size() >= 2) {
+        const auto& previous = instructions[instructions.size() - 2];
+        if (previous.isBranch() || previous.isJump()) {
+            return control_instruction_allows_fallthrough(previous);
+        }
+    }
+
+    if (last.isBranch() || last.isJump()) {
+        return control_instruction_allows_fallthrough(last);
+    }
+
+    return control_instruction_allows_fallthrough(last);
+}
+
 using InstrId = rabbitizer::InstrId::UniqueId;
 using Cop0Reg = rabbitizer::Registers::Cpu::Cop0;
 
@@ -113,7 +272,7 @@ std::string_view ctx_gpr_prefix(int reg) {
 }
 
 template <typename GeneratorType>
-bool process_instruction(GeneratorType& generator, const N64Recomp::Context& context, const N64Recomp::Function& func, size_t func_index, const N64Recomp::FunctionStats& stats, const std::unordered_set<uint32_t>& jtbl_lw_instructions, size_t instr_index, const std::vector<rabbitizer::InstructionCpu>& instructions, std::ostream& output_file, bool indent, bool emit_link_branch, int link_branch_index, size_t reloc_index, bool& needs_link_branch, bool& is_branch_likely, bool tag_reference_relocs, std::span<std::vector<uint32_t>> static_funcs_out) {
+bool process_instruction(GeneratorType& generator, const N64Recomp::Context& context, const N64Recomp::Function& func, size_t func_index, const N64Recomp::FunctionStats& stats, const std::unordered_set<uint32_t>& jtbl_lw_instructions, const std::set<uint32_t>& branch_labels, size_t instr_index, const std::vector<rabbitizer::InstructionCpu>& instructions, std::ostream& output_file, bool indent, bool emit_link_branch, int link_branch_index, size_t reloc_index, bool& needs_link_branch, bool& is_branch_likely, bool tag_reference_relocs, std::span<std::vector<uint32_t>> static_funcs_out) {
     using namespace N64Recomp;
 
     const auto& section = context.sections[func.section_index];
@@ -323,7 +482,7 @@ bool process_instruction(GeneratorType& generator, const N64Recomp::Context& con
             if (reloc_index + 1 < section.relocs.size() && next_vram > section.relocs[reloc_index].address) {
                 next_reloc_index++;
             }
-            if (!process_instruction(generator, context, func, func_index, stats, jtbl_lw_instructions, instr_index + 1, instructions, output_file, use_indent, false, link_branch_index, next_reloc_index, dummy_needs_link_branch, dummy_is_branch_likely, tag_reference_relocs, static_funcs_out)) {
+            if (!process_instruction(generator, context, func, func_index, stats, jtbl_lw_instructions, branch_labels, instr_index + 1, instructions, output_file, use_indent, false, link_branch_index, next_reloc_index, dummy_needs_link_branch, dummy_is_branch_likely, tag_reference_relocs, static_funcs_out)) {
                 return false;
             }
         }
@@ -338,11 +497,71 @@ bool process_instruction(GeneratorType& generator, const N64Recomp::Context& con
     };
 
     auto print_return_with_delay_slot = [&]() {
+        const std::string jr_target_var = fmt::format("jr_target_{:08X}", instr_vram);
+        print_indent();
+        fmt::print(output_file, "{{\n");
+        print_indent();
+        fmt::print(output_file, "gpr {} = ctx->r31;\n", jr_target_var);
         if (!process_delay_slot(false)) {
             return false;
         }
+        bool emitted_local_dispatch = false;
+        const std::string jr_target_vram_var = fmt::format("jr_target_vram_{:08X}", instr_vram);
+        print_indent();
+        fmt::print(output_file, "uint32_t {} = U32({});\n", jr_target_vram_var, jr_target_var);
+        print_indent();
+        fmt::print(output_file, "{{\n");
+        print_indent();
+        fmt::print(output_file, "uint32_t jr_section_base = (uint32_t)section_addresses[{}];\n", func.section_index);
+        print_indent();
+        fmt::print(output_file,
+            "uint32_t jr_section_offset = {} - jr_section_base;\n",
+            jr_target_vram_var);
+        print_indent();
+        fmt::print(output_file,
+            "if (jr_section_base != 0x{:08X}u && jr_section_offset < 0x{:08X}u) {{\n",
+            section.ram_addr, section.size);
+        print_indent();
+        fmt::print(output_file,
+            "{} = 0x{:08X}u + jr_section_offset;\n",
+            jr_target_vram_var, section.ram_addr);
+        print_indent();
+        fmt::print(output_file, "}}\n");
+        print_indent();
+        fmt::print(output_file, "}}\n");
+        for (uint32_t label_vram : branch_labels) {
+            if (label_vram >= func.vram && label_vram < func_vram_end) {
+                if (!emitted_local_dispatch) {
+                    print_indent();
+                    fmt::print(output_file, "switch ({}) {{\n", jr_target_vram_var);
+                    emitted_local_dispatch = true;
+                }
+                print_indent();
+                fmt::print(output_file, "case 0x{:08X}u: goto L_{:08X};\n", label_vram, label_vram);
+            }
+        }
+        if (emitted_local_dispatch) {
+            print_indent();
+            fmt::print(output_file, "default: break;\n");
+            print_indent();
+            fmt::print(output_file, "}}\n");
+        }
+        print_indent();
+        fmt::print(output_file, "if ({} != ctx->host_return_target) {{\n", jr_target_vram_var);
+        print_indent();
+        fmt::print(output_file, "    recomp_request_tailcall(ctx, (gpr)(int32_t){});\n", jr_target_vram_var);
+        if (context.trace_mode) {
+            print_indent();
+            fmt::print(output_file, "    TRACE_RETURN()\n");
+        }
+        print_indent();
+        fmt::print(output_file, "    return;\n");
+        print_indent();
+        fmt::print(output_file, "}}\n");
         print_indent();
         generator.emit_return(context, func_index);
+        print_indent();
+        fmt::print(output_file, "}}\n");
         print_link_branch();
         return true;
     };
@@ -364,6 +583,53 @@ bool process_instruction(GeneratorType& generator, const N64Recomp::Context& con
         print_indent();
         generator.emit_function_call_by_register(reg);
         print_link_branch();
+        return true;
+    };
+
+    auto gpr_expr = [](int reg) {
+        return reg == 0 ? std::string{"0"} : fmt::format("ctx->r{}", reg);
+    };
+
+    auto print_trace_return = [&]() {
+        if (context.trace_mode) {
+            print_indent();
+            fmt::print(output_file, "TRACE_RETURN()\n");
+        }
+    };
+
+    auto print_tailcall_by_register = [&](int reg) {
+        if (!process_delay_slot(false)) {
+            return false;
+        }
+        print_indent();
+        fmt::print(output_file, "recomp_request_tailcall(ctx, (gpr)(int32_t){});\n", gpr_expr(reg));
+        print_trace_return();
+        print_indent();
+        fmt::print(output_file, "return;\n");
+        return true;
+    };
+
+    auto print_tailcall_by_address = [&](uint32_t target_vram) {
+        if (!process_delay_slot(false)) {
+            return false;
+        }
+        print_indent();
+        fmt::print(output_file, "recomp_request_tailcall(ctx, (gpr)(int32_t)0x{:08X}u);\n", target_vram);
+        print_trace_return();
+        print_indent();
+        fmt::print(output_file, "return;\n");
+        return true;
+    };
+
+    auto print_tailcall_by_function = [&](const std::string& target_name) {
+        if (!process_delay_slot(false)) {
+            return false;
+        }
+        print_indent();
+        fmt::print(output_file, "recomp_request_tailcall_func(ctx, {});\n", target_name);
+        print_trace_return();
+        print_indent();
+        fmt::print(output_file, "return;\n");
         return true;
     };
 
@@ -417,7 +683,8 @@ bool process_instruction(GeneratorType& generator, const N64Recomp::Context& con
                 if (has_reloc && reloc_section < context.sections.size()) {
                     target_section = reloc_section;
                 }
-                JalResolutionResult jal_result = resolve_jal(context, target_section, target_func_vram, matched_func_index);
+                size_t static_section_index = target_section;
+                JalResolutionResult jal_result = resolve_jal(context, target_section, target_func_vram, matched_func_index, static_section_index);
 
                 switch (jal_result) {
                     case JalResolutionResult::NoMatch:
@@ -440,8 +707,8 @@ bool process_instruction(GeneratorType& generator, const N64Recomp::Context& con
                         break;
                     case JalResolutionResult::CreateStatic:
                         // Create a static function add it to the static function list for this section.
-                        jal_target_name = fmt::format("static_{}_{:08X}", func.section_index, target_func_vram);
-                        static_funcs_out[func.section_index].push_back(target_func_vram);
+                        jal_target_name = fmt::format("static_{}_{:08X}", static_section_index, target_func_vram);
+                        static_funcs_out[static_section_index].push_back(target_func_vram);
                         call_by_name = true;
                         break;
                     case JalResolutionResult::Ambiguous:
@@ -487,18 +754,62 @@ bool process_instruction(GeneratorType& generator, const N64Recomp::Context& con
     auto print_branch = [&](uint32_t branch_target) {
         // If the branch target is outside the current function, check if it can be treated as a tail call.
         if (branch_target < func.vram || branch_target >= func_vram_end) {
-            // If the branch target is the start of some known function, this can be handled as a tail call.
-            // FIXME: how to deal with static functions?
-            if (context.functions_by_vram.find(branch_target) != context.functions_by_vram.end()) {
-                fmt::print("Tail call in {} to 0x{:08X}\n", func.name, branch_target);
-                if (!print_func_call_by_address(branch_target, true, true)) {
-                    return false;
+            size_t matched_func_index = (size_t)-1;
+            size_t static_section_index = func.section_index;
+            JalResolutionResult branch_result = resolve_jal(
+                context, func.section_index, branch_target,
+                matched_func_index, static_section_index);
+            bool target_contained_in_function = false;
+            if (static_section_index < context.section_functions.size()) {
+                for (size_t target_func_index : context.section_functions[static_section_index]) {
+                    const auto& target_func = context.functions[target_func_index];
+                    if (target_func.words.empty()) {
+                        continue;
+                    }
+
+                    uint32_t target_func_end = target_func.vram + uint32_t(target_func.words.size() * sizeof(target_func.words[0]));
+                    if (branch_target > target_func.vram && branch_target < target_func_end) {
+                        target_contained_in_function = true;
+                        break;
+                    }
                 }
-                print_indent();
-                generator.emit_return(context, func_index);
-                // TODO check if this branch close should exist.
-                // print_indent();
-                // generator.emit_branch_close();
+            }
+            const bool can_create_static_branch =
+                branch_result == JalResolutionResult::CreateStatic &&
+                static_section_index < context.sections.size() &&
+                section_has_backing_rom(context, static_section_index) &&
+                (target_contained_in_function ||
+                 static_entry_requested(static_funcs_out, static_section_index, branch_target) ||
+                 (context.sections[static_section_index].relocatable &&
+                  discover_static_code_entrypoint(context, static_section_index, branch_target)));
+            if (branch_result == JalResolutionResult::Match ||
+                can_create_static_branch ||
+                branch_result == JalResolutionResult::Ambiguous) {
+                const char* resolution_name =
+                    branch_result == JalResolutionResult::Match ? "function" :
+                    (branch_result == JalResolutionResult::CreateStatic ? "static continuation" : "function lookup");
+                fmt::print(
+                    "[Info] Tail branch in {} to 0x{:08X} resolved through {}\n",
+                    func.name,
+                    branch_target,
+                    resolution_name);
+                if (branch_result == JalResolutionResult::Match) {
+                    if (!print_tailcall_by_function(context.functions[matched_func_index].name)) {
+                        return false;
+                    }
+                }
+                else if (can_create_static_branch) {
+                    std::string static_target_name = fmt::format("static_{}_{:08X}", static_section_index, branch_target);
+                    static_funcs_out[static_section_index].push_back(branch_target);
+                    if (!print_tailcall_by_function(static_target_name)) {
+                        return false;
+                    }
+                }
+                else {
+                    if (!print_tailcall_by_address(branch_target)) {
+                        return false;
+                    }
+                }
                 return true;
             }
 
@@ -521,6 +832,20 @@ bool process_instruction(GeneratorType& generator, const N64Recomp::Context& con
 
         if (!process_delay_slot(true)) {
             return false;
+        }
+
+        // Voluntary-preemption checkpoint on loop back-edges. A tight
+        // intra-function loop (branch target at or before this branch)
+        // never re-enters a function, so the function-entry TRACE_ENTRY
+        // tick never fires inside it — the thread can spin forever and
+        // starve the cooperative scheduler (e.g. Pokemon Stadium's GB
+        // Tower osGbpakInit power-up busy-wait). Emit the consumer-defined
+        // TRACE_LOOP() hook here so each back-edge is a yield point.
+        // Gated by trace_mode to mirror TRACE_ENTRY's emission.
+        if (context.trace_mode && branch_target <= instr_vram) {
+            print_indent();
+            print_indent();
+            fmt::print(output_file, "TRACE_LOOP()\n");
         }
 
         print_indent();
@@ -663,27 +988,60 @@ bool process_instruction(GeneratorType& generator, const N64Recomp::Context& con
         // from $ra (e.g. Stadium audio synth's `addiu $t3, $ra, OFFSET`
         // PC-arithmetic trick).
         print_indent();
-        fmt::print(output_file, "ctx->r31 = 0x{:08X}u;\n", instr_vram + 8);
-        if (!print_func_call_by_address(instr.getBranchVramGeneric())) {
-            return false;
+        {
+            uint32_t link_target = instr_vram + 8;
+            fmt::print(output_file, "ctx->r31 = 0x{:08X}u;\n", link_target);
+
+            uint64_t section_start = section.ram_addr;
+            uint64_t section_end = section_start + section.size;
+            if (link_target >= section_start && link_target < section_end) {
+                static_funcs_out[func.section_index].push_back(link_target);
+            }
+        }
+        {
+            const uint32_t branch_target = instr.getBranchVramGeneric();
+            if (branch_target >= func.vram && branch_target < func_vram_end) {
+                if (!print_goto_with_delay_slot(fmt::format("L_{:08X}", branch_target))) {
+                    return false;
+                }
+            }
+            else if (!print_func_call_by_address(branch_target)) {
+                return false;
+            }
         }
         break;
     case InstrId::cpu_jalr:
-        // jalr can only be handled with $ra as the return address register
         if (rd != (int)rabbitizer::Registers::Cpu::GprO32::GPR_O32_ra) {
-            // Engine doesn't model jalr with non-RA link register. Emit a
-            // runtime call instead of failing — the function still
-            // compiles; runtime aborts loudly if this jalr is reached.
-            // Per project principles: not a stub, an unimplementable
-            // hole surfaced at runtime with full context.
-            fmt::print(stderr, "[Warn] Invalid return address reg for jalr: r{} in {} at 0x{:08X} — emitting runtime abort\n", rd, func.name, instr_vram);
-            print_indent();
-            fmt::print(output_file, "recomp_unhandled_jalr(rdram, ctx, 0x{:08X}u, ctx->r{}, {});\n", instr_vram, (int)rs, rd);
+            uint32_t link_target = instr_vram + 8;
+
+            if (rd != 0) {
+                print_indent();
+                fmt::print(output_file, "ctx->r{} = 0x{:08X}u;\n", rd, link_target);
+
+                uint64_t section_start = section.ram_addr;
+                uint64_t section_end = section_start + section.size;
+                if (link_target >= section_start && link_target < section_end) {
+                    static_funcs_out[func.section_index].push_back(link_target);
+                }
+            }
+
+            if (!print_tailcall_by_register(rs)) {
+                return false;
+            }
             break;
         }
         // MIPS link side-effect: $ra := PC+8 (see cpu_jal comment).
         print_indent();
-        fmt::print(output_file, "ctx->r31 = 0x{:08X}u;\n", instr_vram + 8);
+        {
+            uint32_t link_target = instr_vram + 8;
+            fmt::print(output_file, "ctx->r31 = 0x{:08X}u;\n", link_target);
+
+            uint64_t section_start = section.ram_addr;
+            uint64_t section_end = section_start + section.size;
+            if (link_target >= section_start && link_target < section_end) {
+                static_funcs_out[func.section_index].push_back(link_target);
+            }
+        }
         needs_link_branch = true;
         print_func_call_by_register(rs);
         break;
@@ -695,44 +1053,10 @@ bool process_instruction(GeneratorType& generator, const N64Recomp::Context& con
                 print_indent();
                 generator.emit_pause_self();
             }
-            // Check if the branch is within this function
-            else if (branch_target >= func.vram && branch_target < func_vram_end) {
-                print_goto_with_delay_slot(fmt::format("L_{:08X}", branch_target));
-            }
-            // This may be a tail call in the middle of the control flow due to a previous check
-            // For example:
-            // ```c
-            // void test() {
-            //     if (SOME_CONDITION) {
-            //         do_a();
-            //     } else {
-            //         do_b();
-            //     }
-            // }
-            // ```
-            // FIXME: how to deal with static functions?
-            else if (context.functions_by_vram.find(branch_target) != context.functions_by_vram.end()) {
-                fmt::print("[Info] Tail call in {} to 0x{:08X}\n", func.name, branch_target);
-                if (!print_func_call_by_address(branch_target, true)) {
+            else {
+                if (!print_branch(branch_target)) {
                     return false;
                 }
-                print_indent();
-                generator.emit_return(context, func_index);
-            }
-            else {
-                // Branch to an address the engine can't resolve (not in
-                // functions_by_vram, not a label inside this function).
-                // Emit a runtime abort with diagnostic info instead of
-                // failing the whole recompile. The branch transfers
-                // control, so we follow with a return so the C compiler
-                // doesn't fall through into the next instruction's emit.
-                // Per project principles: no stub, no simulated behavior;
-                // the unhandled branch surfaces at runtime if reached.
-                fmt::print(stderr, "[Warn] Unhandled branch in {} at 0x{:08X} to 0x{:08X} — emitting runtime abort\n", func.name, instr_vram, branch_target);
-                print_indent();
-                fmt::print(output_file, "recomp_unhandled_branch(rdram, ctx, 0x{:08X}u, 0x{:08X}u);\n", instr_vram, branch_target);
-                print_indent();
-                generator.emit_return(context, func_index);
             }
         }
         break;
@@ -766,9 +1090,14 @@ bool process_instruction(GeneratorType& generator, const N64Recomp::Context& con
             }
 
             fmt::print("[Info] Indirect tail call in {}\n", func.name);
-            print_func_call_by_register(rs);
-            print_indent();
-            generator.emit_return(context, func_index);
+            uint32_t fallthrough_target = instr_vram + 8;
+            if (fallthrough_target > func.vram && fallthrough_target < func_vram_end) {
+                size_t fallthrough_index = (fallthrough_target - func.vram) / sizeof(uint32_t);
+                if (fallthrough_index < instructions.size() && instructions[fallthrough_index].isValid()) {
+                    static_funcs_out[func.section_index].push_back(fallthrough_target);
+                }
+            }
+            print_tailcall_by_register(rs);
             break;
         }
         break;
@@ -930,7 +1259,16 @@ bool process_instruction(GeneratorType& generator, const N64Recomp::Context& con
         // following `addiu $t3, $ra, OFFSET` can compute a function pointer.
         if (find_conditional_branch_it->second.link) {
             print_indent();
-            fmt::print(output_file, "ctx->r31 = 0x{:08X}u;\n", instr_vram + 8);
+            {
+                uint32_t link_target = instr_vram + 8;
+                fmt::print(output_file, "ctx->r31 = 0x{:08X}u;\n", link_target);
+
+                uint64_t section_start = section.ram_addr;
+                uint64_t section_end = section_start + section.size;
+                if (link_target >= section_start && link_target < section_end) {
+                    static_funcs_out[func.section_index].push_back(link_target);
+                }
+            }
         }
         print_indent();
         // TODO combining the branch condition and branch target into one generator call would allow better optimization in the runtime's JIT generator.
@@ -939,7 +1277,13 @@ bool process_instruction(GeneratorType& generator, const N64Recomp::Context& con
 
         print_indent();
         if (find_conditional_branch_it->second.link) {
-            if (!print_func_call_by_address(instr.getBranchVramGeneric())) {
+            const uint32_t branch_target = instr.getBranchVramGeneric();
+            if (branch_target >= func.vram && branch_target < func_vram_end) {
+                if (!print_branch(branch_target)) {
+                    return false;
+                }
+            }
+            else if (!print_func_call_by_address(branch_target)) {
                 return false;
             }
         }
@@ -1008,20 +1352,40 @@ bool recompile_function_impl(GeneratorType& generator, const N64Recomp::Context&
         // Use a set to sort and deduplicate labels
         std::set<uint32_t> branch_labels;
         instructions.reserve(func.words.size());
+        if (func.entry_vram != 0 && func.entry_vram != func.vram) {
+            branch_labels.insert(func.entry_vram);
+            fmt::print(output_file, "    goto L_{:08X};\n", func.entry_vram);
+        }
 
         auto hook_find = func.function_hooks.find(-1);
         if (hook_find != func.function_hooks.end()) {
             fmt::print(output_file, "    {}\n", hook_find->second);
         }
 
+        const uint32_t func_vram_end = func.vram + uint32_t(func.words.size() * sizeof(func.words[0]));
+
         // First pass, disassemble each instruction and collect branch labels
         uint32_t vram = func.vram;
         for (uint32_t word : func.words) {
             const auto& instr = instructions.emplace_back(byteswap(word), vram);
+            const auto instr_id = instr.getUniqueId();
+            const uint32_t branch_target = (uint32_t)instr.getBranchVramGeneric();
 
             // If this is a branch or a direct jump, add it to the local label list
-            if (instr.isBranch() || instr.getUniqueId() == rabbitizer::InstrId::UniqueId::cpu_j) {
-                branch_labels.insert((uint32_t)instr.getBranchVramGeneric());
+            if (instr.isBranch() || instr_id == rabbitizer::InstrId::UniqueId::cpu_j) {
+                branch_labels.insert(branch_target);
+            }
+
+            // Local link branches are emitted as gotos within this C function.
+            // Their original MIPS return PCs must be labels so local `jr $ra`
+            // dispatch can resume after the delay slot.
+            const auto conditional_branch_it = N64Recomp::conditional_branch_ops.find(instr_id);
+            if ((conditional_branch_it != N64Recomp::conditional_branch_ops.end() && conditional_branch_it->second.link) ||
+                instr_id == rabbitizer::InstrId::UniqueId::cpu_jal) {
+                if (branch_target >= func.vram && branch_target < func_vram_end) {
+                    branch_labels.insert(branch_target);
+                    branch_labels.insert(vram + 8);
+                }
             }
 
             // Advance the vram address by the size of one instruction
@@ -1042,6 +1406,15 @@ bool recompile_function_impl(GeneratorType& generator, const N64Recomp::Context&
             jtbl_lw_instructions.insert(jtbl.lw_vram);
             for (uint32_t jtbl_entry : jtbl.entries) {
                 branch_labels.insert(jtbl_entry);
+            }
+        }
+
+        for (auto label_it = branch_labels.begin(); label_it != branch_labels.end();) {
+            if (*label_it < func.vram || *label_it >= func_vram_end) {
+                label_it = branch_labels.erase(label_it);
+            }
+            else {
+                ++label_it;
             }
         }
 
@@ -1072,7 +1445,7 @@ bool recompile_function_impl(GeneratorType& generator, const N64Recomp::Context&
                 reloc_index++;
             }
             // Process the current instruction and check for errors
-            if (process_instruction(generator, context, func, func_index, stats, jtbl_lw_instructions, instr_index, instructions, output_file, false, needs_link_branch, num_link_branches, reloc_index, needs_link_branch, is_branch_likely, tag_reference_relocs, static_funcs_out) == false) {
+            if (process_instruction(generator, context, func, func_index, stats, jtbl_lw_instructions, branch_labels, instr_index, instructions, output_file, false, needs_link_branch, num_link_branches, reloc_index, needs_link_branch, is_branch_likely, tag_reference_relocs, static_funcs_out) == false) {
                 fmt::print(stderr, "Error in recompiling {} at instr {}\n", func.name, instr_index);
                 return false;
             }
@@ -1090,6 +1463,25 @@ bool recompile_function_impl(GeneratorType& generator, const N64Recomp::Context&
             in_likely_delay_slot = is_branch_likely;
             // Advance the vram address by the size of one instruction
             vram += 4;
+        }
+
+        if (function_end_allows_fallthrough(instructions)) {
+            const uint32_t fallthrough_vram = func.vram + uint32_t(func.words.size() * sizeof(func.words[0]));
+            const size_t fallthrough_func_index = find_callable_function_in_section(
+                context,
+                fallthrough_vram,
+                func.section_index);
+
+            if (fallthrough_func_index != (size_t)-1 && fallthrough_func_index != func_index) {
+                fmt::print(
+                    output_file,
+                    "    recomp_request_tailcall_func(ctx, {});\n",
+                    context.functions[fallthrough_func_index].name);
+                if (context.trace_mode) {
+                    fmt::print(output_file, "    TRACE_RETURN()\n");
+                }
+                fmt::print(output_file, "    return;\n");
+            }
         }
     }
 

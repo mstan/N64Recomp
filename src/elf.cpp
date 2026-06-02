@@ -375,6 +375,32 @@ ELFIO::section* read_sections(N64Recomp::Context& context, const N64Recomp::ElfP
                 uint32_t prev_hi_immediate = 0;
                 uint32_t prev_hi_symbol = std::numeric_limits<uint32_t>::max();
 
+                auto find_nearest_preceding_hi16 = [&](ELFIO::Elf64_Addr lo_offset, ELFIO::Elf_Word lo_symbol, uint32_t& hi_immediate_out) {
+                    bool found = false;
+                    ELFIO::Elf64_Addr best_offset = 0;
+                    for (size_t hi_index = 0; hi_index < section_out.relocs.size(); hi_index++) {
+                        ELFIO::Elf64_Addr hi_offset;
+                        ELFIO::Elf_Word hi_symbol;
+                        unsigned int hi_type;
+                        ELFIO::Elf_Sxword hi_addend;
+                        rel_accessor.get_entry(hi_index, hi_offset, hi_symbol, hi_type, hi_addend);
+
+                        if (hi_type != static_cast<unsigned int>(N64Recomp::RelocType::R_MIPS_HI16) ||
+                            hi_symbol != lo_symbol || hi_offset >= lo_offset) {
+                            continue;
+                        }
+
+                        if (!found || hi_offset > best_offset) {
+                            uint32_t hi_rom_addr = section_out.rom_addr + hi_offset - section_out.ram_addr;
+                            uint32_t hi_rom_word = byteswap(*reinterpret_cast<const uint32_t*>(context.rom.data() + hi_rom_addr));
+                            hi_immediate_out = hi_rom_word & 0xFFFF;
+                            best_offset = hi_offset;
+                            found = true;
+                        }
+                    }
+                    return found;
+                };
+
                 for (size_t i = 0; i < section_out.relocs.size(); i++) {
                     // Get the current reloc
                     ELFIO::Elf64_Addr rel_offset;
@@ -460,7 +486,12 @@ ELFIO::section* read_sections(N64Recomp::Context& context, const N64Recomp::ElfP
                     // Reloc pairing, see MIPS System V ABI documentation page 4-18 (https://refspecs.linuxfoundation.org/elf/mipsabi.pdf)
                     if (reloc_out.type == N64Recomp::RelocType::R_MIPS_LO16) {
                         uint32_t rel_immediate = reloc_rom_word & 0xFFFF;
-                        uint32_t full_immediate = (prev_hi_immediate << 16) + (int16_t)rel_immediate;
+                        uint32_t lo_hi_immediate = prev_hi_immediate;
+                        bool address_paired_hi = false;
+                        if (prev_hi_count == 0) {
+                            address_paired_hi = find_nearest_preceding_hi16(rel_offset, rel_symbol, lo_hi_immediate);
+                        }
+                        uint32_t full_immediate = (lo_hi_immediate << 16) + (int16_t)rel_immediate;
                         reloc_out.target_section_offset = full_immediate + rel_symbol_offset - rel_section_vram;
                         if (prev_hi_count != 0) {
                             if (prev_hi_symbol != rel_symbol) {
@@ -476,6 +507,14 @@ ELFIO::section* read_sections(N64Recomp::Context& context, const N64Recomp::ElfP
                                 uint32_t paired_full_immediate = hi_immediate + (int16_t)rel_immediate;
                                 section_out.relocs[paired_index].target_section_offset = paired_full_immediate + rel_symbol_offset - rel_section_vram;
                             }
+                        }
+                        else if (address_paired_hi) {
+                            // Some linked MIPS ELFs place a LO16 relocation before
+                            // its matching HI16 in the relocation table even though
+                            // the instruction stream still has the LUI first. Pair
+                            // this LO16 with the nearest preceding same-symbol HI16
+                            // by address so multiple low-half users of one base
+                            // register do not inherit an unrelated stale HI16.
                         }
                         else {
                             // Orphaned LO16 reloc warnings.

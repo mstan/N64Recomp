@@ -25,6 +25,7 @@ namespace N64Recomp {
     struct Function {
         uint32_t vram;
         uint32_t rom;
+        uint32_t entry_vram = 0;
         std::vector<uint32_t> words;
         std::string name;
         uint16_t section_index;
@@ -33,8 +34,8 @@ namespace N64Recomp {
         bool stubbed;
         std::unordered_map<int32_t, std::string> function_hooks;
 
-        Function(uint32_t vram, uint32_t rom, std::vector<uint32_t> words, std::string name, uint16_t section_index, bool ignored = false, bool reimplemented = false, bool stubbed = false)
-                : vram(vram), rom(rom), words(std::move(words)), name(std::move(name)), section_index(section_index), ignored(ignored), reimplemented(reimplemented), stubbed(stubbed) {}
+        Function(uint32_t vram, uint32_t rom, std::vector<uint32_t> words, std::string name, uint16_t section_index, bool ignored = false, bool reimplemented = false, bool stubbed = false, uint32_t entry_vram = 0)
+                : vram(vram), rom(rom), entry_vram(entry_vram != 0 ? entry_vram : vram), words(std::move(words)), name(std::move(name)), section_index(section_index), ignored(ignored), reimplemented(reimplemented), stubbed(stubbed) {}
         Function() = default;
     };
     

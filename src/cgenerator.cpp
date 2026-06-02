@@ -85,6 +85,19 @@ static std::string gpr_to_string(int gpr_index) {
     return fmt::format("ctx->r{}", gpr_index);
 }
 
+static bool is_zero_gpr_operand(N64Recomp::Operand operand, const N64Recomp::InstructionContext& ctx) {
+    switch (operand) {
+        case N64Recomp::Operand::Rd:
+            return ctx.rd == 0;
+        case N64Recomp::Operand::Rs:
+            return ctx.rs == 0;
+        case N64Recomp::Operand::Rt:
+            return ctx.rt == 0;
+        default:
+            return false;
+    }
+}
+
 static std::string fpr_to_string(int fpr_index) {
     return fmt::format("ctx->f{}.fl", fpr_index);
 }
@@ -230,7 +243,7 @@ void N64Recomp::CGenerator::get_operand_string(Operand operand, UnaryOpType oper
             // Nothing to do here, they're already U64
             break;
         case UnaryOpType::Lui:
-            operand_string = "S32(" + operand_string + " << 16)"; 
+            operand_string = "S32(U32(" + operand_string + ") << 16)"; 
             break;
         case UnaryOpType::Mask5:
             operand_string = "(" + operand_string + " & 31)";
@@ -407,25 +420,95 @@ void N64Recomp::CGenerator::emit_function_end() const {
 }
 
 void N64Recomp::CGenerator::emit_function_call_lookup(uint32_t addr) const {
-    fmt::print(output_file, "LOOKUP_FUNC(0x{:08X})(rdram, ctx);\n", addr);
+    fmt::print(output_file, "{{\n");
+    fmt::print(output_file, "    gpr recomp_call_sp = ctx->r29;\n");
+    fmt::print(output_file, "    uint32_t recomp_prev_host_return = ctx->host_return_target;\n");
+    fmt::print(output_file, "    ctx->host_return_target = (uint32_t)ctx->r31;\n");
+    fmt::print(output_file, "    LOOKUP_FUNC(0x{:08X})(rdram, ctx);\n", addr);
+    fmt::print(output_file, "    if (ctx->tailcall_pending) {{\n");
+    fmt::print(output_file, "        if (ctx->tailcall_dispatching) {{\n");
+    fmt::print(output_file, "            ctx->host_return_target = recomp_prev_host_return;\n");
+    fmt::print(output_file, "            return;\n");
+    fmt::print(output_file, "        }}\n");
+    fmt::print(output_file, "        recomp_handle_tailcalls(rdram, ctx);\n");
+    fmt::print(output_file, "    }}\n");
+    fmt::print(output_file, "    ctx->host_return_target = recomp_prev_host_return;\n");
+    fmt::print(output_file, "    if (ctx->r29 != recomp_call_sp) {{ return; }}\n");
+    fmt::print(output_file, "}}\n");
 }
 
 void N64Recomp::CGenerator::emit_function_call_by_register(int reg) const {
-    fmt::print(output_file, "LOOKUP_FUNC({})(rdram, ctx);\n", gpr_to_string(reg));
+    fmt::print(output_file, "{{\n");
+    fmt::print(output_file, "    gpr recomp_call_sp = ctx->r29;\n");
+    fmt::print(output_file, "    uint32_t recomp_prev_host_return = ctx->host_return_target;\n");
+    fmt::print(output_file, "    ctx->host_return_target = (uint32_t)ctx->r31;\n");
+    fmt::print(output_file, "    LOOKUP_FUNC({})(rdram, ctx);\n", gpr_to_string(reg));
+    fmt::print(output_file, "    if (ctx->tailcall_pending) {{\n");
+    fmt::print(output_file, "        if (ctx->tailcall_dispatching) {{\n");
+    fmt::print(output_file, "            ctx->host_return_target = recomp_prev_host_return;\n");
+    fmt::print(output_file, "            return;\n");
+    fmt::print(output_file, "        }}\n");
+    fmt::print(output_file, "        recomp_handle_tailcalls(rdram, ctx);\n");
+    fmt::print(output_file, "    }}\n");
+    fmt::print(output_file, "    ctx->host_return_target = recomp_prev_host_return;\n");
+    fmt::print(output_file, "    if (ctx->r29 != recomp_call_sp) {{ return; }}\n");
+    fmt::print(output_file, "}}\n");
 }
 
 void N64Recomp::CGenerator::emit_function_call_reference_symbol(const Context& context, uint16_t section_index, size_t symbol_index, uint32_t target_section_offset) const {
     (void)target_section_offset;
     const N64Recomp::ReferenceSymbol& sym = context.get_reference_symbol(section_index, symbol_index);
-    fmt::print(output_file, "{}(rdram, ctx);\n", sym.name);
+    fmt::print(output_file, "{{\n");
+    fmt::print(output_file, "    gpr recomp_call_sp = ctx->r29;\n");
+    fmt::print(output_file, "    uint32_t recomp_prev_host_return = ctx->host_return_target;\n");
+    fmt::print(output_file, "    ctx->host_return_target = (uint32_t)ctx->r31;\n");
+    fmt::print(output_file, "    {}(rdram, ctx);\n", sym.name);
+    fmt::print(output_file, "    if (ctx->tailcall_pending) {{\n");
+    fmt::print(output_file, "        if (ctx->tailcall_dispatching) {{\n");
+    fmt::print(output_file, "            ctx->host_return_target = recomp_prev_host_return;\n");
+    fmt::print(output_file, "            return;\n");
+    fmt::print(output_file, "        }}\n");
+    fmt::print(output_file, "        recomp_handle_tailcalls(rdram, ctx);\n");
+    fmt::print(output_file, "    }}\n");
+    fmt::print(output_file, "    ctx->host_return_target = recomp_prev_host_return;\n");
+    fmt::print(output_file, "    if (ctx->r29 != recomp_call_sp) {{ return; }}\n");
+    fmt::print(output_file, "}}\n");
 }
 
 void N64Recomp::CGenerator::emit_function_call(const Context& context, size_t function_index) const {
-    fmt::print(output_file, "{}(rdram, ctx);\n", context.functions[function_index].name);
+    fmt::print(output_file, "{{\n");
+    fmt::print(output_file, "    gpr recomp_call_sp = ctx->r29;\n");
+    fmt::print(output_file, "    uint32_t recomp_prev_host_return = ctx->host_return_target;\n");
+    fmt::print(output_file, "    ctx->host_return_target = (uint32_t)ctx->r31;\n");
+    fmt::print(output_file, "    {}(rdram, ctx);\n", context.functions[function_index].name);
+    fmt::print(output_file, "    if (ctx->tailcall_pending) {{\n");
+    fmt::print(output_file, "        if (ctx->tailcall_dispatching) {{\n");
+    fmt::print(output_file, "            ctx->host_return_target = recomp_prev_host_return;\n");
+    fmt::print(output_file, "            return;\n");
+    fmt::print(output_file, "        }}\n");
+    fmt::print(output_file, "        recomp_handle_tailcalls(rdram, ctx);\n");
+    fmt::print(output_file, "    }}\n");
+    fmt::print(output_file, "    ctx->host_return_target = recomp_prev_host_return;\n");
+    fmt::print(output_file, "    if (ctx->r29 != recomp_call_sp) {{ return; }}\n");
+    fmt::print(output_file, "}}\n");
 }
 
 void N64Recomp::CGenerator::emit_named_function_call(const std::string& function_name) const {
-    fmt::print(output_file, "{}(rdram, ctx);\n", function_name);
+    fmt::print(output_file, "{{\n");
+    fmt::print(output_file, "    gpr recomp_call_sp = ctx->r29;\n");
+    fmt::print(output_file, "    uint32_t recomp_prev_host_return = ctx->host_return_target;\n");
+    fmt::print(output_file, "    ctx->host_return_target = (uint32_t)ctx->r31;\n");
+    fmt::print(output_file, "    {}(rdram, ctx);\n", function_name);
+    fmt::print(output_file, "    if (ctx->tailcall_pending) {{\n");
+    fmt::print(output_file, "        if (ctx->tailcall_dispatching) {{\n");
+    fmt::print(output_file, "            ctx->host_return_target = recomp_prev_host_return;\n");
+    fmt::print(output_file, "            return;\n");
+    fmt::print(output_file, "        }}\n");
+    fmt::print(output_file, "        recomp_handle_tailcalls(rdram, ctx);\n");
+    fmt::print(output_file, "    }}\n");
+    fmt::print(output_file, "    ctx->host_return_target = recomp_prev_host_return;\n");
+    fmt::print(output_file, "    if (ctx->r29 != recomp_call_sp) {{ return; }}\n");
+    fmt::print(output_file, "}}\n");
 }
 
 void N64Recomp::CGenerator::emit_goto(const std::string& target) const {
@@ -567,6 +650,9 @@ void N64Recomp::CGenerator::process_binary_op(const BinaryOp& op, const Instruct
     // TODO these thread locals probably don't actually help right now, so figure out a better way to prevent allocations.
     thread_local std::string output{};
     thread_local std::string expression{};
+    if (is_zero_gpr_operand(op.output, ctx)) {
+        return;
+    }
     get_operand_string(op.output, UnaryOpType::None, ctx, output);
     get_binary_expr_string(op.type, op.operands, ctx, output, expression);
     fmt::print(output_file, "{} = {};\n", output, expression);
@@ -577,6 +663,9 @@ void N64Recomp::CGenerator::process_unary_op(const UnaryOp& op, const Instructio
     // TODO these thread locals probably don't actually help right now, so figure out a better way to prevent allocations.
     thread_local std::string output{};
     thread_local std::string input{};
+    if (is_zero_gpr_operand(op.output, ctx)) {
+        return;
+    }
     get_operand_string(op.output, UnaryOpType::None, ctx, output);
     get_operand_string(op.input, op.operation, ctx, input);
     fmt::print(output_file, "{} = {};\n", output, input);

@@ -20,6 +20,7 @@
 #include <fstream>
 #include <array>
 #include <vector>
+#include <algorithm>
 #include <unordered_set>
 #include <unordered_map>
 #include <cassert>
@@ -149,7 +150,14 @@ uint32_t expected_c0_reg_value(int cop0_reg) {
         return 0; // Pretend DMAs complete instantly
     case Cop0Reg::RSP_COP0_SP_SEMAPHORE:
         return 0; // Always acquire the semaphore
+    case Cop0Reg::RSP_COP0_DPC_START:
+    case Cop0Reg::RSP_COP0_DPC_END:
+    case Cop0Reg::RSP_COP0_DPC_CURRENT:
     case Cop0Reg::RSP_COP0_DPC_STATUS:
+    case Cop0Reg::RSP_COP0_DPC_CLOCK:
+    case Cop0Reg::RSP_COP0_DPC_BUFBUSY:
+    case Cop0Reg::RSP_COP0_DPC_PIPEBUSY:
+    case Cop0Reg::RSP_COP0_DPC_TMEM:
         return 0; // Good enough for the microcodes that would be recompiled (i.e. non-graphics ones)
     default:
         fmt::print(stderr, "Unhandled mfc0: {}\n", cop0_reg);
@@ -163,7 +171,7 @@ std::string_view c0_reg_write_action(int cop0_reg) {
     case Cop0Reg::RSP_COP0_SP_SEMAPHORE:
         return ""; // Ignore semaphore functionality
     case Cop0Reg::RSP_COP0_SP_STATUS:
-        return ""; // Ignore writes to the status flags since yielding is ignored
+        return "WRITE_SP_STATUS";
     case Cop0Reg::RSP_COP0_SP_DRAM_ADDR:
         return "SET_DMA_DRAM";
     case Cop0Reg::RSP_COP0_SP_MEM_ADDR:
@@ -204,7 +212,17 @@ struct BranchTargets {
 
 BranchTargets get_branch_targets(const std::vector<rabbitizer::InstructionRsp>& instrs) {
     BranchTargets ret;
+    std::unordered_set<int> indirect_jump_regs;
+
     for (const auto& instr : instrs) {
+        InstrId instr_id = instr.getUniqueId();
+        if (instr_id == InstrId::rsp_jr || instr_id == InstrId::rsp_jalr) {
+            indirect_jump_regs.insert((int)instr.GetO32_rs());
+        }
+    }
+
+    for (const auto& instr : instrs) {
+        InstrId instr_id = instr.getUniqueId();
         if (instr.isJumpWithAddress() || instr.isBranch()) {
             // OR with 0x1000 (IMEM region bit) so the target matches how
             // labels are emitted at instruction boundaries. See process_instruction
@@ -213,6 +231,14 @@ BranchTargets get_branch_targets(const std::vector<rabbitizer::InstructionRsp>& 
         }
         if (instr.doesLink()) {
             ret.indirect_targets.insert(instr.getVram() + 2 * instr_size);
+        }
+        if ((instr_id == InstrId::rsp_addiu || instr_id == InstrId::rsp_ori) &&
+            (int)instr.GetO32_rs() == 0 &&
+            indirect_jump_regs.contains((int)instr.GetO32_rt())) {
+            uint16_t imm = instr.Get_immediate();
+            if (imm >= 0x1000 && imm <= rsp_mem_mask) {
+                ret.indirect_targets.insert(imm);
+            }
         }
     }
     return ret;
@@ -435,7 +461,7 @@ bool process_instruction(size_t instr_index, const std::vector<rabbitizer::Instr
             break;
             // Arithmetic
         case InstrId::rsp_lui:
-            print_line("{}{} = S32({} << 16)", ctx_gpr_prefix(rt), rt, unsigned_imm_string);
+            print_line("{}{} = S32(U32({}) << 16)", ctx_gpr_prefix(rt), rt, unsigned_imm_string);
             break;
         case InstrId::rsp_add:
         case InstrId::rsp_addu:
@@ -480,10 +506,10 @@ bool process_instruction(size_t instr_index, const std::vector<rabbitizer::Instr
             print_line("{}{} = {}{} ^ {}", ctx_gpr_prefix(rt), rt, ctx_gpr_prefix(rs), rs, unsigned_imm_string);
             break;
         case InstrId::rsp_sll:
-            print_line("{}{} = S32({}{}) << {}", ctx_gpr_prefix(rd), rd, ctx_gpr_prefix(rt), rt, sa);
+            print_line("{}{} = S32(U32({}{}) << {})", ctx_gpr_prefix(rd), rd, ctx_gpr_prefix(rt), rt, sa);
             break;
         case InstrId::rsp_sllv:
-            print_line("{}{} = S32({}{}) << ({}{} & 31)", ctx_gpr_prefix(rd), rd, ctx_gpr_prefix(rt), rt, ctx_gpr_prefix(rs), rs);
+            print_line("{}{} = S32(U32({}{}) << ({}{} & 31))", ctx_gpr_prefix(rd), rd, ctx_gpr_prefix(rt), rt, ctx_gpr_prefix(rs), rs);
             break;
         case InstrId::rsp_sra:
             print_line("{}{} = S32(RSP_SIGNED({}{}) >> {})", ctx_gpr_prefix(rd), rd, ctx_gpr_prefix(rt), rt, sa);
@@ -585,6 +611,28 @@ bool process_instruction(size_t instr_index, const std::vector<rabbitizer::Instr
             print_branch_condition("if (RSP_SIGNED({}{}) < 0)", ctx_gpr_prefix(rs), rs);
             print_branch("goto L_{:04X}", branch_target);
             break;
+        case InstrId::rsp_bgezal:
+            print_indent();
+            print_branch_condition("if (RSP_SIGNED({}{}) >= 0)", ctx_gpr_prefix(rs), rs);
+            fmt::print(output_file, "{{\n");
+            fmt::print(output_file, "        {}{} = 0x{:04X};\n", ctx_gpr_prefix(31), 31, instr_vram + 2 * instr_size);
+            if (instr_index < instructions.size() - 1) {
+                process_instruction(instr_index + 1, instructions, output_file, branch_targets, unsupported_instructions, resume_targets, has_overlays, true, true);
+            }
+            fmt::print(output_file, "        goto L_{:04X};\n", branch_target);
+            fmt::print(output_file, "    }}\n");
+            break;
+        case InstrId::rsp_bltzal:
+            print_indent();
+            print_branch_condition("if (RSP_SIGNED({}{}) < 0)", ctx_gpr_prefix(rs), rs);
+            fmt::print(output_file, "{{\n");
+            fmt::print(output_file, "        {}{} = 0x{:04X};\n", ctx_gpr_prefix(31), 31, instr_vram + 2 * instr_size);
+            if (instr_index < instructions.size() - 1) {
+                process_instruction(instr_index + 1, instructions, output_file, branch_targets, unsupported_instructions, resume_targets, has_overlays, true, true);
+            }
+            fmt::print(output_file, "        goto L_{:04X};\n", branch_target);
+            fmt::print(output_file, "    }}\n");
+            break;
         case InstrId::rsp_break:
             print_line("return RspExitReason::Broke", instr_vram);
             break;
@@ -634,18 +682,42 @@ void write_indirect_jumps(std::ofstream& output_file, const BranchTargets& branc
     fmt::print(output_file,
         "do_indirect_jump:\n"
         "    switch ((jump_target | 0x1000) & {:#X}) {{ \n", rsp_mem_mask);
-    for (uint32_t branch_target: branch_targets.indirect_targets) {
+
+    // Some RSP ucodes use plain jumps with delay-slot writes such as
+    // `j helper; addiu $ra, $zero, return_pc` instead of `jal`.
+    // get_branch_targets marks those literal return PCs as indirect
+    // labels. Direct labels are also valid computed targets, so accept
+    // both sets in the dispatch.
+    std::vector<uint32_t> jump_targets;
+    jump_targets.reserve(branch_targets.direct_targets.size() + branch_targets.indirect_targets.size());
+    for (uint32_t branch_target : branch_targets.direct_targets) {
+        jump_targets.push_back(branch_target);
+    }
+    for (uint32_t branch_target : branch_targets.indirect_targets) {
+        if (!branch_targets.direct_targets.contains(branch_target)) {
+            jump_targets.push_back(branch_target);
+        }
+    }
+    std::sort(jump_targets.begin(), jump_targets.end());
+
+    for (uint32_t branch_target: jump_targets) {
         fmt::print(output_file, "        case 0x{0:04X}: goto L_{0:04X};\n", branch_target);
     }
     fmt::print(output_file,
         "    }}\n"
-        "    printf(\"Unhandled jump target 0x%04X in microcode {}, coming from [%s:%d]\\n\", jump_target, debug_file, debug_line);\n"
-        "    printf(\"Register dump: r0  = %08X r1  = %08X r2  = %08X r3  = %08X r4  = %08X r5  = %08X r6  = %08X r7  = %08X\\n\"\n"
+        "    fprintf(stderr, \"Unhandled jump target 0x%04X in microcode {}, coming from [%s:%d]\\n\", jump_target, debug_file, debug_line);\n"
+        "    fprintf(stderr, \"PC trail (oldest..newest):\\n\");\n"
+        "    for (uint32_t i = 0; i < 32; i++) {{\n"
+        "        uint32_t pos = (ctx->pc_trail_idx + i) & 31;\n"
+        "        fprintf(stderr, \"  [%2u] PC=0x%04X\\n\", i, ctx->pc_trail[pos]);\n"
+        "    }}\n"
+        "    fprintf(stderr, \"Register dump: r0  = %08X r1  = %08X r2  = %08X r3  = %08X r4  = %08X r5  = %08X r6  = %08X r7  = %08X\\n\"\n"
         "           \"               r8  = %08X r9  = %08X r10 = %08X r11 = %08X r12 = %08X r13 = %08X r14 = %08X r15 = %08X\\n\"\n"
         "           \"               r16 = %08X r17 = %08X r18 = %08X r19 = %08X r20 = %08X r21 = %08X r22 = %08X r23 = %08X\\n\"\n"
         "           \"               r24 = %08X r25 = %08X r26 = %08X r27 = %08X r28 = %08X r29 = %08X r30 = %08X r31 = %08X\\n\",\n"
         "           0, r1, r2, r3, r4, r5, r6, r7, r8, r9, r10, r11, r12, r13, r14, r15, r16,\n"
         "           r17, r18, r19, r20, r21, r22, r23, r24, r25, r26, r27, r28, r29, r30, r31);\n"
+        "    fflush(stderr);\n"
         "    return RspExitReason::UnhandledJumpTarget;\n", output_function_name);
 }
 

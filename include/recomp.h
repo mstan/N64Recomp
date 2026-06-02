@@ -3,8 +3,8 @@
 // Original file copyright remains with upstream authors.
 //
 // Modified 2026 by Matthew Stanley:
-//   - Mask host-side rdram offset in MEM_W / MEM_H / MEM_B / MEM_HU /
-//     MEM_BU / SD so out-of-range vaddrs wrap into the mapped 1GB
+//   - Mask host-side rdram offset in MEM_W / MEM_WU / MEM_H / MEM_B /
+//     MEM_HU / MEM_BU / SD so out-of-range vaddrs wrap into the mapped 1GB
 //     rdram region instead of faulting (matches N64 hardware's
 //     silent address-bus wrap; converts host SEGVs from corrupt
 //     pointers into garbage reads we can keep diagnosing).
@@ -50,6 +50,12 @@
     #define SET_FENV_ACCESS()
 #else
     #error "No RECOMP_FUNC definition for this compiler"
+#endif
+
+#if defined(__clang__)
+    #define RECOMP_MUSTTAIL __attribute__((musttail))
+#else
+    #define RECOMP_MUSTTAIL
 #endif
 
 // Implementation of 64-bit multiply and divide instructions
@@ -123,6 +129,9 @@ typedef uint64_t gpr;
 
 #define MEM_W(offset, reg) \
     (*(int32_t*)(rdram + ((((reg) + (offset)) - 0xFFFFFFFF80000000) & RECOMP_MEM_MASK)))
+
+#define MEM_WU(offset, reg) \
+    (*(uint32_t*)(rdram + ((((reg) + (offset)) - 0xFFFFFFFF80000000) & RECOMP_MEM_MASK)))
 
 #define MEM_H(offset, reg) \
     (*(int16_t*)(rdram + (((((reg) + (offset)) ^ 2) - 0xFFFFFFFF80000000) & RECOMP_MEM_MASK)))
@@ -440,7 +449,10 @@ typedef union {
     uint64_t u64;
 } fpr;
 
-typedef struct {
+typedef struct recomp_context recomp_context;
+typedef void (recomp_func_t)(uint8_t* rdram, recomp_context* ctx);
+
+struct recomp_context {
     gpr r0,  r1,  r2,  r3,  r4,  r5,  r6,  r7,
         r8,  r9,  r10, r11, r12, r13, r14, r15,
         r16, r17, r18, r19, r20, r21, r22, r23,
@@ -511,7 +523,13 @@ typedef struct {
     // dedicated helper for THAT register and the dispatch in
     // recompilation.cpp routes to it instead of cop0_regs[].
     uint32_t cop0_regs[32];
-} recomp_context;
+
+    uint32_t tailcall_target;
+    uint32_t tailcall_pending;
+    uint32_t tailcall_dispatching;
+    recomp_func_t* tailcall_func;
+    uint32_t host_return_target;
+};
 
 // Checks if the target is an even float register or that mips3 float mode is enabled
 #define CHECK_FR(ctx, idx) \
@@ -526,13 +544,25 @@ gpr cop0_status_read(recomp_context* ctx);
 void switch_error(const char* func, uint32_t vram, uint32_t jtbl);
 void do_break(uint32_t vram);
 
-// The function signature for all recompiler output functions.
-typedef void (recomp_func_t)(uint8_t* rdram, recomp_context* ctx);
 // The function signature for special functions that need a third argument.
 // These get called via generated shims to allow providing some information about the caller, such as mod id.
 typedef void (recomp_func_ext_t)(uint8_t* rdram, recomp_context* ctx, uintptr_t arg);
 
 recomp_func_t* get_function(int32_t vram);
+
+static inline void recomp_request_tailcall(recomp_context* ctx, gpr target) {
+    ctx->tailcall_target = (uint32_t)target;
+    ctx->tailcall_func = NULL;
+    ctx->tailcall_pending = 1;
+}
+
+static inline void recomp_request_tailcall_func(recomp_context* ctx, recomp_func_t* func) {
+    ctx->tailcall_target = 0;
+    ctx->tailcall_func = func;
+    ctx->tailcall_pending = 1;
+}
+
+void recomp_handle_tailcalls(uint8_t* rdram, recomp_context* ctx);
 
 #define LOOKUP_FUNC(val) \
     get_function((int32_t)(val))

@@ -12,6 +12,7 @@
 #include "recompiler/context.h"
 #include "config.h"
 #include "decompressed.h"
+#include "analysis.h"
 #include <set>
 
 void add_manual_functions(N64Recomp::Context& context, const std::vector<N64Recomp::ManualFunction>& manual_funcs) {
@@ -110,6 +111,1192 @@ bool compare_files(const std::filesystem::path& file1_path, const std::filesyste
     std::istreambuf_iterator<char> begin2(file2);
 
     return std::equal(begin1, std::istreambuf_iterator<char>(), begin2); //Second argument is end-of-range iterator
+}
+
+size_t find_exact_function_in_section(const N64Recomp::Context& context, uint32_t vram, size_t section_index) {
+    auto find_it = context.functions_by_vram.find(vram);
+    if (find_it == context.functions_by_vram.end()) {
+        return (size_t)-1;
+    }
+
+    for (size_t func_index : find_it->second) {
+        const auto& func = context.functions[func_index];
+        if (func.section_index == section_index &&
+            (!func.words.empty() || func.reimplemented || N64Recomp::is_manual_patch_symbol(func.vram))) {
+            return func_index;
+        }
+    }
+
+    return (size_t)-1;
+}
+
+size_t find_containing_function_in_section(const N64Recomp::Context& context, uint32_t vram, size_t section_index) {
+    if (section_index >= context.section_functions.size()) {
+        return (size_t)-1;
+    }
+
+    for (size_t func_index : context.section_functions[section_index]) {
+        const auto& func = context.functions[func_index];
+        if (func.words.empty()) {
+            continue;
+        }
+
+        uint32_t func_start = func.vram;
+        uint32_t func_end = func_start + uint32_t(func.words.size() * sizeof(func.words[0]));
+        if (vram > func_start && vram < func_end) {
+            return func_index;
+        }
+    }
+
+    return (size_t)-1;
+}
+
+size_t find_unique_executable_section_containing_vram(const N64Recomp::Context& context, uint32_t vram) {
+    size_t containing_section = (size_t)-1;
+
+    for (size_t section_index = 0; section_index < context.sections.size(); section_index++) {
+        const auto& section = context.sections[section_index];
+        if (!section.executable) {
+            continue;
+        }
+
+        uint32_t section_start = section.ram_addr;
+        uint32_t section_end = section_start + section.size;
+        if (vram >= section_start && vram < section_end) {
+            if (containing_section != (size_t)-1) {
+                return (size_t)-1;
+            }
+            containing_section = section_index;
+        }
+    }
+
+    return containing_section;
+}
+
+uint32_t infer_section_encoded_vram_base(const N64Recomp::Context& context, size_t section_index) {
+    if (section_index >= context.sections.size() || section_index >= context.section_functions.size()) {
+        return 0;
+    }
+
+    const auto& section = context.sections[section_index];
+    uint32_t encoded_base = section.ram_addr;
+    bool found_base = false;
+
+    for (size_t func_index : context.section_functions[section_index]) {
+        const auto& func = context.functions[func_index];
+        if (func.words.empty() && !func.reimplemented) {
+            continue;
+        }
+        uint64_t section_rom_start = section.rom_addr;
+        uint64_t section_rom_end = section_rom_start + section.size;
+        if (func.rom < section_rom_start || func.rom >= section_rom_end) {
+            continue;
+        }
+
+        uint32_t candidate_base = func.vram - (func.rom - section.rom_addr);
+        if (!found_base) {
+            encoded_base = candidate_base;
+            found_base = true;
+        }
+        else if (encoded_base != candidate_base) {
+            return section.ram_addr;
+        }
+    }
+
+    return encoded_base;
+}
+
+uint32_t reloc_offset_in_section(const N64Recomp::Context& context, size_t section_index, uint32_t reloc_address) {
+    const auto& section = context.sections[section_index];
+    uint32_t encoded_base = infer_section_encoded_vram_base(context, section_index);
+
+    uint64_t encoded_start = encoded_base;
+    uint64_t encoded_end = encoded_start + section.size;
+    if (reloc_address >= encoded_start && reloc_address < encoded_end) {
+        return reloc_address - encoded_base;
+    }
+
+    return reloc_address - section.ram_addr;
+}
+
+bool instruction_writes_zero_gpr(const rabbitizer::InstructionCpu& instr, uint32_t insn_word) {
+    if (insn_word == 0) {
+        return false;
+    }
+
+    using InstrId = rabbitizer::InstrId::UniqueId;
+    const auto id = instr.getUniqueId();
+    switch (id) {
+        case InstrId::cpu_add:
+        case InstrId::cpu_addu:
+        case InstrId::cpu_sub:
+        case InstrId::cpu_subu:
+        case InstrId::cpu_dadd:
+        case InstrId::cpu_daddu:
+        case InstrId::cpu_dsub:
+        case InstrId::cpu_dsubu:
+        case InstrId::cpu_and:
+        case InstrId::cpu_or:
+        case InstrId::cpu_xor:
+        case InstrId::cpu_nor:
+        case InstrId::cpu_sll:
+        case InstrId::cpu_sllv:
+        case InstrId::cpu_srl:
+        case InstrId::cpu_srlv:
+        case InstrId::cpu_sra:
+        case InstrId::cpu_srav:
+        case InstrId::cpu_dsll:
+        case InstrId::cpu_dsllv:
+        case InstrId::cpu_dsll32:
+        case InstrId::cpu_dsrl:
+        case InstrId::cpu_dsrlv:
+        case InstrId::cpu_dsrl32:
+        case InstrId::cpu_dsra:
+        case InstrId::cpu_dsrav:
+        case InstrId::cpu_dsra32:
+        case InstrId::cpu_slt:
+        case InstrId::cpu_sltu:
+        case InstrId::cpu_mfhi:
+        case InstrId::cpu_mflo:
+            return int(instr.GetO32_rd()) == 0;
+
+        case InstrId::cpu_addi:
+        case InstrId::cpu_addiu:
+        case InstrId::cpu_daddi:
+        case InstrId::cpu_daddiu:
+        case InstrId::cpu_andi:
+        case InstrId::cpu_ori:
+        case InstrId::cpu_xori:
+        case InstrId::cpu_slti:
+        case InstrId::cpu_sltiu:
+        case InstrId::cpu_lui:
+        case InstrId::cpu_lb:
+        case InstrId::cpu_lbu:
+        case InstrId::cpu_lh:
+        case InstrId::cpu_lhu:
+        case InstrId::cpu_lw:
+        case InstrId::cpu_lwu:
+        case InstrId::cpu_ld:
+        case InstrId::cpu_lwl:
+        case InstrId::cpu_lwr:
+        case InstrId::cpu_ldl:
+        case InstrId::cpu_ldr:
+        case InstrId::cpu_mfc1:
+        case InstrId::cpu_dmfc1:
+            return int(instr.GetO32_rt()) == 0;
+
+        default:
+            return false;
+    }
+}
+
+bool discovered_entrypoint_looks_like_code(
+    const N64Recomp::Context& context,
+    size_t section_index,
+    uint32_t target_vram,
+    size_t discovered_size) {
+    const auto& section = context.sections[section_index];
+    const uint32_t entry_offset = target_vram - section.ram_addr;
+    const uint8_t* body = context.rom.data() + section.rom_addr;
+
+    for (size_t offset = entry_offset; offset < entry_offset + discovered_size; offset += sizeof(uint32_t)) {
+        uint32_t insn_word = byteswap(*reinterpret_cast<const uint32_t*>(body + offset));
+        rabbitizer::InstructionCpu instr(insn_word, section.ram_addr + uint32_t(offset));
+        if (!instr.isValid() || (insn_word != 0 && instruction_writes_zero_gpr(instr, insn_word))) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+bool discover_static_code_entrypoint(
+    const N64Recomp::Context& context,
+    size_t section_index,
+    uint32_t target_vram,
+    size_t* size_out = nullptr) {
+    if (section_index >= context.sections.size()) {
+        return false;
+    }
+
+    const auto& section = context.sections[section_index];
+    if (!section.executable || (target_vram & 3u) != 0) {
+        return false;
+    }
+
+    const uint32_t section_start = section.ram_addr;
+    const uint32_t section_end = section_start + section.size;
+    if (target_vram < section_start || target_vram >= section_end) {
+        return false;
+    }
+
+    if (section.rom_addr >= 0xF0000000u ||
+        uint64_t(section.rom_addr) + uint64_t(section.size) > context.rom.size()) {
+        return false;
+    }
+
+    size_t discovered_size = 0;
+    std::string discover_error;
+    if (!N64Recomp::discover_function_bounds(
+            context.rom.data() + section.rom_addr,
+            section.size,
+            section.ram_addr,
+            target_vram - section.ram_addr,
+            discovered_size,
+            discover_error)) {
+        return false;
+    }
+
+    if (size_out != nullptr) {
+        *size_out = discovered_size;
+    }
+    return discovered_size != 0 &&
+        discovered_entrypoint_looks_like_code(context, section_index, target_vram, discovered_size);
+}
+
+bool is_resident_text_section(const N64Recomp::Section& section) {
+    return section.name == ".text";
+}
+
+void seed_static_entrypoints_from_code_relocs(
+    const N64Recomp::Context& context,
+    std::vector<std::vector<uint32_t>>& static_funcs_by_section) {
+    size_t seeded_count = 0;
+    std::set<std::pair<size_t, uint32_t>> seeded_entries;
+    constexpr size_t max_reloc_static_entry_size = 0x400;
+
+    for (size_t section_index = 0; section_index < static_funcs_by_section.size(); section_index++) {
+        for (uint32_t static_func : static_funcs_by_section[section_index]) {
+            seeded_entries.emplace(section_index, static_func);
+        }
+    }
+
+    auto entry_is_seeded = [&](size_t section_index, uint32_t vram) {
+        return seeded_entries.contains({ section_index, vram });
+    };
+
+    auto entry_falls_through_to_seeded_static = [&](size_t section_index, uint32_t vram) {
+        if (section_index >= context.sections.size()) {
+            return false;
+        }
+
+        const auto& section = context.sections[section_index];
+        if (!section.executable ||
+            section.rom_addr >= 0xF0000000u ||
+            uint64_t(section.rom_addr) + uint64_t(section.size) > context.rom.size() ||
+            vram < section.ram_addr ||
+            vram + 8 > section.ram_addr + section.size) {
+            return false;
+        }
+
+        const uint32_t instr_word = byteswap(*reinterpret_cast<const uint32_t*>(
+            context.rom.data() + section.rom_addr + (vram - section.ram_addr)));
+        rabbitizer::InstructionCpu instr(instr_word, vram);
+        return instr.isValid() &&
+            entry_is_seeded(section_index, vram + 8);
+    };
+
+    for (size_t source_section_index = 0; source_section_index < context.sections.size(); source_section_index++) {
+        const auto& source_section = context.sections[source_section_index];
+        if (!source_section.relocatable) {
+            continue;
+        }
+
+        for (const auto& reloc : source_section.relocs) {
+            if (reloc.type != N64Recomp::RelocType::R_MIPS_HI16 &&
+                reloc.type != N64Recomp::RelocType::R_MIPS_LO16 &&
+                reloc.type != N64Recomp::RelocType::R_MIPS_32) {
+                continue;
+            }
+
+            bool source_is_small_code_label = false;
+            if (source_section.executable &&
+                find_exact_function_in_section(context, reloc.address, source_section_index) == (size_t)-1 &&
+                find_containing_function_in_section(context, reloc.address, source_section_index) == (size_t)-1 &&
+                !entry_is_seeded(source_section_index, reloc.address)) {
+                size_t discovered_source_size = 0;
+                if (!discover_static_code_entrypoint(context, source_section_index, reloc.address, &discovered_source_size) ||
+                    discovered_source_size > max_reloc_static_entry_size) {
+                    continue;
+                }
+                source_is_small_code_label = true;
+            }
+
+            uint32_t target_vram = reloc.target_section_offset;
+            size_t target_section_index = (size_t)-1;
+            bool absolute_target = reloc.target_section == N64Recomp::SectionAbsolute;
+
+            if (!reloc.reference_symbol && reloc.target_section < context.sections.size()) {
+                target_section_index = reloc.target_section;
+                target_vram = context.sections[target_section_index].ram_addr + reloc.target_section_offset;
+            }
+            else if (absolute_target) {
+                target_section_index = find_unique_executable_section_containing_vram(context, target_vram);
+            }
+
+            if (target_section_index == (size_t)-1 || target_section_index >= context.sections.size()) {
+                continue;
+            }
+
+            const auto& target_section = context.sections[target_section_index];
+            if (!target_section.executable ||
+                !target_section.relocatable ||
+                is_resident_text_section(target_section) ||
+                (target_vram & 3u) != 0) {
+                continue;
+            }
+
+            uint32_t section_start = target_section.ram_addr;
+            uint32_t section_end = section_start + target_section.size;
+            if (target_vram < section_start || target_vram >= section_end) {
+                continue;
+            }
+
+            if (find_exact_function_in_section(context, target_vram, target_section_index) != (size_t)-1) {
+                continue;
+            }
+
+            size_t containing_func_index = find_containing_function_in_section(context, target_vram, target_section_index);
+            if (containing_func_index != (size_t)-1) {
+                const auto& containing_func = context.functions[containing_func_index];
+                const size_t word_index = (target_vram - containing_func.vram) / sizeof(uint32_t);
+                const uint32_t insn_word = byteswap(containing_func.words[word_index]);
+                rabbitizer::InstructionCpu instr(insn_word, target_vram);
+                if (!instr.isValid() || (insn_word != 0 && instruction_writes_zero_gpr(instr, insn_word))) {
+                    continue;
+                }
+            }
+            else {
+                if (!absolute_target) {
+                    continue;
+                }
+                bool falls_through_to_seeded_static =
+                    entry_falls_through_to_seeded_static(target_section_index, target_vram);
+                size_t discovered_size = 0;
+                if (!discover_static_code_entrypoint(context, target_section_index, target_vram, &discovered_size) &&
+                    !falls_through_to_seeded_static) {
+                    continue;
+                }
+                if (discovered_size > max_reloc_static_entry_size &&
+                    !falls_through_to_seeded_static &&
+                    !source_is_small_code_label) {
+                    continue;
+                }
+            }
+
+            if (!seeded_entries.emplace(target_section_index, target_vram).second) {
+                continue;
+            }
+            static_funcs_by_section[target_section_index].push_back(target_vram);
+            seeded_count++;
+        }
+    }
+
+    if (seeded_count != 0) {
+        fmt::print(
+            "[Info] Seeded {} static code-label entr{} from relocation targets\n",
+            seeded_count,
+            seeded_count == 1 ? "y" : "ies");
+    }
+}
+
+bool static_entrypoint_inside_function_looks_valid(
+    const N64Recomp::Function& func,
+    uint32_t target_vram);
+
+void seed_static_entrypoints_from_pointer_tables(
+    const N64Recomp::Context& context,
+    std::vector<std::vector<uint32_t>>& static_funcs_by_section) {
+    size_t seeded_count = 0;
+    std::set<std::pair<size_t, uint32_t>> seeded_entries;
+    constexpr size_t max_pointer_static_entry_size = 0x400;
+
+    for (size_t section_index = 0; section_index < static_funcs_by_section.size(); section_index++) {
+        for (uint32_t static_func : static_funcs_by_section[section_index]) {
+            seeded_entries.emplace(section_index, static_func);
+        }
+    }
+
+    struct ExecutableRange {
+        uint32_t start;
+        uint32_t end;
+        size_t section_index;
+    };
+    std::vector<ExecutableRange> executable_ranges;
+    executable_ranges.reserve(context.sections.size());
+    for (size_t section_index = 0; section_index < context.sections.size(); section_index++) {
+        const auto& section = context.sections[section_index];
+        if (!section.executable ||
+            !section.relocatable ||
+            is_resident_text_section(section)) {
+            continue;
+        }
+
+        executable_ranges.push_back({
+            section.ram_addr,
+            section.ram_addr + section.size,
+            section_index
+        });
+    }
+    std::sort(
+        executable_ranges.begin(),
+        executable_ranges.end(),
+        [](const ExecutableRange& lhs, const ExecutableRange& rhs) {
+            if (lhs.start != rhs.start) {
+                return lhs.start < rhs.start;
+            }
+            return lhs.end < rhs.end;
+        });
+
+    auto find_indexed_executable_sections = [&](uint32_t target_vram) {
+        std::vector<size_t> matches;
+        auto it = std::upper_bound(
+            executable_ranges.begin(),
+            executable_ranges.end(),
+            target_vram,
+            [](uint32_t value, const ExecutableRange& range) {
+                return value < range.start;
+            });
+
+        while (it != executable_ranges.begin()) {
+            --it;
+            if (target_vram - it->start > 0x400000u) {
+                break;
+            }
+            if (target_vram >= it->start && target_vram < it->end) {
+                matches.push_back(it->section_index);
+            }
+        }
+        return matches;
+    };
+
+    auto word_points_to_section = [&](size_t offset, size_t section_index) {
+        if (offset + sizeof(uint32_t) > context.rom.size()) {
+            return false;
+        }
+
+        const uint32_t target_vram =
+            byteswap(*reinterpret_cast<const uint32_t*>(context.rom.data() + offset));
+        for (size_t match : find_indexed_executable_sections(target_vram)) {
+            if (match == section_index) {
+                return true;
+            }
+        }
+
+        return false;
+    };
+
+    auto word_is_in_raw_code_pointer_table = [&](size_t offset, size_t section_index) {
+        const size_t strides[] = {
+            sizeof(uint32_t),
+            sizeof(uint32_t) * 2,
+            sizeof(uint32_t) * 4,
+            sizeof(uint32_t) * 8
+        };
+
+        for (size_t stride : strides) {
+            const bool prev_1 =
+                offset >= stride &&
+                word_points_to_section(offset - stride, section_index);
+            const bool prev_2 =
+                offset >= stride * 2 &&
+                word_points_to_section(offset - stride * 2, section_index);
+            const bool next_1 =
+                offset + stride + sizeof(uint32_t) <= context.rom.size() &&
+                word_points_to_section(offset + stride, section_index);
+            const bool next_2 =
+                offset + stride * 2 + sizeof(uint32_t) <= context.rom.size() &&
+                word_points_to_section(offset + stride * 2, section_index);
+
+            if ((prev_1 && next_1) || (prev_1 && prev_2) || (next_1 && next_2)) {
+                return true;
+            }
+        }
+
+        return false;
+    };
+
+    auto seed_target = [&](size_t target_section_index, uint32_t target_vram, bool raw_table_entry) {
+        if (target_section_index == (size_t)-1 || target_section_index >= context.sections.size()) {
+            return;
+        }
+
+        const auto& target_section = context.sections[target_section_index];
+        if (!target_section.executable ||
+            !target_section.relocatable ||
+            is_resident_text_section(target_section) ||
+            (target_vram & 3u) != 0 ||
+            target_vram < target_section.ram_addr ||
+            target_vram >= target_section.ram_addr + target_section.size) {
+            return;
+        }
+
+        if (find_exact_function_in_section(context, target_vram, target_section_index) != (size_t)-1) {
+            return;
+        }
+
+        auto is_non_return_indirect_jump_at = [&](uint32_t instr_vram) {
+            if (instr_vram < target_section.ram_addr ||
+                instr_vram + sizeof(uint32_t) > target_section.ram_addr + target_section.size) {
+                return false;
+            }
+
+            const uint32_t instr_word = byteswap(*reinterpret_cast<const uint32_t*>(
+                context.rom.data() + target_section.rom_addr + (instr_vram - target_section.ram_addr)));
+            rabbitizer::InstructionCpu instr(instr_word, instr_vram);
+            return instr.isValid() &&
+                instr.getUniqueId() == rabbitizer::InstrId::UniqueId::cpu_jr &&
+                int(instr.GetO32_rs()) != (int)rabbitizer::Registers::Cpu::GprO32::GPR_O32_ra;
+        };
+
+        auto discovered_entry_ends_with_non_return_indirect_jump =
+            [&](uint32_t entry_vram, size_t discovered_size) {
+                if (discovered_size < sizeof(uint32_t) * 2) {
+                    return false;
+                }
+
+                return is_non_return_indirect_jump_at(
+                    entry_vram + uint32_t(discovered_size - sizeof(uint32_t) * 2));
+            };
+
+        auto direct_unconditional_jump_target_at = [&](uint32_t instr_vram, uint32_t* branch_target_out = nullptr) {
+            if (instr_vram < target_section.ram_addr ||
+                instr_vram + sizeof(uint32_t) > target_section.ram_addr + target_section.size) {
+                return false;
+            }
+
+            const uint32_t instr_word = byteswap(*reinterpret_cast<const uint32_t*>(
+                context.rom.data() + target_section.rom_addr + (instr_vram - target_section.ram_addr)));
+            rabbitizer::InstructionCpu instr(instr_word, instr_vram);
+            if (!instr.isValid()) {
+                return false;
+            }
+
+            using InstrId = rabbitizer::InstrId::UniqueId;
+            const auto id = instr.getUniqueId();
+            const bool is_direct_jump = id == InstrId::cpu_j ||
+                id == InstrId::cpu_b ||
+                (id == InstrId::cpu_beq &&
+                 int(instr.GetO32_rs()) == 0 &&
+                 int(instr.GetO32_rt()) == 0);
+            if (!is_direct_jump) {
+                return false;
+            }
+
+            if (branch_target_out != nullptr) {
+                *branch_target_out = uint32_t(instr.getBranchVramGeneric());
+            }
+            return true;
+        };
+
+        auto direct_unconditional_jump_targets_same_section = [&](uint32_t instr_vram) {
+            uint32_t branch_target = 0;
+            if (!direct_unconditional_jump_target_at(instr_vram, &branch_target)) {
+                return false;
+            }
+
+            return branch_target >= target_section.ram_addr &&
+                branch_target < target_section.ram_addr + target_section.size;
+        };
+
+        auto discovered_entry_ends_with_backward_direct_unconditional_jump =
+            [&](uint32_t entry_vram, size_t discovered_size) {
+                if (discovered_size < sizeof(uint32_t) * 2) {
+                    return false;
+                }
+
+                uint32_t branch_target = 0;
+                if (!direct_unconditional_jump_target_at(
+                        entry_vram + uint32_t(discovered_size - sizeof(uint32_t) * 2),
+                        &branch_target)) {
+                    return false;
+                }
+
+                return branch_target >= target_section.ram_addr &&
+                    branch_target < target_section.ram_addr + target_section.size &&
+                    branch_target < entry_vram;
+            };
+
+        auto discovered_entry_contains_direct_call =
+            [&](uint32_t entry_vram, size_t discovered_size) {
+                using InstrId = rabbitizer::InstrId::UniqueId;
+                for (size_t offset = 0; offset < discovered_size; offset += sizeof(uint32_t)) {
+                    const uint32_t instr_vram = entry_vram + uint32_t(offset);
+                    if (instr_vram < target_section.ram_addr ||
+                        instr_vram + sizeof(uint32_t) > target_section.ram_addr + target_section.size) {
+                        return true;
+                    }
+
+                    const uint32_t instr_word = byteswap(*reinterpret_cast<const uint32_t*>(
+                        context.rom.data() + target_section.rom_addr + (instr_vram - target_section.ram_addr)));
+                    rabbitizer::InstructionCpu instr(instr_word, instr_vram);
+                    if (!instr.isValid()) {
+                        return true;
+                    }
+
+                    const auto id = instr.getUniqueId();
+                    if (id == InstrId::cpu_jal || id == InstrId::cpu_jalr) {
+                        return true;
+                    }
+                }
+
+                return false;
+            };
+
+        auto is_conditional_branch_at = [&](uint32_t instr_vram) {
+            if (instr_vram < target_section.ram_addr ||
+                instr_vram + sizeof(uint32_t) > target_section.ram_addr + target_section.size) {
+                return false;
+            }
+
+            const uint32_t instr_word = byteswap(*reinterpret_cast<const uint32_t*>(
+                context.rom.data() + target_section.rom_addr + (instr_vram - target_section.ram_addr)));
+            rabbitizer::InstructionCpu instr(instr_word, instr_vram);
+            if (!instr.isValid()) {
+                return false;
+            }
+
+            using InstrId = rabbitizer::InstrId::UniqueId;
+            switch (instr.getUniqueId()) {
+                case InstrId::cpu_beq:
+                case InstrId::cpu_beql:
+                case InstrId::cpu_bne:
+                case InstrId::cpu_bnel:
+                case InstrId::cpu_bgez:
+                case InstrId::cpu_bgezl:
+                case InstrId::cpu_bgtz:
+                case InstrId::cpu_bgtzl:
+                case InstrId::cpu_blez:
+                case InstrId::cpu_blezl:
+                case InstrId::cpu_bltz:
+                case InstrId::cpu_bltzl:
+                case InstrId::cpu_bgezal:
+                case InstrId::cpu_bgezall:
+                case InstrId::cpu_bltzal:
+                case InstrId::cpu_bltzall:
+                case InstrId::cpu_bc1f:
+                case InstrId::cpu_bc1fl:
+                case InstrId::cpu_bc1t:
+                case InstrId::cpu_bc1tl:
+                    return true;
+                default:
+                    return false;
+            }
+        };
+
+        auto discovered_entry_ends_after_conditional_branch_delay =
+            [&](uint32_t entry_vram, size_t discovered_size) {
+                if (discovered_size < sizeof(uint32_t) * 2) {
+                    return false;
+                }
+
+                return is_conditional_branch_at(
+                    entry_vram + uint32_t(discovered_size - sizeof(uint32_t) * 2));
+            };
+
+        auto follows_unconditional_control_transfer = [&](const N64Recomp::Function& func) {
+            using InstrId = rabbitizer::InstrId::UniqueId;
+            if (target_vram < func.vram + sizeof(uint32_t) * 2) {
+                return false;
+            }
+
+            const size_t word_index = (target_vram - func.vram) / sizeof(uint32_t);
+            if (word_index < 2 || word_index > func.words.size()) {
+                return false;
+            }
+
+            const uint32_t branch_vram = target_vram - sizeof(uint32_t) * 2;
+            const uint32_t branch_word = byteswap(func.words[word_index - 2]);
+            rabbitizer::InstructionCpu branch_instr(branch_word, branch_vram);
+            if (!branch_instr.isValid()) {
+                return false;
+            }
+
+            const auto id = branch_instr.getUniqueId();
+            return id == InstrId::cpu_j ||
+                id == InstrId::cpu_b ||
+                (id == InstrId::cpu_beq &&
+                 int(branch_instr.GetO32_rs()) == 0 &&
+                 int(branch_instr.GetO32_rt()) == 0);
+        };
+
+        bool target_looks_valid = false;
+        size_t containing_func_index = find_containing_function_in_section(
+            context, target_vram, target_section_index);
+        if (containing_func_index != (size_t)-1) {
+            const auto& containing_func = context.functions[containing_func_index];
+            target_looks_valid =
+                static_entrypoint_inside_function_looks_valid(containing_func, target_vram) &&
+                ((raw_table_entry &&
+                  (follows_unconditional_control_transfer(containing_func) ||
+                   is_non_return_indirect_jump_at(target_vram) ||
+                   direct_unconditional_jump_targets_same_section(target_vram))) ||
+                 is_non_return_indirect_jump_at(target_vram + 4) ||
+                 is_non_return_indirect_jump_at(target_vram + 8));
+        }
+        else {
+            size_t discovered_size = 0;
+            bool discovered_entry = discover_static_code_entrypoint(
+                context, target_section_index, target_vram, &discovered_size);
+            target_looks_valid =
+                discovered_entry &&
+                discovered_size <= max_pointer_static_entry_size &&
+                ((raw_table_entry && is_non_return_indirect_jump_at(target_vram)) ||
+                 is_non_return_indirect_jump_at(target_vram + 4) ||
+                 is_non_return_indirect_jump_at(target_vram + 8) ||
+                 (raw_table_entry &&
+                  discovered_size <= sizeof(uint32_t) * 8 &&
+                  !discovered_entry_contains_direct_call(target_vram, discovered_size) &&
+                  discovered_entry_ends_with_backward_direct_unconditional_jump(target_vram, discovered_size)) ||
+                 (raw_table_entry &&
+                  discovered_entry_ends_with_non_return_indirect_jump(target_vram, discovered_size)) ||
+                 (raw_table_entry &&
+                  discovered_entry_ends_after_conditional_branch_delay(target_vram, discovered_size)));
+        }
+
+        if (!target_looks_valid) {
+            return;
+        }
+
+        if (!seeded_entries.emplace(target_section_index, target_vram).second) {
+            return;
+        }
+
+        static_funcs_by_section[target_section_index].push_back(target_vram);
+        seeded_count++;
+    };
+
+    for (size_t offset = 0; offset + sizeof(uint32_t) <= context.rom.size(); offset += sizeof(uint32_t)) {
+        const uint32_t target_vram =
+            byteswap(*reinterpret_cast<const uint32_t*>(context.rom.data() + offset));
+        for (size_t target_section_index : find_indexed_executable_sections(target_vram)) {
+            seed_target(
+                target_section_index,
+                target_vram,
+                word_is_in_raw_code_pointer_table(offset, target_section_index));
+        }
+    }
+
+    if (seeded_count != 0) {
+        fmt::print(
+            "[Info] Seeded {} static code-label entr{} from raw code-pointer tables\n",
+            seeded_count,
+            seeded_count == 1 ? "y" : "ies");
+    }
+}
+
+bool function_contains_indirect_dispatch(const N64Recomp::Function& func) {
+    using InstrId = rabbitizer::InstrId::UniqueId;
+    constexpr int ra_reg = (int)rabbitizer::Registers::Cpu::GprO32::GPR_O32_ra;
+
+    uint32_t vram = func.vram;
+    for (uint32_t word : func.words) {
+        uint32_t insn_word = byteswap(word);
+        rabbitizer::InstructionCpu instr(insn_word, vram);
+        if (!instr.isValid()) {
+            vram += sizeof(uint32_t);
+            continue;
+        }
+
+        const auto id = instr.getUniqueId();
+        if (id == InstrId::cpu_jr && int(instr.GetO32_rs()) != ra_reg) {
+            return true;
+        }
+
+        vram += sizeof(uint32_t);
+    }
+
+    return false;
+}
+
+bool is_unconditional_branch_or_jump(const rabbitizer::InstructionCpu& instr) {
+    using InstrId = rabbitizer::InstrId::UniqueId;
+    const auto id = instr.getUniqueId();
+    if (id == InstrId::cpu_j || id == InstrId::cpu_b) {
+        return true;
+    }
+
+    if (id == InstrId::cpu_beq &&
+        int(instr.GetO32_rs()) == 0 &&
+        int(instr.GetO32_rt()) == 0) {
+        return true;
+    }
+
+    return false;
+}
+
+bool is_conditional_branch(const rabbitizer::InstructionCpu& instr) {
+    using InstrId = rabbitizer::InstrId::UniqueId;
+    switch (instr.getUniqueId()) {
+        case InstrId::cpu_beq:
+        case InstrId::cpu_beql:
+        case InstrId::cpu_bne:
+        case InstrId::cpu_bnel:
+        case InstrId::cpu_bgez:
+        case InstrId::cpu_bgezl:
+        case InstrId::cpu_bgtz:
+        case InstrId::cpu_bgtzl:
+        case InstrId::cpu_blez:
+        case InstrId::cpu_blezl:
+        case InstrId::cpu_bltz:
+        case InstrId::cpu_bltzl:
+        case InstrId::cpu_bgezal:
+        case InstrId::cpu_bgezall:
+        case InstrId::cpu_bltzal:
+        case InstrId::cpu_bltzall:
+        case InstrId::cpu_bc1f:
+        case InstrId::cpu_bc1fl:
+        case InstrId::cpu_bc1t:
+        case InstrId::cpu_bc1tl:
+            return true;
+        default:
+            return false;
+    }
+}
+
+bool static_entrypoint_inside_function_looks_valid(
+    const N64Recomp::Function& func,
+    uint32_t target_vram) {
+    const uint32_t func_end = func.vram + uint32_t(func.words.size() * sizeof(func.words[0]));
+    if (target_vram <= func.vram || target_vram >= func_end || (target_vram & 3u) != 0) {
+        return false;
+    }
+
+    size_t word_index = (target_vram - func.vram) / sizeof(uint32_t);
+    uint32_t insn_word = byteswap(func.words[word_index]);
+    rabbitizer::InstructionCpu instr(insn_word, target_vram);
+    return instr.isValid() && (insn_word == 0 || !instruction_writes_zero_gpr(instr, insn_word));
+}
+
+void seed_static_branch_continuations_from_indirect_dispatch_entries(
+    const N64Recomp::Context& context,
+    std::vector<std::vector<uint32_t>>& static_funcs_by_section) {
+    using InstrId = rabbitizer::InstrId::UniqueId;
+    constexpr int ra_reg = (int)rabbitizer::Registers::Cpu::GprO32::GPR_O32_ra;
+    constexpr size_t max_dispatch_function_size = 0x2000;
+    constexpr size_t max_static_dispatch_scan_size = 0x800;
+    size_t seeded_count = 0;
+
+    for (size_t section_index = 0; section_index < context.sections.size(); section_index++) {
+        const auto& section = context.sections[section_index];
+        if (!section.executable ||
+            !section.relocatable ||
+            is_resident_text_section(section) ||
+            section.rom_addr >= 0xF0000000u ||
+            uint64_t(section.rom_addr) + uint64_t(section.size) > context.rom.size()) {
+            continue;
+        }
+
+        std::set<uint32_t> seeded_entries{
+            static_funcs_by_section[section_index].begin(),
+            static_funcs_by_section[section_index].end()
+        };
+
+        std::vector<uint32_t> entry_snapshot{
+            static_funcs_by_section[section_index].begin(),
+            static_funcs_by_section[section_index].end()
+        };
+        std::sort(entry_snapshot.begin(), entry_snapshot.end());
+        entry_snapshot.erase(
+            std::unique(entry_snapshot.begin(), entry_snapshot.end()),
+            entry_snapshot.end());
+        std::set<size_t> processed_functions;
+
+        auto add_entry = [&](const N64Recomp::Function& func, uint32_t target_vram) {
+            if (!static_entrypoint_inside_function_looks_valid(func, target_vram)) {
+                return;
+            }
+
+            if (find_exact_function_in_section(context, target_vram, section_index) != (size_t)-1) {
+                return;
+            }
+
+            if (!seeded_entries.emplace(target_vram).second) {
+                return;
+            }
+
+            static_funcs_by_section[section_index].push_back(target_vram);
+            seeded_count++;
+        };
+
+        for (uint32_t entry_vram : entry_snapshot) {
+            if ((entry_vram & 3u) != 0 ||
+                find_exact_function_in_section(context, entry_vram, section_index) != (size_t)-1) {
+                continue;
+            }
+
+            const size_t containing_func_index = find_containing_function_in_section(
+                context, entry_vram, section_index);
+            if (containing_func_index == (size_t)-1) {
+                continue;
+            }
+
+            const auto& func = context.functions[containing_func_index];
+            const size_t func_size = func.words.size() * sizeof(func.words[0]);
+            if (func.words.empty() ||
+                func.ignored ||
+                func.reimplemented ||
+                func_size > max_dispatch_function_size ||
+                entry_vram < func.vram ||
+                entry_vram >= func.vram + func_size) {
+                continue;
+            }
+
+            if (!processed_functions.emplace(containing_func_index).second) {
+                continue;
+            }
+
+            const uint32_t scan_start = func.vram;
+            const uint32_t scan_end = std::min<uint32_t>(
+                func.vram + uint32_t(func_size),
+                func.vram + uint32_t(max_static_dispatch_scan_size));
+            if (scan_end <= scan_start + sizeof(uint32_t)) {
+                continue;
+            }
+
+            size_t start_word_index = (scan_start - func.vram) / sizeof(func.words[0]);
+            size_t end_word_index = (scan_end - func.vram) / sizeof(func.words[0]);
+            for (size_t word_index = start_word_index; word_index < end_word_index; word_index++) {
+                uint32_t instr_vram = func.vram + uint32_t(word_index * sizeof(func.words[0]));
+                uint32_t insn_word = byteswap(func.words[word_index]);
+                rabbitizer::InstructionCpu instr(insn_word, instr_vram);
+                if (!instr.isValid()) {
+                    continue;
+                }
+
+                const auto id = instr.getUniqueId();
+                if (is_unconditional_branch_or_jump(instr) ||
+                    (id == InstrId::cpu_jr &&
+                     int(instr.GetO32_rs()) == ra_reg)) {
+                    add_entry(func, instr_vram + 8);
+                }
+                else if (is_conditional_branch(instr)) {
+                    add_entry(func, instr_vram + 8);
+                }
+            }
+        }
+    }
+
+    if (seeded_count != 0) {
+        fmt::print(
+            "[Info] Seeded {} static branch-continuation entr{} from indirect dispatch labels\n",
+            seeded_count,
+            seeded_count == 1 ? "y" : "ies");
+    }
+}
+
+void seed_static_entrypoints_from_indirect_dispatch(
+    const N64Recomp::Context& context,
+    std::vector<std::vector<uint32_t>>& static_funcs_by_section) {
+    using InstrId = rabbitizer::InstrId::UniqueId;
+    constexpr int ra_reg = (int)rabbitizer::Registers::Cpu::GprO32::GPR_O32_ra;
+    constexpr size_t max_dispatch_function_size = 0x2000;
+    constexpr size_t max_control_entry_function_size = 0x100;
+    size_t seeded_count = 0;
+
+    for (size_t section_index = 0; section_index < context.sections.size(); section_index++) {
+        const auto& section = context.sections[section_index];
+        if (!section.executable || !section.relocatable ||
+            is_resident_text_section(section)) {
+            continue;
+        }
+
+        if (section.rom_addr >= 0xF0000000u ||
+            uint64_t(section.rom_addr) + uint64_t(section.size) > context.rom.size()) {
+            continue;
+        }
+
+        bool section_contains_indirect_dispatch = false;
+        for (size_t func_index : context.section_functions[section_index]) {
+            const auto& func = context.functions[func_index];
+            if (!func.words.empty() &&
+                func.words.size() * sizeof(func.words[0]) <= max_dispatch_function_size &&
+                function_contains_indirect_dispatch(func)) {
+                section_contains_indirect_dispatch = true;
+                break;
+            }
+        }
+        if (!section_contains_indirect_dispatch) {
+            continue;
+        }
+
+        std::set<uint32_t> seeded_entries{
+            static_funcs_by_section[section_index].begin(),
+            static_funcs_by_section[section_index].end()
+        };
+
+        auto add_entry = [&](const N64Recomp::Function& func, uint32_t target_vram) {
+            if (!static_entrypoint_inside_function_looks_valid(func, target_vram)) {
+                return;
+            }
+
+            if (find_exact_function_in_section(context, target_vram, section_index) != (size_t)-1) {
+                return;
+            }
+
+            if (!seeded_entries.emplace(target_vram).second) {
+                return;
+            }
+
+            static_funcs_by_section[section_index].push_back(target_vram);
+            seeded_count++;
+        };
+
+        for (size_t func_index : context.section_functions[section_index]) {
+            const auto& func = context.functions[func_index];
+            const size_t func_size = func.words.size() * sizeof(func.words[0]);
+            if (func.words.empty() ||
+                func.ignored ||
+                func.reimplemented ||
+                func_size > max_dispatch_function_size ||
+                !function_contains_indirect_dispatch(func)) {
+                continue;
+            }
+
+            for (size_t word_index = 0; word_index < func.words.size(); word_index++) {
+                uint32_t instr_vram = func.vram + uint32_t(word_index * sizeof(func.words[0]));
+                uint32_t word = func.words[word_index];
+                uint32_t insn_word = byteswap(word);
+                rabbitizer::InstructionCpu instr(insn_word, instr_vram);
+                if (instr.isValid()) {
+                    if (instr.doesLink()) {
+                        add_entry(func, instr_vram + 8);
+                    }
+
+                    if (is_unconditional_branch_or_jump(instr)) {
+                        if (func_size <= max_control_entry_function_size) {
+                            add_entry(func, instr_vram);
+                        }
+                        add_entry(func, instr_vram + 8);
+                    }
+                    else if (is_conditional_branch(instr)) {
+                        add_entry(func, instr_vram + 8);
+                    }
+                    else if (instr.getUniqueId() == InstrId::cpu_jr &&
+                             int(instr.GetO32_rs()) != 0) {
+                        if (func_size <= max_control_entry_function_size) {
+                            add_entry(func, instr_vram);
+                        }
+                        add_entry(func, instr_vram + 8);
+                    }
+                }
+            }
+        }
+
+        auto add_raw_entry = [&](uint32_t target_vram) {
+            if ((target_vram & 3u) != 0 ||
+                target_vram < section.ram_addr ||
+                target_vram >= section.ram_addr + section.size) {
+                return;
+            }
+
+            if (find_exact_function_in_section(context, target_vram, section_index) != (size_t)-1) {
+                return;
+            }
+
+            bool target_looks_valid = false;
+            size_t containing_func_index = find_containing_function_in_section(context, target_vram, section_index);
+            if (containing_func_index != (size_t)-1) {
+                target_looks_valid = static_entrypoint_inside_function_looks_valid(
+                    context.functions[containing_func_index],
+                    target_vram);
+            }
+            else {
+                size_t discovered_size = 0;
+                target_looks_valid =
+                    discover_static_code_entrypoint(context, section_index, target_vram, &discovered_size) &&
+                    discovered_size <= max_dispatch_function_size;
+            }
+
+            if (!target_looks_valid) {
+                return;
+            }
+
+            if (!seeded_entries.emplace(target_vram).second) {
+                return;
+            }
+
+            static_funcs_by_section[section_index].push_back(target_vram);
+            seeded_count++;
+        };
+
+        const uint8_t* section_body = context.rom.data() + section.rom_addr;
+        std::vector<uint32_t> seeded_snapshot{ seeded_entries.begin(), seeded_entries.end() };
+        for (uint32_t entry_vram : seeded_snapshot) {
+            if (entry_vram + 8 < section.ram_addr ||
+                entry_vram + 8 >= section.ram_addr + section.size) {
+                continue;
+            }
+
+            const uint32_t return_vram = entry_vram + 8;
+            const uint32_t return_word = byteswap(*reinterpret_cast<const uint32_t*>(
+                section_body + (return_vram - section.ram_addr)));
+            rabbitizer::InstructionCpu return_instr(return_word, return_vram);
+            if (return_instr.isValid() &&
+                return_instr.getUniqueId() == InstrId::cpu_jr &&
+                int(return_instr.GetO32_rs()) != 0 &&
+                int(return_instr.GetO32_rs()) != ra_reg) {
+                add_raw_entry(entry_vram + 4);
+            }
+        }
+
+        for (size_t dispatch_func_index : context.section_functions[section_index]) {
+            const auto& dispatch_func = context.functions[dispatch_func_index];
+            const size_t dispatch_func_size = dispatch_func.words.size() * sizeof(dispatch_func.words[0]);
+            if (dispatch_func.words.empty() ||
+                dispatch_func.ignored ||
+                dispatch_func.reimplemented ||
+                dispatch_func_size > max_dispatch_function_size ||
+                !function_contains_indirect_dispatch(dispatch_func)) {
+                continue;
+            }
+
+            uint32_t scan_start = dispatch_func.vram;
+            uint32_t scan_end = std::min<uint32_t>(
+                section.ram_addr + section.size,
+                dispatch_func.vram + uint32_t(max_dispatch_function_size));
+
+            for (size_t other_func_index : context.section_functions[section_index]) {
+                const auto& other_func = context.functions[other_func_index];
+                if (!other_func.words.empty() &&
+                    other_func.vram > dispatch_func.vram &&
+                    other_func.vram < scan_end) {
+                    scan_end = other_func.vram;
+                }
+            }
+
+            if (scan_end <= scan_start + 8) {
+                continue;
+            }
+
+            uint32_t scan_offset = scan_start - section.ram_addr;
+            const uint32_t scan_end_offset = scan_end - section.ram_addr;
+            for (; scan_offset + 8 <= scan_end_offset; scan_offset += sizeof(uint32_t)) {
+                const uint32_t instr_word =
+                    byteswap(*reinterpret_cast<const uint32_t*>(section_body + scan_offset));
+                const uint32_t instr_vram = section.ram_addr + scan_offset;
+                rabbitizer::InstructionCpu instr(instr_word, instr_vram);
+                if (!instr.isValid()) {
+                    continue;
+                }
+
+                const auto id = instr.getUniqueId();
+                if (id == InstrId::cpu_jr || is_unconditional_branch_or_jump(instr)) {
+                    if (dispatch_func_size <= max_control_entry_function_size) {
+                        add_raw_entry(instr_vram);
+                    }
+                    add_raw_entry(instr_vram + 8);
+                }
+            }
+        }
+    }
+
+    if (seeded_count != 0) {
+        fmt::print(
+            "[Info] Seeded {} static code-label entr{} from indirect dispatch sections\n",
+            seeded_count,
+            seeded_count == 1 ? "y" : "ies");
+    }
 }
 
 bool recompile_single_function(const N64Recomp::Context& context, size_t func_index, const std::string& recomp_include, const std::filesystem::path& output_path, std::span<std::vector<uint32_t>> static_funcs_out) {
@@ -572,6 +1759,11 @@ int main(int argc, char** argv) {
     );
 
     std::vector<std::vector<uint32_t>> static_funcs_by_section{ context.sections.size() };
+    seed_static_entrypoints_from_code_relocs(context, static_funcs_by_section);
+    seed_static_entrypoints_from_pointer_tables(context, static_funcs_by_section);
+    seed_static_entrypoints_from_code_relocs(context, static_funcs_by_section);
+    seed_static_branch_continuations_from_indirect_dispatch_entries(context, static_funcs_by_section);
+    seed_static_entrypoints_from_code_relocs(context, static_funcs_by_section);
 
     fmt::print("Working dir: {}\n", std::filesystem::current_path().string());
 
@@ -872,52 +2064,131 @@ int main(int argc, char** argv) {
         std::vector<uint32_t> section_statics{};
         section_statics.assign(statics_set.begin(), statics_set.end());
 
+        auto span_ends_after_conditional_branch_delay = [&](uint32_t span_end) {
+            if (span_end < section.ram_addr + sizeof(uint32_t) * 2 ||
+                span_end > section.ram_addr + section.size) {
+                return false;
+            }
+
+            const uint32_t branch_vram = span_end - sizeof(uint32_t) * 2;
+            const uint32_t branch_word = byteswap(*reinterpret_cast<const uint32_t*>(
+                context.rom.data() + section.rom_addr + (branch_vram - section.ram_addr)));
+            rabbitizer::InstructionCpu branch_instr(branch_word, branch_vram);
+            return branch_instr.isValid() && is_conditional_branch(branch_instr);
+        };
+
         for (size_t static_func_index = 0; static_func_index < section_statics.size(); static_func_index++) {
             uint32_t static_func_addr = section_statics[static_func_index];
+            size_t exact_func_index = find_exact_function_in_section(context, static_func_addr, section_index);
+            if (exact_func_index != (size_t)-1) {
+                const auto& exact_func = context.functions[exact_func_index];
+                std::string alias_name = fmt::format("static_{}_{:08X}", section_index, static_func_addr);
+                fmt::print(func_header_file,
+                           "void {}(uint8_t* rdram, recomp_context* ctx);\n", alias_name);
+                fmt::print(current_output_file,
+                           "RECOMP_FUNC void {}(uint8_t* rdram, recomp_context* ctx) {{\n"
+                           "    {}(rdram, ctx);\n"
+                           "}}\n",
+                           alias_name,
+                           exact_func.name);
+                if (!config.single_file_output) {
+                    cur_file_function_count++;
+                    if (cur_file_function_count >= config.functions_per_output_file) {
+                        open_new_output_file();
+                    }
+                }
+                continue;
+            }
 
-            // Determine the end of this static function
+            // Determine the code span for this static function.
+            uint32_t code_func_start = static_func_addr;
+            uint32_t code_rom_addr = static_cast<uint32_t>(static_func_addr - section.ram_addr + section.rom_addr);
             uint32_t cur_func_end = static_cast<uint32_t>(section.size + section.ram_addr);
+            size_t containing_func_index = find_containing_function_in_section(context, static_func_addr, section_index);
 
+            if (containing_func_index != (size_t)-1) {
+                const auto& containing_func = context.functions[containing_func_index];
+                code_func_start = containing_func.vram;
+                code_rom_addr = containing_func.rom;
+                cur_func_end = containing_func.vram + uint32_t(containing_func.words.size() * sizeof(containing_func.words[0]));
+            }
+            else {
             // Search for the closest function. The bounds check must come
             // first — the previous order read section_funcs[size] before
             // exiting, which is OOB and segfaults for static funcs whose
             // address lies past the last known function in the section
             // (observed in Stadium's .fragment1 once it was marked
             // relocatable, which exposes more CreateStatic targets).
-            size_t closest_func_index = 0;
-            while (closest_func_index < section_funcs.size() && section_funcs[closest_func_index] < static_func_addr) {
-                closest_func_index++;
-            }
-
-            // Check if there's a nonstatic function after this one
-            if (closest_func_index < section_funcs.size()) {
-                // If so, use that function's address as the end of this one
-                cur_func_end = section_funcs[closest_func_index];
-            }
-
-            // Check for any known statics after this function and truncate this function's size to make sure it doesn't overlap.
-            for (uint32_t checked_func : statics_set) {
-                if (checked_func > static_func_addr && checked_func < cur_func_end) {
-                    cur_func_end = checked_func;
+                for (size_t func_index : context.section_functions[section_index]) {
+                    const auto& boundary_func = context.functions[func_index];
+                    if (boundary_func.words.empty() || boundary_func.name.rfind("static_", 0) == 0) {
+                        continue;
+                    }
+                    if (boundary_func.vram > static_func_addr && boundary_func.vram < cur_func_end) {
+                        cur_func_end = boundary_func.vram;
+                    }
                 }
+
+                size_t discovered_size = 0;
+                std::string discover_error;
+                const size_t entry_offset = static_func_addr - section.ram_addr;
+                if (N64Recomp::discover_function_bounds(
+                        context.rom.data() + section.rom_addr,
+                        section.size,
+                        section.ram_addr,
+                        entry_offset,
+                        discovered_size,
+                        discover_error)) {
+                    cur_func_end = static_func_addr + uint32_t(discovered_size);
+                    cur_func_end = std::min(cur_func_end, static_cast<uint32_t>(section.ram_addr + section.size));
+
+                    while (statics_set.contains(cur_func_end) &&
+                           span_ends_after_conditional_branch_delay(cur_func_end)) {
+                        size_t fallthrough_size = 0;
+                        if (!N64Recomp::discover_function_bounds(
+                                context.rom.data() + section.rom_addr,
+                                section.size,
+                                section.ram_addr,
+                                cur_func_end - section.ram_addr,
+                                fallthrough_size,
+                                discover_error) ||
+                            fallthrough_size == 0) {
+                            break;
+                        }
+
+                        const uint32_t extended_end =
+                            std::min<uint32_t>(
+                                cur_func_end + uint32_t(fallthrough_size),
+                                section.ram_addr + section.size);
+                        if (extended_end <= cur_func_end) {
+                            break;
+                        }
+                        cur_func_end = extended_end;
+                    }
+                }
+
             }
 
-            uint32_t rom_addr = static_cast<uint32_t>(static_func_addr - section.ram_addr + section.rom_addr);
-            const uint32_t* func_rom_start = reinterpret_cast<const uint32_t*>(context.rom.data() + rom_addr);
+            const uint32_t* func_rom_start = reinterpret_cast<const uint32_t*>(context.rom.data() + code_rom_addr);
 
-            std::vector<uint32_t> insn_words((cur_func_end - static_func_addr) / sizeof(uint32_t));
+            std::vector<uint32_t> insn_words((cur_func_end - code_func_start) / sizeof(uint32_t));
             insn_words.assign(func_rom_start, func_rom_start + insn_words.size());
 
             // Create the new function and add it to the context.
             size_t new_func_index = context.functions.size();
             context.functions.emplace_back(
-                static_func_addr,
-                rom_addr,
+                code_func_start,
+                code_rom_addr,
                 std::move(insn_words),
                 fmt::format("static_{}_{:08X}", section_index, static_func_addr),
                 static_cast<uint16_t>(section_index),
-                false
+                false,
+                false,
+                false,
+                static_func_addr
             );
+            context.section_functions[section_index].push_back(new_func_index);
+            context.functions_by_vram[static_func_addr].push_back(new_func_index);
             const N64Recomp::Function& new_func = context.functions[new_func_index];
 
             fmt::print(func_header_file,
@@ -1026,8 +2297,12 @@ int main(int argc, char** argv) {
                     size_t func_size = func.reimplemented ? 0 : func.words.size() * sizeof(func.words[0]);
 
                     if (func.reimplemented || (!func.name.empty() && !func.ignored && func.words.size() != 0)) {
+                        uint32_t func_offset = func.rom - section.rom_addr;
+                        if (func.entry_vram != 0 && func.entry_vram != func.vram) {
+                            func_offset += func.entry_vram - func.vram;
+                        }
                         fmt::print(overlay_file, "    {{ .func = {}, .offset = 0x{:08X}, .rom_size = 0x{:08X} }},\n",
-                            func.name, func.rom - section.rom_addr, func_size);
+                            func.name, func_offset, func_size);
                     }
                 }
 
@@ -1075,7 +2350,7 @@ int main(int argc, char** argv) {
                                 target_section_offset = reloc.target_section_offset;
                             }
                             fmt::print(overlay_file, "    {{ .offset = 0x{:08X}, .target_section_offset = 0x{:08X}, .target_section = {}, .type = {} }}, \n",
-                                reloc.address - section.ram_addr, target_section_offset, reloc.target_section, reloc_names[static_cast<size_t>(reloc.type)] );
+                                reloc_offset_in_section(context, section_index, reloc.address), target_section_offset, reloc.target_section, reloc_names[static_cast<size_t>(reloc.type)] );
                         }
                     }
 
@@ -1121,7 +2396,7 @@ int main(int argc, char** argv) {
             );
             for (size_t func_index : export_function_indices) {
                 const auto& func = context.functions[func_index];
-                fmt::print(overlay_file, "    {{ \"{}\", 0x{:08X} }},\n", func.name, func.vram);
+                fmt::print(overlay_file, "    {{ \"{}\", 0x{:08X} }},\n", func.name, func.entry_vram != 0 ? func.entry_vram : func.vram);
             }
             // Add a dummy element at the end to ensure the array has a valid length because C doesn't allow zero-size arrays.
             fmt::print(overlay_file, "    {{ NULL, 0 }}\n");
