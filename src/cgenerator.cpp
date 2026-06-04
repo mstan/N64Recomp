@@ -423,17 +423,17 @@ void N64Recomp::CGenerator::emit_function_call_lookup(uint32_t addr) const {
     fmt::print(output_file, "{{\n");
     fmt::print(output_file, "    gpr recomp_call_sp = ctx->r29;\n");
     fmt::print(output_file, "    uint32_t recomp_prev_host_return = ctx->host_return_target;\n");
-    fmt::print(output_file, "    ctx->host_return_target = (uint32_t)ctx->r31;\n");
+    fmt::print(output_file, "    uint32_t recomp_call_host_return = (uint32_t)ctx->r31;\n");
+    fmt::print(output_file, "    ctx->host_return_target = recomp_call_host_return;\n");
     fmt::print(output_file, "    LOOKUP_FUNC(0x{:08X})(rdram, ctx);\n", addr);
     fmt::print(output_file, "    if (ctx->tailcall_pending) {{\n");
     fmt::print(output_file, "        if (ctx->tailcall_dispatching) {{\n");
-    fmt::print(output_file, "            ctx->host_return_target = recomp_prev_host_return;\n");
-    fmt::print(output_file, "            return;\n");
+    fmt::print(output_file, "            recomp_cf_note(\"call-nested-dispatch\", (uint32_t)recomp_call_sp, recomp_prev_host_return, recomp_call_host_return, ctx);\n");
     fmt::print(output_file, "        }}\n");
     fmt::print(output_file, "        recomp_handle_tailcalls(rdram, ctx);\n");
     fmt::print(output_file, "    }}\n");
     fmt::print(output_file, "    ctx->host_return_target = recomp_prev_host_return;\n");
-    fmt::print(output_file, "    if (ctx->r29 != recomp_call_sp) {{ return; }}\n");
+    fmt::print(output_file, "    if (ctx->r29 != recomp_call_sp) {{ recomp_cf_note(\"call-sp-mismatch\", (uint32_t)recomp_call_sp, recomp_prev_host_return, recomp_call_host_return, ctx); return; }}\n");
     fmt::print(output_file, "}}\n");
 }
 
@@ -441,17 +441,17 @@ void N64Recomp::CGenerator::emit_function_call_by_register(int reg) const {
     fmt::print(output_file, "{{\n");
     fmt::print(output_file, "    gpr recomp_call_sp = ctx->r29;\n");
     fmt::print(output_file, "    uint32_t recomp_prev_host_return = ctx->host_return_target;\n");
-    fmt::print(output_file, "    ctx->host_return_target = (uint32_t)ctx->r31;\n");
+    fmt::print(output_file, "    uint32_t recomp_call_host_return = (uint32_t)ctx->r31;\n");
+    fmt::print(output_file, "    ctx->host_return_target = recomp_call_host_return;\n");
     fmt::print(output_file, "    LOOKUP_FUNC({})(rdram, ctx);\n", gpr_to_string(reg));
     fmt::print(output_file, "    if (ctx->tailcall_pending) {{\n");
     fmt::print(output_file, "        if (ctx->tailcall_dispatching) {{\n");
-    fmt::print(output_file, "            ctx->host_return_target = recomp_prev_host_return;\n");
-    fmt::print(output_file, "            return;\n");
+    fmt::print(output_file, "            recomp_cf_note(\"call-nested-dispatch\", (uint32_t)recomp_call_sp, recomp_prev_host_return, recomp_call_host_return, ctx);\n");
     fmt::print(output_file, "        }}\n");
     fmt::print(output_file, "        recomp_handle_tailcalls(rdram, ctx);\n");
     fmt::print(output_file, "    }}\n");
     fmt::print(output_file, "    ctx->host_return_target = recomp_prev_host_return;\n");
-    fmt::print(output_file, "    if (ctx->r29 != recomp_call_sp) {{ return; }}\n");
+    fmt::print(output_file, "    if (ctx->r29 != recomp_call_sp) {{ recomp_cf_note(\"call-sp-mismatch\", (uint32_t)recomp_call_sp, recomp_prev_host_return, recomp_call_host_return, ctx); return; }}\n");
     fmt::print(output_file, "}}\n");
 }
 
@@ -461,17 +461,17 @@ void N64Recomp::CGenerator::emit_function_call_reference_symbol(const Context& c
     fmt::print(output_file, "{{\n");
     fmt::print(output_file, "    gpr recomp_call_sp = ctx->r29;\n");
     fmt::print(output_file, "    uint32_t recomp_prev_host_return = ctx->host_return_target;\n");
-    fmt::print(output_file, "    ctx->host_return_target = (uint32_t)ctx->r31;\n");
+    fmt::print(output_file, "    uint32_t recomp_call_host_return = (uint32_t)ctx->r31;\n");
+    fmt::print(output_file, "    ctx->host_return_target = recomp_call_host_return;\n");
     fmt::print(output_file, "    {}(rdram, ctx);\n", sym.name);
     fmt::print(output_file, "    if (ctx->tailcall_pending) {{\n");
     fmt::print(output_file, "        if (ctx->tailcall_dispatching) {{\n");
-    fmt::print(output_file, "            ctx->host_return_target = recomp_prev_host_return;\n");
-    fmt::print(output_file, "            return;\n");
+    fmt::print(output_file, "            recomp_cf_note(\"call-nested-dispatch\", (uint32_t)recomp_call_sp, recomp_prev_host_return, recomp_call_host_return, ctx);\n");
     fmt::print(output_file, "        }}\n");
     fmt::print(output_file, "        recomp_handle_tailcalls(rdram, ctx);\n");
     fmt::print(output_file, "    }}\n");
     fmt::print(output_file, "    ctx->host_return_target = recomp_prev_host_return;\n");
-    fmt::print(output_file, "    if (ctx->r29 != recomp_call_sp) {{ return; }}\n");
+    fmt::print(output_file, "    if (ctx->r29 != recomp_call_sp) {{ recomp_cf_note(\"call-sp-mismatch\", (uint32_t)recomp_call_sp, recomp_prev_host_return, recomp_call_host_return, ctx); return; }}\n");
     fmt::print(output_file, "}}\n");
 }
 
@@ -479,17 +479,17 @@ void N64Recomp::CGenerator::emit_function_call(const Context& context, size_t fu
     fmt::print(output_file, "{{\n");
     fmt::print(output_file, "    gpr recomp_call_sp = ctx->r29;\n");
     fmt::print(output_file, "    uint32_t recomp_prev_host_return = ctx->host_return_target;\n");
-    fmt::print(output_file, "    ctx->host_return_target = (uint32_t)ctx->r31;\n");
+    fmt::print(output_file, "    uint32_t recomp_call_host_return = (uint32_t)ctx->r31;\n");
+    fmt::print(output_file, "    ctx->host_return_target = recomp_call_host_return;\n");
     fmt::print(output_file, "    {}(rdram, ctx);\n", context.functions[function_index].name);
     fmt::print(output_file, "    if (ctx->tailcall_pending) {{\n");
     fmt::print(output_file, "        if (ctx->tailcall_dispatching) {{\n");
-    fmt::print(output_file, "            ctx->host_return_target = recomp_prev_host_return;\n");
-    fmt::print(output_file, "            return;\n");
+    fmt::print(output_file, "            recomp_cf_note(\"call-nested-dispatch\", (uint32_t)recomp_call_sp, recomp_prev_host_return, recomp_call_host_return, ctx);\n");
     fmt::print(output_file, "        }}\n");
     fmt::print(output_file, "        recomp_handle_tailcalls(rdram, ctx);\n");
     fmt::print(output_file, "    }}\n");
     fmt::print(output_file, "    ctx->host_return_target = recomp_prev_host_return;\n");
-    fmt::print(output_file, "    if (ctx->r29 != recomp_call_sp) {{ return; }}\n");
+    fmt::print(output_file, "    if (ctx->r29 != recomp_call_sp) {{ recomp_cf_note(\"call-sp-mismatch\", (uint32_t)recomp_call_sp, recomp_prev_host_return, recomp_call_host_return, ctx); return; }}\n");
     fmt::print(output_file, "}}\n");
 }
 
@@ -497,17 +497,17 @@ void N64Recomp::CGenerator::emit_named_function_call(const std::string& function
     fmt::print(output_file, "{{\n");
     fmt::print(output_file, "    gpr recomp_call_sp = ctx->r29;\n");
     fmt::print(output_file, "    uint32_t recomp_prev_host_return = ctx->host_return_target;\n");
-    fmt::print(output_file, "    ctx->host_return_target = (uint32_t)ctx->r31;\n");
+    fmt::print(output_file, "    uint32_t recomp_call_host_return = (uint32_t)ctx->r31;\n");
+    fmt::print(output_file, "    ctx->host_return_target = recomp_call_host_return;\n");
     fmt::print(output_file, "    {}(rdram, ctx);\n", function_name);
     fmt::print(output_file, "    if (ctx->tailcall_pending) {{\n");
     fmt::print(output_file, "        if (ctx->tailcall_dispatching) {{\n");
-    fmt::print(output_file, "            ctx->host_return_target = recomp_prev_host_return;\n");
-    fmt::print(output_file, "            return;\n");
+    fmt::print(output_file, "            recomp_cf_note(\"call-nested-dispatch\", (uint32_t)recomp_call_sp, recomp_prev_host_return, recomp_call_host_return, ctx);\n");
     fmt::print(output_file, "        }}\n");
     fmt::print(output_file, "        recomp_handle_tailcalls(rdram, ctx);\n");
     fmt::print(output_file, "    }}\n");
     fmt::print(output_file, "    ctx->host_return_target = recomp_prev_host_return;\n");
-    fmt::print(output_file, "    if (ctx->r29 != recomp_call_sp) {{ return; }}\n");
+    fmt::print(output_file, "    if (ctx->r29 != recomp_call_sp) {{ recomp_cf_note(\"call-sp-mismatch\", (uint32_t)recomp_call_sp, recomp_prev_host_return, recomp_call_host_return, ctx); return; }}\n");
     fmt::print(output_file, "}}\n");
 }
 

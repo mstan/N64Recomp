@@ -563,6 +563,7 @@ static inline void recomp_request_tailcall_func(recomp_context* ctx, recomp_func
 }
 
 void recomp_handle_tailcalls(uint8_t* rdram, recomp_context* ctx);
+void recomp_cf_note(const char* kind, uint32_t value0, uint32_t value1, uint32_t value2, recomp_context* ctx);
 
 #define LOOKUP_FUNC(val) \
     get_function((int32_t)(val))
