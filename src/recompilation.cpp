@@ -614,6 +614,16 @@ bool process_instruction(GeneratorType& generator, const N64Recomp::Context& con
             return false;
         }
         print_indent();
+        fmt::print(output_file, "if (0x{:08X}u == ctx->host_return_target) {{\n", target_vram);
+        if (context.trace_mode) {
+            print_indent();
+            fmt::print(output_file, "    TRACE_RETURN()\n");
+        }
+        print_indent();
+        fmt::print(output_file, "    return;\n");
+        print_indent();
+        fmt::print(output_file, "}}\n");
+        print_indent();
         fmt::print(output_file, "recomp_request_tailcall(ctx, (gpr)(int32_t)0x{:08X}u);\n", target_vram);
         print_trace_return();
         print_indent();
@@ -621,12 +631,22 @@ bool process_instruction(GeneratorType& generator, const N64Recomp::Context& con
         return true;
     };
 
-    auto print_tailcall_by_function = [&](const std::string& target_name) {
+    auto print_tailcall_by_function = [&](const std::string& target_name, uint32_t target_vram) {
         if (!process_delay_slot(false)) {
             return false;
         }
         print_indent();
-        fmt::print(output_file, "recomp_request_tailcall_func(ctx, {});\n", target_name);
+        fmt::print(output_file, "if (0x{:08X}u == ctx->host_return_target) {{\n", target_vram);
+        if (context.trace_mode) {
+            print_indent();
+            fmt::print(output_file, "    TRACE_RETURN()\n");
+        }
+        print_indent();
+        fmt::print(output_file, "    return;\n");
+        print_indent();
+        fmt::print(output_file, "}}\n");
+        print_indent();
+        fmt::print(output_file, "recomp_request_tailcall_func_target(ctx, {}, 0x{:08X}u);\n", target_name, target_vram);
         print_trace_return();
         print_indent();
         fmt::print(output_file, "return;\n");
@@ -794,14 +814,14 @@ bool process_instruction(GeneratorType& generator, const N64Recomp::Context& con
                     branch_target,
                     resolution_name);
                 if (branch_result == JalResolutionResult::Match) {
-                    if (!print_tailcall_by_function(context.functions[matched_func_index].name)) {
+                    if (!print_tailcall_by_function(context.functions[matched_func_index].name, branch_target)) {
                         return false;
                     }
                 }
                 else if (can_create_static_branch) {
                     std::string static_target_name = fmt::format("static_{}_{:08X}", static_section_index, branch_target);
                     static_funcs_out[static_section_index].push_back(branch_target);
-                    if (!print_tailcall_by_function(static_target_name)) {
+                    if (!print_tailcall_by_function(static_target_name, branch_target)) {
                         return false;
                     }
                 }
@@ -1475,8 +1495,18 @@ bool recompile_function_impl(GeneratorType& generator, const N64Recomp::Context&
             if (fallthrough_func_index != (size_t)-1 && fallthrough_func_index != func_index) {
                 fmt::print(
                     output_file,
-                    "    recomp_request_tailcall_func(ctx, {});\n",
-                    context.functions[fallthrough_func_index].name);
+                    "    if (0x{:08X}u == ctx->host_return_target) {{\n",
+                    fallthrough_vram);
+                if (context.trace_mode) {
+                    fmt::print(output_file, "        TRACE_RETURN()\n");
+                }
+                fmt::print(output_file, "        return;\n");
+                fmt::print(output_file, "    }}\n");
+                fmt::print(
+                    output_file,
+                    "    recomp_request_tailcall_func_target(ctx, {}, 0x{:08X}u);\n",
+                    context.functions[fallthrough_func_index].name,
+                    fallthrough_vram);
                 if (context.trace_mode) {
                     fmt::print(output_file, "    TRACE_RETURN()\n");
                 }

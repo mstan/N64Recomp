@@ -562,6 +562,12 @@ static inline void recomp_request_tailcall_func(recomp_context* ctx, recomp_func
     ctx->tailcall_pending = 1;
 }
 
+static inline void recomp_request_tailcall_func_target(recomp_context* ctx, recomp_func_t* func, uint32_t target) {
+    ctx->tailcall_target = target;
+    ctx->tailcall_func = func;
+    ctx->tailcall_pending = 1;
+}
+
 void recomp_handle_tailcalls(uint8_t* rdram, recomp_context* ctx);
 void recomp_cf_note(const char* kind, uint32_t value0, uint32_t value1, uint32_t value2, recomp_context* ctx);
 
