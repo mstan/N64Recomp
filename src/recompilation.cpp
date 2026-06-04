@@ -319,6 +319,20 @@ bool process_instruction(GeneratorType& generator, const N64Recomp::Context& con
 
     uint32_t func_vram_end = func.vram + func.words.size() * sizeof(func.words[0]);
 
+    constexpr size_t max_local_tailcall_labels = 16;
+    auto get_local_tailcall_labels = [&]() {
+        std::set<uint32_t> ret;
+        for (uint32_t target : branch_labels) {
+            if (target >= func.vram && target < func_vram_end) {
+                ret.insert(target);
+                if (ret.size() > max_local_tailcall_labels) {
+                    ret.clear();
+                    break;
+                }
+            }
+        }
+        return ret;
+    };
     uint16_t imm = instr.Get_immediate();
 
     // Check if this instruction has a reloc.
@@ -581,7 +595,7 @@ bool process_instruction(GeneratorType& generator, const N64Recomp::Context& con
             return false;
         }
         print_indent();
-        generator.emit_function_call_by_register(reg);
+        generator.emit_function_call_by_register(reg, get_local_tailcall_labels());
         print_link_branch();
         return true;
     };
@@ -653,7 +667,7 @@ bool process_instruction(GeneratorType& generator, const N64Recomp::Context& con
         return true;
     };
 
-    auto print_func_call_by_address = [&generator, reloc_target_section_offset, has_reloc, reloc_section, reloc_reference_symbol, reloc_type, &context, &func, &static_funcs_out, &needs_link_branch, &print_indent, &process_delay_slot, &print_link_branch, &output_file, instr_vram]
+    auto print_func_call_by_address = [&generator, reloc_target_section_offset, has_reloc, reloc_section, reloc_reference_symbol, reloc_type, &context, &func, &static_funcs_out, &needs_link_branch, &print_indent, &process_delay_slot, &print_link_branch, &output_file, instr_vram, &get_local_tailcall_labels]
         (uint32_t target_func_vram, bool tail_call = false, bool indent = false)
     {
         bool call_by_lookup = false;
@@ -755,16 +769,16 @@ bool process_instruction(GeneratorType& generator, const N64Recomp::Context& con
             }
             print_indent();
             if (reloc_reference_symbol != (size_t)-1) {
-                generator.emit_function_call_reference_symbol(context, reloc_section, reloc_reference_symbol, reloc_target_section_offset);
+                generator.emit_function_call_reference_symbol(context, reloc_section, reloc_reference_symbol, reloc_target_section_offset, get_local_tailcall_labels());
             }
             else if (call_by_lookup) {
-                generator.emit_function_call_lookup(target_func_vram);
+                generator.emit_function_call_lookup(target_func_vram, get_local_tailcall_labels());
             }
             else if (call_by_name) {
-                generator.emit_named_function_call(jal_target_name);
+                generator.emit_named_function_call(jal_target_name, get_local_tailcall_labels());
             }
             else {
-                generator.emit_function_call(context, matched_func_index);
+                generator.emit_function_call(context, matched_func_index, get_local_tailcall_labels());
             }
             print_link_branch();
         }

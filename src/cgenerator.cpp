@@ -419,43 +419,61 @@ void N64Recomp::CGenerator::emit_function_end() const {
     fmt::print(output_file, ";}}\n");
 }
 
-void N64Recomp::CGenerator::emit_function_call_lookup(uint32_t addr) const {
+void N64Recomp::CGenerator::emit_tailcall_handling(const std::set<uint32_t>& local_labels) const {
+    fmt::print(output_file, "    if (ctx->tailcall_pending) {{\n");
+    if (!local_labels.empty()) {
+        fmt::print(output_file, "        if (ctx->tailcall_target != 0) {{\n");
+        fmt::print(output_file, "            switch ((uint32_t)ctx->tailcall_target) {{\n");
+        for (uint32_t label_vram : local_labels) {
+            fmt::print(output_file, "            case 0x{:08X}u:\n", label_vram);
+            fmt::print(output_file, "                recomp_cf_note(\"call-local-tailcall\", (uint32_t)recomp_call_sp, recomp_prev_host_return, recomp_call_host_return, ctx);\n");
+            fmt::print(output_file, "                ctx->tailcall_pending = 0;\n");
+            fmt::print(output_file, "                ctx->tailcall_target = 0;\n");
+            fmt::print(output_file, "                ctx->tailcall_func = 0;\n");
+            fmt::print(output_file, "                ctx->host_return_target = recomp_prev_host_return;\n");
+            fmt::print(output_file, "                if (ctx->r29 != recomp_call_sp) {{ recomp_cf_note(\"call-sp-mismatch\", (uint32_t)recomp_call_sp, recomp_prev_host_return, recomp_call_host_return, ctx); return; }}\n");
+            fmt::print(output_file, "                goto L_{:08X};\n", label_vram);
+        }
+        fmt::print(output_file, "            default: break;\n");
+        fmt::print(output_file, "            }}\n");
+        fmt::print(output_file, "        }}\n");
+    }
+    fmt::print(output_file, "        if (ctx->tailcall_dispatching) {{\n");
+    fmt::print(output_file, "            recomp_cf_note(\"call-bubble-dispatch\", (uint32_t)recomp_call_sp, recomp_prev_host_return, recomp_call_host_return, ctx);\n");
+    fmt::print(output_file, "            ctx->host_return_target = recomp_prev_host_return;\n");
+    fmt::print(output_file, "            return;\n");
+    fmt::print(output_file, "        }}\n");
+    fmt::print(output_file, "        recomp_handle_tailcalls(rdram, ctx);\n");
+    fmt::print(output_file, "    }}\n");
+}
+
+void N64Recomp::CGenerator::emit_function_call_lookup(uint32_t addr, const std::set<uint32_t>& local_labels) const {
     fmt::print(output_file, "{{\n");
     fmt::print(output_file, "    gpr recomp_call_sp = ctx->r29;\n");
     fmt::print(output_file, "    uint32_t recomp_prev_host_return = ctx->host_return_target;\n");
     fmt::print(output_file, "    uint32_t recomp_call_host_return = (uint32_t)ctx->r31;\n");
     fmt::print(output_file, "    ctx->host_return_target = recomp_call_host_return;\n");
     fmt::print(output_file, "    LOOKUP_FUNC(0x{:08X})(rdram, ctx);\n", addr);
-    fmt::print(output_file, "    if (ctx->tailcall_pending) {{\n");
-    fmt::print(output_file, "        if (ctx->tailcall_dispatching) {{\n");
-    fmt::print(output_file, "            recomp_cf_note(\"call-nested-dispatch\", (uint32_t)recomp_call_sp, recomp_prev_host_return, recomp_call_host_return, ctx);\n");
-    fmt::print(output_file, "        }}\n");
-    fmt::print(output_file, "        recomp_handle_tailcalls(rdram, ctx);\n");
-    fmt::print(output_file, "    }}\n");
+    emit_tailcall_handling(local_labels);
     fmt::print(output_file, "    ctx->host_return_target = recomp_prev_host_return;\n");
     fmt::print(output_file, "    if (ctx->r29 != recomp_call_sp) {{ recomp_cf_note(\"call-sp-mismatch\", (uint32_t)recomp_call_sp, recomp_prev_host_return, recomp_call_host_return, ctx); return; }}\n");
     fmt::print(output_file, "}}\n");
 }
 
-void N64Recomp::CGenerator::emit_function_call_by_register(int reg) const {
+void N64Recomp::CGenerator::emit_function_call_by_register(int reg, const std::set<uint32_t>& local_labels) const {
     fmt::print(output_file, "{{\n");
     fmt::print(output_file, "    gpr recomp_call_sp = ctx->r29;\n");
     fmt::print(output_file, "    uint32_t recomp_prev_host_return = ctx->host_return_target;\n");
     fmt::print(output_file, "    uint32_t recomp_call_host_return = (uint32_t)ctx->r31;\n");
     fmt::print(output_file, "    ctx->host_return_target = recomp_call_host_return;\n");
     fmt::print(output_file, "    LOOKUP_FUNC({})(rdram, ctx);\n", gpr_to_string(reg));
-    fmt::print(output_file, "    if (ctx->tailcall_pending) {{\n");
-    fmt::print(output_file, "        if (ctx->tailcall_dispatching) {{\n");
-    fmt::print(output_file, "            recomp_cf_note(\"call-nested-dispatch\", (uint32_t)recomp_call_sp, recomp_prev_host_return, recomp_call_host_return, ctx);\n");
-    fmt::print(output_file, "        }}\n");
-    fmt::print(output_file, "        recomp_handle_tailcalls(rdram, ctx);\n");
-    fmt::print(output_file, "    }}\n");
+    emit_tailcall_handling(local_labels);
     fmt::print(output_file, "    ctx->host_return_target = recomp_prev_host_return;\n");
     fmt::print(output_file, "    if (ctx->r29 != recomp_call_sp) {{ recomp_cf_note(\"call-sp-mismatch\", (uint32_t)recomp_call_sp, recomp_prev_host_return, recomp_call_host_return, ctx); return; }}\n");
     fmt::print(output_file, "}}\n");
 }
 
-void N64Recomp::CGenerator::emit_function_call_reference_symbol(const Context& context, uint16_t section_index, size_t symbol_index, uint32_t target_section_offset) const {
+void N64Recomp::CGenerator::emit_function_call_reference_symbol(const Context& context, uint16_t section_index, size_t symbol_index, uint32_t target_section_offset, const std::set<uint32_t>& local_labels) const {
     (void)target_section_offset;
     const N64Recomp::ReferenceSymbol& sym = context.get_reference_symbol(section_index, symbol_index);
     fmt::print(output_file, "{{\n");
@@ -464,48 +482,33 @@ void N64Recomp::CGenerator::emit_function_call_reference_symbol(const Context& c
     fmt::print(output_file, "    uint32_t recomp_call_host_return = (uint32_t)ctx->r31;\n");
     fmt::print(output_file, "    ctx->host_return_target = recomp_call_host_return;\n");
     fmt::print(output_file, "    {}(rdram, ctx);\n", sym.name);
-    fmt::print(output_file, "    if (ctx->tailcall_pending) {{\n");
-    fmt::print(output_file, "        if (ctx->tailcall_dispatching) {{\n");
-    fmt::print(output_file, "            recomp_cf_note(\"call-nested-dispatch\", (uint32_t)recomp_call_sp, recomp_prev_host_return, recomp_call_host_return, ctx);\n");
-    fmt::print(output_file, "        }}\n");
-    fmt::print(output_file, "        recomp_handle_tailcalls(rdram, ctx);\n");
-    fmt::print(output_file, "    }}\n");
+    emit_tailcall_handling(local_labels);
     fmt::print(output_file, "    ctx->host_return_target = recomp_prev_host_return;\n");
     fmt::print(output_file, "    if (ctx->r29 != recomp_call_sp) {{ recomp_cf_note(\"call-sp-mismatch\", (uint32_t)recomp_call_sp, recomp_prev_host_return, recomp_call_host_return, ctx); return; }}\n");
     fmt::print(output_file, "}}\n");
 }
 
-void N64Recomp::CGenerator::emit_function_call(const Context& context, size_t function_index) const {
+void N64Recomp::CGenerator::emit_function_call(const Context& context, size_t function_index, const std::set<uint32_t>& local_labels) const {
     fmt::print(output_file, "{{\n");
     fmt::print(output_file, "    gpr recomp_call_sp = ctx->r29;\n");
     fmt::print(output_file, "    uint32_t recomp_prev_host_return = ctx->host_return_target;\n");
     fmt::print(output_file, "    uint32_t recomp_call_host_return = (uint32_t)ctx->r31;\n");
     fmt::print(output_file, "    ctx->host_return_target = recomp_call_host_return;\n");
     fmt::print(output_file, "    {}(rdram, ctx);\n", context.functions[function_index].name);
-    fmt::print(output_file, "    if (ctx->tailcall_pending) {{\n");
-    fmt::print(output_file, "        if (ctx->tailcall_dispatching) {{\n");
-    fmt::print(output_file, "            recomp_cf_note(\"call-nested-dispatch\", (uint32_t)recomp_call_sp, recomp_prev_host_return, recomp_call_host_return, ctx);\n");
-    fmt::print(output_file, "        }}\n");
-    fmt::print(output_file, "        recomp_handle_tailcalls(rdram, ctx);\n");
-    fmt::print(output_file, "    }}\n");
+    emit_tailcall_handling(local_labels);
     fmt::print(output_file, "    ctx->host_return_target = recomp_prev_host_return;\n");
     fmt::print(output_file, "    if (ctx->r29 != recomp_call_sp) {{ recomp_cf_note(\"call-sp-mismatch\", (uint32_t)recomp_call_sp, recomp_prev_host_return, recomp_call_host_return, ctx); return; }}\n");
     fmt::print(output_file, "}}\n");
 }
 
-void N64Recomp::CGenerator::emit_named_function_call(const std::string& function_name) const {
+void N64Recomp::CGenerator::emit_named_function_call(const std::string& function_name, const std::set<uint32_t>& local_labels) const {
     fmt::print(output_file, "{{\n");
     fmt::print(output_file, "    gpr recomp_call_sp = ctx->r29;\n");
     fmt::print(output_file, "    uint32_t recomp_prev_host_return = ctx->host_return_target;\n");
     fmt::print(output_file, "    uint32_t recomp_call_host_return = (uint32_t)ctx->r31;\n");
     fmt::print(output_file, "    ctx->host_return_target = recomp_call_host_return;\n");
     fmt::print(output_file, "    {}(rdram, ctx);\n", function_name);
-    fmt::print(output_file, "    if (ctx->tailcall_pending) {{\n");
-    fmt::print(output_file, "        if (ctx->tailcall_dispatching) {{\n");
-    fmt::print(output_file, "            recomp_cf_note(\"call-nested-dispatch\", (uint32_t)recomp_call_sp, recomp_prev_host_return, recomp_call_host_return, ctx);\n");
-    fmt::print(output_file, "        }}\n");
-    fmt::print(output_file, "        recomp_handle_tailcalls(rdram, ctx);\n");
-    fmt::print(output_file, "    }}\n");
+    emit_tailcall_handling(local_labels);
     fmt::print(output_file, "    ctx->host_return_target = recomp_prev_host_return;\n");
     fmt::print(output_file, "    if (ctx->r29 != recomp_call_sp) {{ recomp_cf_note(\"call-sp-mismatch\", (uint32_t)recomp_call_sp, recomp_prev_host_return, recomp_call_host_return, ctx); return; }}\n");
     fmt::print(output_file, "}}\n");

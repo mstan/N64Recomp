@@ -103,11 +103,11 @@ namespace N64Recomp {
         void process_store_op(const StoreOp& op, const InstructionContext& ctx) const final;
         void emit_function_start(const std::string& function_name, size_t func_index) const final;
         void emit_function_end() const final;
-        void emit_function_call_lookup(uint32_t addr) const final;
-        void emit_function_call_by_register(int reg) const final;
-        void emit_function_call_reference_symbol(const Context& context, uint16_t section_index, size_t symbol_index, uint32_t target_section_offset) const final;
-        void emit_function_call(const Context& context, size_t function_index) const final;
-        void emit_named_function_call(const std::string& function_name) const final;
+        void emit_function_call_lookup(uint32_t addr, const std::set<uint32_t>& local_labels) const final;
+        void emit_function_call_by_register(int reg, const std::set<uint32_t>& local_labels) const final;
+        void emit_function_call_reference_symbol(const Context& context, uint16_t section_index, size_t symbol_index, uint32_t target_section_offset, const std::set<uint32_t>& local_labels) const final;
+        void emit_function_call(const Context& context, size_t function_index, const std::set<uint32_t>& local_labels) const final;
+        void emit_named_function_call(const std::string& function_name, const std::set<uint32_t>& local_labels) const final;
         void emit_goto(const std::string& target) const final;
         void emit_label(const std::string& label_name) const final;
         void emit_jtbl_addend_declaration(const JumpTable& jtbl, int reg) const final;
