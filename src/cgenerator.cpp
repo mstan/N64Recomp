@@ -439,9 +439,7 @@ void N64Recomp::CGenerator::emit_tailcall_handling(const std::set<uint32_t>& loc
         fmt::print(output_file, "        }}\n");
     }
     fmt::print(output_file, "        if (ctx->tailcall_dispatching) {{\n");
-    fmt::print(output_file, "            recomp_cf_note(\"call-bubble-dispatch\", (uint32_t)recomp_call_sp, recomp_prev_host_return, recomp_call_host_return, ctx);\n");
-    fmt::print(output_file, "            ctx->host_return_target = recomp_prev_host_return;\n");
-    fmt::print(output_file, "            return;\n");
+    fmt::print(output_file, "            recomp_cf_note(\"call-nested-dispatch\", (uint32_t)recomp_call_sp, recomp_prev_host_return, recomp_call_host_return, ctx);\n");
     fmt::print(output_file, "        }}\n");
     fmt::print(output_file, "        recomp_handle_tailcalls(rdram, ctx);\n");
     fmt::print(output_file, "    }}\n");
