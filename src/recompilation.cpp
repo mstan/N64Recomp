@@ -272,7 +272,7 @@ std::string_view ctx_gpr_prefix(int reg) {
 }
 
 template <typename GeneratorType>
-bool process_instruction(GeneratorType& generator, const N64Recomp::Context& context, const N64Recomp::Function& func, size_t func_index, const N64Recomp::FunctionStats& stats, const std::unordered_set<uint32_t>& jtbl_lw_instructions, const std::set<uint32_t>& branch_labels, size_t instr_index, const std::vector<rabbitizer::InstructionCpu>& instructions, std::ostream& output_file, bool indent, bool emit_link_branch, int link_branch_index, size_t reloc_index, bool& needs_link_branch, bool& is_branch_likely, bool tag_reference_relocs, std::span<std::vector<uint32_t>> static_funcs_out) {
+bool process_instruction(GeneratorType& generator, const N64Recomp::Context& context, const N64Recomp::Function& func, size_t func_index, const N64Recomp::FunctionStats& stats, const std::unordered_set<uint32_t>& jtbl_lw_instructions, const std::set<uint32_t>& branch_labels, const std::set<uint32_t>& local_tailcall_labels, size_t instr_index, const std::vector<rabbitizer::InstructionCpu>& instructions, std::ostream& output_file, bool indent, bool emit_link_branch, int link_branch_index, size_t reloc_index, bool& needs_link_branch, bool& is_branch_likely, bool tag_reference_relocs, std::span<std::vector<uint32_t>> static_funcs_out) {
     using namespace N64Recomp;
 
     const auto& section = context.sections[func.section_index];
@@ -319,19 +319,18 @@ bool process_instruction(GeneratorType& generator, const N64Recomp::Context& con
 
     uint32_t func_vram_end = func.vram + func.words.size() * sizeof(func.words[0]);
 
-    constexpr size_t max_local_tailcall_labels = 16;
     auto get_local_tailcall_labels = [&]() {
         std::set<uint32_t> ret;
-        for (uint32_t target : branch_labels) {
+        for (uint32_t target : local_tailcall_labels) {
             if (target >= func.vram && target < func_vram_end) {
                 ret.insert(target);
-                if (ret.size() > max_local_tailcall_labels) {
-                    ret.clear();
-                    break;
-                }
             }
         }
         return ret;
+    };
+    auto get_call_return_label = [&]() {
+        const uint32_t ret = instr_vram + 8;
+        return branch_labels.contains(ret) ? ret : 0u;
     };
     uint16_t imm = instr.Get_immediate();
 
@@ -496,7 +495,7 @@ bool process_instruction(GeneratorType& generator, const N64Recomp::Context& con
             if (reloc_index + 1 < section.relocs.size() && next_vram > section.relocs[reloc_index].address) {
                 next_reloc_index++;
             }
-            if (!process_instruction(generator, context, func, func_index, stats, jtbl_lw_instructions, branch_labels, instr_index + 1, instructions, output_file, use_indent, false, link_branch_index, next_reloc_index, dummy_needs_link_branch, dummy_is_branch_likely, tag_reference_relocs, static_funcs_out)) {
+            if (!process_instruction(generator, context, func, func_index, stats, jtbl_lw_instructions, branch_labels, local_tailcall_labels, instr_index + 1, instructions, output_file, use_indent, false, link_branch_index, next_reloc_index, dummy_needs_link_branch, dummy_is_branch_likely, tag_reference_relocs, static_funcs_out)) {
                 return false;
             }
         }
@@ -595,7 +594,7 @@ bool process_instruction(GeneratorType& generator, const N64Recomp::Context& con
             return false;
         }
         print_indent();
-        generator.emit_function_call_by_register(reg, get_local_tailcall_labels());
+        generator.emit_function_call_by_register(reg, get_local_tailcall_labels(), get_call_return_label());
         print_link_branch();
         return true;
     };
@@ -667,7 +666,7 @@ bool process_instruction(GeneratorType& generator, const N64Recomp::Context& con
         return true;
     };
 
-    auto print_func_call_by_address = [&generator, reloc_target_section_offset, has_reloc, reloc_section, reloc_reference_symbol, reloc_type, &context, &func, &static_funcs_out, &needs_link_branch, &print_indent, &process_delay_slot, &print_link_branch, &output_file, instr_vram, &get_local_tailcall_labels]
+    auto print_func_call_by_address = [&generator, reloc_target_section_offset, has_reloc, reloc_section, reloc_reference_symbol, reloc_type, &context, &func, &static_funcs_out, &needs_link_branch, &print_indent, &process_delay_slot, &print_link_branch, &output_file, instr_vram, &get_local_tailcall_labels, &get_call_return_label]
         (uint32_t target_func_vram, bool tail_call = false, bool indent = false)
     {
         bool call_by_lookup = false;
@@ -769,16 +768,16 @@ bool process_instruction(GeneratorType& generator, const N64Recomp::Context& con
             }
             print_indent();
             if (reloc_reference_symbol != (size_t)-1) {
-                generator.emit_function_call_reference_symbol(context, reloc_section, reloc_reference_symbol, reloc_target_section_offset, get_local_tailcall_labels());
+                generator.emit_function_call_reference_symbol(context, reloc_section, reloc_reference_symbol, reloc_target_section_offset, get_local_tailcall_labels(), get_call_return_label());
             }
             else if (call_by_lookup) {
-                generator.emit_function_call_lookup(target_func_vram, get_local_tailcall_labels());
+                generator.emit_function_call_lookup(target_func_vram, get_local_tailcall_labels(), get_call_return_label());
             }
             else if (call_by_name) {
-                generator.emit_named_function_call(jal_target_name, get_local_tailcall_labels());
+                generator.emit_named_function_call(jal_target_name, get_local_tailcall_labels(), get_call_return_label());
             }
             else {
-                generator.emit_function_call(context, matched_func_index, get_local_tailcall_labels());
+                generator.emit_function_call(context, matched_func_index, get_local_tailcall_labels(), get_call_return_label());
             }
             print_link_branch();
         }
@@ -1385,6 +1384,7 @@ bool recompile_function_impl(GeneratorType& generator, const N64Recomp::Context&
     if (!func.stubbed) {
         // Use a set to sort and deduplicate labels
         std::set<uint32_t> branch_labels;
+        std::set<uint32_t> local_tailcall_labels;
         instructions.reserve(func.words.size());
         if (func.entry_vram != 0 && func.entry_vram != func.vram) {
             branch_labels.insert(func.entry_vram);
@@ -1395,6 +1395,7 @@ bool recompile_function_impl(GeneratorType& generator, const N64Recomp::Context&
         if (hook_find != func.function_hooks.end()) {
             fmt::print(output_file, "    {}\n", hook_find->second);
         }
+        generator.emit_label(fmt::format("L_{:08X}", func.vram));
 
         const uint32_t func_vram_end = func.vram + uint32_t(func.words.size() * sizeof(func.words[0]));
 
@@ -1404,6 +1405,12 @@ bool recompile_function_impl(GeneratorType& generator, const N64Recomp::Context&
             const auto& instr = instructions.emplace_back(byteswap(word), vram);
             const auto instr_id = instr.getUniqueId();
             const uint32_t branch_target = (uint32_t)instr.getBranchVramGeneric();
+            const uint32_t link_return_vram = vram + 8;
+            const auto add_link_return_label = [&]() {
+                if (link_return_vram >= func.vram && link_return_vram < func_vram_end) {
+                    branch_labels.insert(link_return_vram);
+                }
+            };
 
             // If this is a branch or a direct jump, add it to the local label list
             if (instr.isBranch() || instr_id == rabbitizer::InstrId::UniqueId::cpu_j) {
@@ -1414,12 +1421,21 @@ bool recompile_function_impl(GeneratorType& generator, const N64Recomp::Context&
             // Their original MIPS return PCs must be labels so local `jr $ra`
             // dispatch can resume after the delay slot.
             const auto conditional_branch_it = N64Recomp::conditional_branch_ops.find(instr_id);
-            if ((conditional_branch_it != N64Recomp::conditional_branch_ops.end() && conditional_branch_it->second.link) ||
-                instr_id == rabbitizer::InstrId::UniqueId::cpu_jal) {
+            if (conditional_branch_it != N64Recomp::conditional_branch_ops.end() && conditional_branch_it->second.link) {
                 if (branch_target >= func.vram && branch_target < func_vram_end) {
                     branch_labels.insert(branch_target);
-                    branch_labels.insert(vram + 8);
                 }
+                add_link_return_label();
+            }
+            else if (instr_id == rabbitizer::InstrId::UniqueId::cpu_jal) {
+                if (branch_target >= func.vram && branch_target < func_vram_end) {
+                    branch_labels.insert(branch_target);
+                }
+                add_link_return_label();
+            }
+            else if (instr_id == rabbitizer::InstrId::UniqueId::cpu_jalr &&
+                     instr.GetO32_rd() == rabbitizer::Registers::Cpu::GprO32::GPR_O32_ra) {
+                add_link_return_label();
             }
 
             // Advance the vram address by the size of one instruction
@@ -1442,6 +1458,24 @@ bool recompile_function_impl(GeneratorType& generator, const N64Recomp::Context&
                 branch_labels.insert(jtbl_entry);
             }
         }
+        constexpr size_t max_static_local_tailcall_function_size = 0x2000;
+        constexpr size_t max_static_local_tailcall_labels = 256;
+        if (func.section_index < static_funcs_out.size() &&
+            func.name.rfind("static_", 0) != 0 &&
+            func.words.size() * sizeof(func.words[0]) <= max_static_local_tailcall_function_size) {
+            std::set<uint32_t> static_local_tailcall_labels;
+            for (uint32_t static_vram : static_funcs_out[func.section_index]) {
+                if (static_vram > func.vram && static_vram < func_vram_end) {
+                    static_local_tailcall_labels.insert(static_vram);
+                    if (static_local_tailcall_labels.size() > max_static_local_tailcall_labels) {
+                        static_local_tailcall_labels.clear();
+                        break;
+                    }
+                }
+            }
+            branch_labels.insert(static_local_tailcall_labels.begin(), static_local_tailcall_labels.end());
+            local_tailcall_labels.insert(static_local_tailcall_labels.begin(), static_local_tailcall_labels.end());
+        }
 
         for (auto label_it = branch_labels.begin(); label_it != branch_labels.end();) {
             if (*label_it < func.vram || *label_it >= func_vram_end) {
@@ -1451,6 +1485,15 @@ bool recompile_function_impl(GeneratorType& generator, const N64Recomp::Context&
                 ++label_it;
             }
         }
+        for (auto label_it = local_tailcall_labels.begin(); label_it != local_tailcall_labels.end();) {
+            if (*label_it < func.vram || *label_it >= func_vram_end || !branch_labels.contains(*label_it)) {
+                label_it = local_tailcall_labels.erase(label_it);
+            }
+            else {
+                ++label_it;
+            }
+        }
+        branch_labels.erase(func.vram);
 
         // Second pass, emit code for each instruction and emit labels
         auto cur_label = branch_labels.cbegin();
@@ -1479,7 +1522,7 @@ bool recompile_function_impl(GeneratorType& generator, const N64Recomp::Context&
                 reloc_index++;
             }
             // Process the current instruction and check for errors
-            if (process_instruction(generator, context, func, func_index, stats, jtbl_lw_instructions, branch_labels, instr_index, instructions, output_file, false, needs_link_branch, num_link_branches, reloc_index, needs_link_branch, is_branch_likely, tag_reference_relocs, static_funcs_out) == false) {
+            if (process_instruction(generator, context, func, func_index, stats, jtbl_lw_instructions, branch_labels, local_tailcall_labels, instr_index, instructions, output_file, false, needs_link_branch, num_link_branches, reloc_index, needs_link_branch, is_branch_likely, tag_reference_relocs, static_funcs_out) == false) {
                 fmt::print(stderr, "Error in recompiling {} at instr {}\n", func.name, instr_index);
                 return false;
             }

@@ -1365,7 +1365,7 @@ void N64Recomp::LiveGenerator::emit_function_end() const {
     }
 }
 
-void N64Recomp::LiveGenerator::emit_function_call_lookup(uint32_t addr, const std::set<uint32_t>&) const {
+void N64Recomp::LiveGenerator::emit_function_call_lookup(uint32_t addr, const std::set<uint32_t>&, uint32_t) const {
     // Load the address immediate into the first argument. 
     sljit_emit_op1(compiler, SLJIT_MOV32, SLJIT_R0, 0, SLJIT_IMM, int32_t(addr));
     
@@ -1383,7 +1383,7 @@ void N64Recomp::LiveGenerator::emit_function_call_lookup(uint32_t addr, const st
     sljit_emit_icall(compiler, SLJIT_CALL, SLJIT_ARGS2V(P, P), SLJIT_R3, 0);
 }
 
-void N64Recomp::LiveGenerator::emit_function_call_by_register(int reg, const std::set<uint32_t>&) const {
+void N64Recomp::LiveGenerator::emit_function_call_by_register(int reg, const std::set<uint32_t>&, uint32_t) const {
     // Load the register's value into the first argument. 
     sljit_emit_op1(compiler, SLJIT_MOV32, SLJIT_R0, 0, SLJIT_MEM1(Registers::ctx), get_gpr_context_offset(reg));
 
@@ -1401,7 +1401,7 @@ void N64Recomp::LiveGenerator::emit_function_call_by_register(int reg, const std
     sljit_emit_icall(compiler, SLJIT_CALL, SLJIT_ARGS2V(P, P), SLJIT_R3, 0);
 }
 
-void N64Recomp::LiveGenerator::emit_function_call_reference_symbol(const Context&, uint16_t section_index, size_t symbol_index, uint32_t target_section_offset, const std::set<uint32_t>&) const {
+void N64Recomp::LiveGenerator::emit_function_call_reference_symbol(const Context&, uint16_t section_index, size_t symbol_index, uint32_t target_section_offset, const std::set<uint32_t>&, uint32_t) const {
     (void)symbol_index;
 
     // Load rdram and ctx into R0 and R1.
@@ -1427,7 +1427,7 @@ void N64Recomp::LiveGenerator::emit_function_call_reference_symbol(const Context
     }
 }
 
-void N64Recomp::LiveGenerator::emit_function_call(const Context&, size_t function_index, const std::set<uint32_t>&) const {
+void N64Recomp::LiveGenerator::emit_function_call(const Context&, size_t function_index, const std::set<uint32_t>&, uint32_t) const {
     // Load rdram and ctx into R0 and R1.
     sljit_emit_op2(compiler, SLJIT_ADD, SLJIT_R0, 0, Registers::rdram, 0, SLJIT_IMM, rdram_offset);
     sljit_emit_op1(compiler, SLJIT_MOV, SLJIT_R1, 0, Registers::ctx, 0);
@@ -1436,7 +1436,7 @@ void N64Recomp::LiveGenerator::emit_function_call(const Context&, size_t functio
     context->inner_calls.emplace_back(InnerCall{ .target_func_index = function_index, .jump = call_jump });
 }
 
-void N64Recomp::LiveGenerator::emit_named_function_call(const std::string& function_name, const std::set<uint32_t>&) const {
+void N64Recomp::LiveGenerator::emit_named_function_call(const std::string& function_name, const std::set<uint32_t>&, uint32_t) const {
     // The live recompiler can't call functions by name. This is only used for statics, so it's not an issue.
     assert(false);
     errored = true;

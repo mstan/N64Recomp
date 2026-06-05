@@ -34,13 +34,13 @@ namespace N64Recomp {
         virtual void process_store_op(const StoreOp& op, const InstructionContext& ctx) const = 0;
         virtual void emit_function_start(const std::string& function_name, size_t func_index) const = 0;
         virtual void emit_function_end() const = 0;
-        virtual void emit_function_call_lookup(uint32_t addr, const std::set<uint32_t>& local_labels) const = 0;
-        virtual void emit_function_call_by_register(int reg, const std::set<uint32_t>& local_labels) const = 0;
+        virtual void emit_function_call_lookup(uint32_t addr, const std::set<uint32_t>& local_labels, uint32_t return_vram) const = 0;
+        virtual void emit_function_call_by_register(int reg, const std::set<uint32_t>& local_labels, uint32_t return_vram) const = 0;
         // target_section_offset can each be deduced from symbol_index if the full context is available,
         // but for live recompilation the reference symbol list is unavailable so it's still provided.
-        virtual void emit_function_call_reference_symbol(const Context& context, uint16_t section_index, size_t symbol_index, uint32_t target_section_offset, const std::set<uint32_t>& local_labels) const = 0;
-        virtual void emit_function_call(const Context& context, size_t function_index, const std::set<uint32_t>& local_labels) const = 0;
-        virtual void emit_named_function_call(const std::string& function_name, const std::set<uint32_t>& local_labels) const = 0;
+        virtual void emit_function_call_reference_symbol(const Context& context, uint16_t section_index, size_t symbol_index, uint32_t target_section_offset, const std::set<uint32_t>& local_labels, uint32_t return_vram) const = 0;
+        virtual void emit_function_call(const Context& context, size_t function_index, const std::set<uint32_t>& local_labels, uint32_t return_vram) const = 0;
+        virtual void emit_named_function_call(const std::string& function_name, const std::set<uint32_t>& local_labels, uint32_t return_vram) const = 0;
         virtual void emit_goto(const std::string& target) const = 0;
         virtual void emit_label(const std::string& label_name) const = 0;
         virtual void emit_jtbl_addend_declaration(const JumpTable& jtbl, int reg) const = 0;
@@ -73,11 +73,11 @@ namespace N64Recomp {
         void process_store_op(const StoreOp& op, const InstructionContext& ctx) const final;
         void emit_function_start(const std::string& function_name, size_t func_index) const final;
         void emit_function_end() const final;
-        void emit_function_call_lookup(uint32_t addr, const std::set<uint32_t>& local_labels) const final;
-        void emit_function_call_by_register(int reg, const std::set<uint32_t>& local_labels) const final;
-        void emit_function_call_reference_symbol(const Context& context, uint16_t section_index, size_t symbol_index, uint32_t target_section_offset, const std::set<uint32_t>& local_labels) const final;
-        void emit_function_call(const Context& context, size_t function_index, const std::set<uint32_t>& local_labels) const final;
-        void emit_named_function_call(const std::string& function_name, const std::set<uint32_t>& local_labels) const final;
+        void emit_function_call_lookup(uint32_t addr, const std::set<uint32_t>& local_labels, uint32_t return_vram) const final;
+        void emit_function_call_by_register(int reg, const std::set<uint32_t>& local_labels, uint32_t return_vram) const final;
+        void emit_function_call_reference_symbol(const Context& context, uint16_t section_index, size_t symbol_index, uint32_t target_section_offset, const std::set<uint32_t>& local_labels, uint32_t return_vram) const final;
+        void emit_function_call(const Context& context, size_t function_index, const std::set<uint32_t>& local_labels, uint32_t return_vram) const final;
+        void emit_named_function_call(const std::string& function_name, const std::set<uint32_t>& local_labels, uint32_t return_vram) const final;
         void emit_goto(const std::string& target) const final;
         void emit_label(const std::string& label_name) const final;
         void emit_jtbl_addend_declaration(const JumpTable& jtbl, int reg) const final;
@@ -104,7 +104,7 @@ namespace N64Recomp {
         void get_operand_string(Operand operand, UnaryOpType operation, const InstructionContext& context, std::string& operand_string) const;
         void get_binary_expr_string(BinaryOpType type, const BinaryOperands& operands, const InstructionContext& ctx, const std::string& output, std::string& expr_string) const;
         void get_notation(BinaryOpType op_type, std::string& func_string, std::string& infix_string) const;
-        void emit_tailcall_handling(const std::set<uint32_t>& local_labels) const;
+        void emit_tailcall_handling(const std::set<uint32_t>& local_labels, uint32_t return_vram) const;
         std::ostream& output_file;
     };
 }
