@@ -12,8 +12,7 @@ translate at compile time. It must:
 
 All six hooks are load-bearing. There is no "store the bits in flat
 storage and trust the game won't notice" fallback for any unmodeled
-behavior, including unmodeled COP0 registers — that would be a stub
-in violation of PRINCIPLES.md #12.
+behavior, including unmodeled COP0 registers — that would be a stub.
 """
 from __future__ import annotations
 

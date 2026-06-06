@@ -595,8 +595,8 @@ void pause_self(uint8_t *rdram);
 /* Tolerant-emit runtime entry points. The engine emits calls to these
  * for instructions/branches/calls it can't translate at compile time;
  * consumers implement them in a runtime hook file (e.g. extras.c).
- * See src/recompilation.cpp for the emit sites and PRINCIPLES.md #12
- * for why these exist (loud runtime aborts, NOT stubs). */
+ * See src/recompilation.cpp for the emit sites; these exist to make
+ * untranslatable code fail as loud runtime aborts, NOT stubs. */
 void recomp_unhandled_branch(uint8_t *rdram, recomp_context *ctx,
                              uint32_t instr_vram, uint32_t branch_target);
 void recomp_unhandled_call(uint8_t *rdram, recomp_context *ctx,

@@ -726,11 +726,10 @@ bool process_instruction(GeneratorType& generator, const N64Recomp::Context& con
                         // downstream functions for one missing symbol), emit a
                         // runtime call that aborts loudly with diagnostic info.
                         // The function still compiles; only the unsupported call
-                        // path crashes if reached. Per project principles
-                        // (F:\Projects\recomp-template\NES\PRINCIPLES.md #12),
-                        // this is NOT a stub — no behavior is simulated; the
-                        // call is left as an unimplementable hole that surfaces
-                        // at runtime with full context.
+                        // path crashes if reached. This is NOT a stub — no
+                        // behavior is simulated; the call is left as an
+                        // unimplementable hole that surfaces at runtime with
+                        // full context.
                         fmt::print(stderr, "[Warn] No function found for jal target 0x{:08X} in {} — emitting runtime abort\n", target_func_vram, func.name);
                         if (indent) fmt::print(output_file, "    ");
                         fmt::print(output_file, "    recomp_unhandled_call(rdram, ctx, 0x{:08X}u, 0x{:08X}u);\n", instr_vram, target_func_vram);
@@ -848,8 +847,8 @@ bool process_instruction(GeneratorType& generator, const N64Recomp::Context& con
 
             // Branch out of function with no symbol at target. Emit a
             // runtime abort instead of `goto L_<vram>` to a label that
-            // never exists. Per project principles: no stub, an
-            // unimplementable hole surfaced loudly at runtime.
+            // never exists. No stub — an unimplementable hole surfaced
+            // loudly at runtime.
             fmt::print(stderr, "[Warn] Function {} is branching outside of the function (to 0x{:08X}) — emitting runtime abort\n", func.name, branch_target);
             if (!process_delay_slot(true)) {
                 return false;
@@ -1350,8 +1349,8 @@ bool process_instruction(GeneratorType& generator, const N64Recomp::Context& con
         // Engine doesn't have a decoder for this opcode. Emit a runtime
         // call instead of failing — function still compiles; if execution
         // reaches the unhandled instruction, it aborts loudly with the
-        // opcode name. Per project principles: not a stub, an
-        // unimplementable hole surfaced at runtime with full context.
+        // opcode name. Not a stub — an unimplementable hole surfaced
+        // at runtime with full context.
         fmt::print(stderr, "[Warn] Unhandled instruction '{}' in {} at 0x{:08X} — emitting runtime abort\n", instr.getOpcodeName(), func.name, instr_vram);
         print_indent();
         fmt::print(output_file, "recomp_unhandled_instruction(rdram, ctx, 0x{:08X}u, \"{}\");\n", instr_vram, instr.getOpcodeName());
