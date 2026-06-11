@@ -10,6 +10,7 @@
 #include <unordered_set>
 #include <filesystem>
 #include <optional>
+#include <set>
 
 #ifdef _MSC_VER
 inline uint32_t byteswap(uint32_t val) {
@@ -32,11 +33,20 @@ namespace N64Recomp {
         bool ignored;
         bool reimplemented;
         bool stubbed;
+        std::set<uint32_t> dispatch_entry_vrams;
         std::unordered_map<int32_t, std::string> function_hooks;
 
         Function(uint32_t vram, uint32_t rom, std::vector<uint32_t> words, std::string name, uint16_t section_index, bool ignored = false, bool reimplemented = false, bool stubbed = false, uint32_t entry_vram = 0)
                 : vram(vram), rom(rom), entry_vram(entry_vram != 0 ? entry_vram : vram), words(std::move(words)), name(std::move(name)), section_index(section_index), ignored(ignored), reimplemented(reimplemented), stubbed(stubbed) {}
         Function() = default;
+    };
+
+    struct DispatchAlias {
+        uint16_t section_index;
+        uint32_t vram;
+        uint32_t rom;
+        std::string name;
+        size_t target_function_index;
     };
     
     struct JumpTable {
@@ -231,8 +241,10 @@ namespace N64Recomp {
     public:
         std::vector<Section> sections;
         std::vector<Function> functions;
+        std::vector<DispatchAlias> dispatch_aliases;
         // A list of the list of each function (by index in `functions`) in a given section
         std::vector<std::vector<size_t>> section_functions;
+        std::vector<std::vector<size_t>> section_dispatch_aliases;
         // A mapping of vram address to every function with that address.
         std::unordered_map<uint32_t, std::vector<size_t>> functions_by_vram;
         // A mapping of bss section index to the corresponding non-bss section index.

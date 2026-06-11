@@ -649,6 +649,7 @@ ELFIO::section* read_sections(N64Recomp::Context& context, const N64Recomp::ElfP
 static void setup_context_for_elf(N64Recomp::Context& context, const ELFIO::elfio& elf_file) {
     context.sections.resize(elf_file.sections.size());
     context.section_functions.resize(elf_file.sections.size());
+    context.section_dispatch_aliases.resize(elf_file.sections.size());
     context.functions.reserve(1024);
     context.functions_by_vram.reserve(context.functions.capacity());
     context.functions_by_name.reserve(context.functions.capacity());

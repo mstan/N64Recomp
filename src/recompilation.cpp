@@ -22,6 +22,43 @@ enum class JalResolutionResult {
     Error
 };
 
+static uint32_t infer_recomp_section_encoded_vram_base(
+    const N64Recomp::Context& context,
+    size_t section_index) {
+    if (section_index >= context.sections.size() ||
+        section_index >= context.section_functions.size()) {
+        return 0;
+    }
+
+    const auto& section = context.sections[section_index];
+    uint32_t encoded_base = section.ram_addr;
+    bool found_base = false;
+
+    for (size_t func_index : context.section_functions[section_index]) {
+        const auto& func = context.functions[func_index];
+        if (func.words.empty() && !func.reimplemented) {
+            continue;
+        }
+        const uint64_t section_rom_start = section.rom_addr;
+        const uint64_t section_rom_end = section_rom_start + section.size;
+        if (func.rom < section_rom_start || func.rom >= section_rom_end) {
+            continue;
+        }
+
+        const uint32_t candidate_base =
+            func.vram - uint32_t(func.rom - section.rom_addr);
+        if (!found_base) {
+            encoded_base = candidate_base;
+            found_base = true;
+        }
+        else if (encoded_base != candidate_base) {
+            return section.ram_addr;
+        }
+    }
+
+    return encoded_base;
+}
+
 JalResolutionResult resolve_jal(const N64Recomp::Context& context, size_t cur_section_index, uint32_t target_func_vram, size_t& matched_function_index, size_t& static_section_index) {
     // Skip resolution if all function calls should use lookup and just return Ambiguous.
     if (context.use_lookup_for_all_function_calls) {
@@ -31,9 +68,16 @@ JalResolutionResult resolve_jal(const N64Recomp::Context& context, size_t cur_se
     // Look for symbols with the target vram address
     const N64Recomp::Section& cur_section = context.sections[cur_section_index];
     const auto matching_funcs_find = context.functions_by_vram.find(target_func_vram);
-    uint32_t section_vram_start = cur_section.ram_addr;
-    uint32_t section_vram_end = cur_section.ram_addr + cur_section.size;
-    bool in_current_section = target_func_vram >= section_vram_start && target_func_vram < section_vram_end;
+    uint32_t section_vram_start =
+        infer_recomp_section_encoded_vram_base(context, cur_section_index);
+    uint32_t section_vram_end = section_vram_start + cur_section.size;
+    const uint32_t link_vram_start = cur_section.ram_addr;
+    const uint32_t link_vram_end = link_vram_start + cur_section.size;
+    bool in_current_section =
+        (target_func_vram >= section_vram_start &&
+         target_func_vram < section_vram_end) ||
+        (target_func_vram >= link_vram_start &&
+         target_func_vram < link_vram_end);
     bool exact_match_found = false;
     static_section_index = cur_section_index;
 
@@ -91,9 +135,18 @@ JalResolutionResult resolve_jal(const N64Recomp::Context& context, size_t cur_se
             size_t containing_section = (size_t)-1;
             for (size_t section_index = 0; section_index < context.sections.size(); section_index++) {
                 const auto& candidate_section = context.sections[section_index];
-                const uint32_t section_start = candidate_section.ram_addr;
+                const uint32_t section_start =
+                    infer_recomp_section_encoded_vram_base(
+                        context, section_index);
                 const uint32_t section_end = section_start + candidate_section.size;
-                if (target_func_vram >= section_start && target_func_vram < section_end) {
+                const uint32_t candidate_link_start =
+                    candidate_section.ram_addr;
+                const uint32_t candidate_link_end =
+                    candidate_link_start + candidate_section.size;
+                if ((target_func_vram >= section_start &&
+                     target_func_vram < section_end) ||
+                    (target_func_vram >= candidate_link_start &&
+                     target_func_vram < candidate_link_end)) {
                     if (containing_section != (size_t)-1) {
                         return JalResolutionResult::Ambiguous;
                     }
@@ -148,11 +201,20 @@ bool discover_static_code_entrypoint(
         return false;
     }
 
-    const uint32_t section_start = section.ram_addr;
+    const uint32_t section_start =
+        infer_recomp_section_encoded_vram_base(context, section_index);
     const uint32_t section_end = section_start + section.size;
-    if (target_vram < section_start || target_vram >= section_end) {
+    const uint32_t link_section_start = section.ram_addr;
+    const uint32_t link_section_end = link_section_start + section.size;
+    bool target_uses_encoded_base =
+        target_vram >= section_start && target_vram < section_end;
+    bool target_uses_link_base =
+        target_vram >= link_section_start && target_vram < link_section_end;
+    if (!target_uses_encoded_base && !target_uses_link_base) {
         return false;
     }
+    const uint32_t decode_base =
+        target_uses_encoded_base ? section_start : link_section_start;
 
     if (uint64_t(section.rom_addr) + uint64_t(section.size) > context.rom.size()) {
         return false;
@@ -163,8 +225,8 @@ bool discover_static_code_entrypoint(
     if (!N64Recomp::discover_function_bounds(
             context.rom.data() + section.rom_addr,
             section.size,
-            section.ram_addr,
-            target_vram - section.ram_addr,
+            decode_base,
+            target_vram - decode_base,
             discovered_size,
             discover_error)) {
         return false;
@@ -179,8 +241,8 @@ bool section_has_backing_rom(const N64Recomp::Context& context, size_t section_i
     }
 
     const auto& section = context.sections[section_index];
-    return section.rom_addr < 0xF0000000u &&
-        uint64_t(section.rom_addr) + uint64_t(section.size) <= context.rom.size();
+    return uint64_t(section.rom_addr) + uint64_t(section.size) <=
+        context.rom.size();
 }
 
 bool static_entry_requested(
@@ -487,7 +549,25 @@ bool process_instruction(GeneratorType& generator, const N64Recomp::Context& con
     }
 
     auto process_delay_slot = [&](bool use_indent) {
-        if (instr_index < instructions.size() - 1) {
+        if (instr_index >= instructions.size() - 1) {
+            // The branch/jump at the FINAL word of the function has its delay
+            // slot outside the function's word range. Emitting the branch
+            // without its delay slot is a silent miscompile — the skipped
+            // instruction's effect simply vanishes (observed in Pocket
+            // Monsters Stadium: a Yay0 decompressor whose `b` delay slot
+            // `addi t3, t3, 0x12` was cut off by a too-small function size,
+            // turning a bounded copy loop into a 4-billion-iteration rdram
+            // scribble). The function's size in the symbols input is wrong —
+            // refuse to generate and name the exact fix.
+            fmt::print(stderr,
+                "[Error] Function {} ends with a branch/jump at 0x{:08X} whose delay slot "
+                "(0x{:08X}) is outside the function bounds — the function's size in the "
+                "symbols file is too small (truncated by at least one instruction). "
+                "Extend the function size to include the delay slot.\n",
+                func.name, instr_vram, instr_vram + 4);
+            return false;
+        }
+        {
             bool dummy_needs_link_branch;
             bool dummy_is_branch_likely;
             size_t next_reloc_index = reloc_index;
@@ -871,13 +951,24 @@ bool process_instruction(GeneratorType& generator, const N64Recomp::Context& con
         // never re-enters a function, so the function-entry TRACE_ENTRY
         // tick never fires inside it — the thread can spin forever and
         // starve the cooperative scheduler (e.g. Pokemon Stadium's GB
-        // Tower osGbpakInit power-up busy-wait). Emit the consumer-defined
-        // TRACE_LOOP() hook here so each back-edge is a yield point.
-        // Gated by trace_mode to mirror TRACE_ENTRY's emission.
-        if (context.trace_mode && branch_target <= instr_vram) {
+        // Tower osGbpakInit power-up busy-wait, or an idle thread's
+        // while(1) starving external-message drain into a black-screen
+        // boot deadlock).
+        //
+        // Emitted UNCONDITIONALLY: this is cooperative-scheduler
+        // correctness, not tracing. It was previously gated by
+        // trace_mode "to mirror TRACE_ENTRY's emission", which made
+        // games built with trace_mode=false deadlock the moment every
+        // guest thread blocked while one spun (Pocket Monsters Stadium
+        // first-boot, 2026-06). trace_mode now gates only the logging
+        // hooks. The default RECOMP_LOOP_CHECKPOINT_VRAM lives in
+        // recomp.h and routes to ultramodern_scheduler_tick_vram();
+        // consumers may redefine it, but it must remain a real yield
+        // point.
+        if (branch_target <= instr_vram) {
             print_indent();
             print_indent();
-            fmt::print(output_file, "TRACE_LOOP()\n");
+            fmt::print(output_file, "RECOMP_LOOP_CHECKPOINT_VRAM(0x{:08X}u)\n", instr_vram);
         }
 
         print_indent();
@@ -1075,7 +1166,10 @@ bool process_instruction(GeneratorType& generator, const N64Recomp::Context& con
             }
         }
         needs_link_branch = true;
-        print_func_call_by_register(rs);
+        // Propagate failure (delay-slot-out-of-bounds guard) — see cpu_jr.
+        if (!print_func_call_by_register(rs)) {
+            return false;
+        }
         break;
     case InstrId::cpu_j:
     case InstrId::cpu_b:
@@ -1094,7 +1188,14 @@ bool process_instruction(GeneratorType& generator, const N64Recomp::Context& con
         break;
     case InstrId::cpu_jr:
         if (rs == (int)rabbitizer::Registers::Cpu::GprO32::GPR_O32_ra) {
-            print_return_with_delay_slot();
+            // Propagate failure (e.g. the delay-slot-out-of-bounds guard in
+            // process_delay_slot). Ignoring it silently dropped the jr-ra
+            // delay slot for every function whose symbols-file size excluded
+            // it — often a meaningful instruction (sp restore, return-value
+            // set), i.e. a silent miscompile.
+            if (!print_return_with_delay_slot()) {
+                return false;
+            }
         } else {
             auto jtbl_find_result = std::find_if(stats.jump_tables.begin(), stats.jump_tables.end(),
                 [instr_vram](const N64Recomp::JumpTable& jtbl) {
@@ -1385,6 +1486,33 @@ bool recompile_function_impl(GeneratorType& generator, const N64Recomp::Context&
         std::set<uint32_t> branch_labels;
         std::set<uint32_t> local_tailcall_labels;
         instructions.reserve(func.words.size());
+        const uint32_t func_vram_end = func.vram + uint32_t(func.words.size() * sizeof(func.words[0]));
+        for (uint32_t dispatch_entry_vram : func.dispatch_entry_vrams) {
+            if (dispatch_entry_vram > func.vram &&
+                dispatch_entry_vram < func_vram_end) {
+                branch_labels.insert(dispatch_entry_vram);
+            }
+        }
+        if (!func.dispatch_entry_vrams.empty()) {
+            fmt::print(output_file,
+                "    if (ctx->dispatch_entry_target != 0) {{\n"
+                "        uint32_t recomp_dispatch_entry = ctx->dispatch_entry_target;\n"
+                "        ctx->dispatch_entry_target = 0;\n"
+                "        switch (recomp_dispatch_entry) {{\n");
+            for (uint32_t dispatch_entry_vram : func.dispatch_entry_vrams) {
+                if (dispatch_entry_vram > func.vram &&
+                    dispatch_entry_vram < func_vram_end) {
+                    fmt::print(output_file,
+                        "        case 0x{:08X}u: goto L_{:08X};\n",
+                        dispatch_entry_vram,
+                        dispatch_entry_vram);
+                }
+            }
+            fmt::print(output_file,
+                "        default: break;\n"
+                "        }}\n"
+                "    }}\n");
+        }
         if (func.entry_vram != 0 && func.entry_vram != func.vram) {
             branch_labels.insert(func.entry_vram);
             fmt::print(output_file, "    goto L_{:08X};\n", func.entry_vram);
@@ -1395,8 +1523,6 @@ bool recompile_function_impl(GeneratorType& generator, const N64Recomp::Context&
             fmt::print(output_file, "    {}\n", hook_find->second);
         }
         generator.emit_label(fmt::format("L_{:08X}", func.vram));
-
-        const uint32_t func_vram_end = func.vram + uint32_t(func.words.size() * sizeof(func.words[0]));
 
         // First pass, disassemble each instruction and collect branch labels
         uint32_t vram = func.vram;

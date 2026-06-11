@@ -13,6 +13,36 @@ static uint32_t read_be_u32_local(const uint8_t* p) {
            (uint32_t(p[2]) << 8)  |  uint32_t(p[3]);
 }
 
+static bool decode_conditional_branch_target(
+    uint32_t insn_word,
+    uint32_t pc,
+    uint32_t& target_vram_out)
+{
+    const uint32_t op = (insn_word >> 26) & 0x3Fu;
+    bool is_conditional_branch = false;
+
+    if (op == 0x01u) {
+        const uint32_t rt = (insn_word >> 16) & 0x1Fu;
+        is_conditional_branch =
+            rt == 0x00u || rt == 0x01u || rt == 0x02u || rt == 0x03u ||
+            rt == 0x10u || rt == 0x11u || rt == 0x12u || rt == 0x13u;
+    } else if ((op >= 0x04u && op <= 0x07u) ||
+               (op >= 0x14u && op <= 0x17u)) {
+        is_conditional_branch = true;
+    } else if (op == 0x11u) {
+        const uint32_t rs = (insn_word >> 21) & 0x1Fu;
+        is_conditional_branch = rs == 0x08u; // bc1*
+    }
+
+    if (!is_conditional_branch) {
+        return false;
+    }
+
+    const int16_t imm = int16_t(insn_word & 0xFFFFu);
+    target_vram_out = pc + 4u + (uint32_t(int32_t(imm)) << 2);
+    return true;
+}
+
 extern "C" const char* RabbitizerRegister_getNameGpr(uint8_t regValue);
 
 // If 64-bit addressing is ever implemented, these will need to be changed to 64-bit values
@@ -585,15 +615,22 @@ bool N64Recomp::discover_function_bounds(
                     visited.insert(delay);
                     if (delay > max_reached) max_reached = delay;
                 }
+                uint32_t target_vram = 0;
+                bool has_branch_target = false;
                 if (instr.hasOperandAlias(
                         rabbitizer::OperandType::cpu_branch_target_label)) {
-                    uint32_t target_vram = instr.getBranchVramGeneric();
-                    if (target_vram >= vram_base &&
-                        target_vram < vram_base + bytes_size) {
-                        size_t target_off = target_vram - vram_base;
-                        if (!visited.contains(target_off)) {
-                            worklist.push_back(target_off);
-                        }
+                    target_vram = instr.getBranchVramGeneric();
+                    has_branch_target = true;
+                } else if (decode_conditional_branch_target(
+                               insn_word, instr.getVram(), target_vram)) {
+                    has_branch_target = true;
+                }
+                if (has_branch_target &&
+                    target_vram >= vram_base &&
+                    target_vram < vram_base + bytes_size) {
+                    size_t target_off = target_vram - vram_base;
+                    if (!visited.contains(target_off)) {
+                        worklist.push_back(target_off);
                     }
                 }
                 cursor = delay + 4;

@@ -529,6 +529,7 @@ struct recomp_context {
     uint32_t tailcall_dispatching;
     recomp_func_t* tailcall_func;
     uint32_t host_return_target;
+    uint32_t dispatch_entry_target;
 };
 
 // Checks if the target is an even float register or that mips3 float mode is enabled
@@ -592,6 +593,35 @@ void recomp_syscall_handler(uint8_t* rdram, recomp_context* ctx, int32_t instruc
 
 void pause_self(uint8_t *rdram);
 
+/* Voluntary-preemption checkpoint. The recompiler emits
+ * RECOMP_LOOP_CHECKPOINT() on every intra-function loop back-edge,
+ * UNCONDITIONALLY — this is cooperative-scheduler correctness, not
+ * tracing. A tight intra-function spin loop never re-enters a function,
+ * so without a back-edge checkpoint a CPU-bound guest loop (an idle
+ * thread's while(1), GB Tower's osGbpakInit power-up wait) starves the
+ * scheduler: externally-posted messages (VI retrace, SP/DP completions,
+ * timer fires) are never drained into guest queues and every blocked
+ * thread sleeps forever (black-screen boot deadlock). trace_mode gates
+ * only the TRACE_ENTRY/TRACE_RETURN logging hooks, never this
+ * checkpoint.
+ *
+ * The default routes to the runtime's tick (N64ModernRuntime
+ * ultramodern/src/scheduler_tick.cpp): one relaxed atomic load on the
+ * fast path; drains/yields only when external messages are pending or
+ * the host monitor flagged the thread as stuck. New generated code uses
+ * RECOMP_LOOP_CHECKPOINT_VRAM(pc) so diagnostics can identify the exact
+ * guest back-edge. The zero-arg form remains for older generated code.
+ * Consumers may redefine the macro before compiling generated code, but
+ * any override must remain a real yield point. */
+void ultramodern_scheduler_tick(void);
+void ultramodern_scheduler_tick_vram(uint32_t pc);
+#ifndef RECOMP_LOOP_CHECKPOINT
+#define RECOMP_LOOP_CHECKPOINT() ultramodern_scheduler_tick();
+#endif
+#ifndef RECOMP_LOOP_CHECKPOINT_VRAM
+#define RECOMP_LOOP_CHECKPOINT_VRAM(pc) ultramodern_scheduler_tick_vram(pc);
+#endif
+
 /* Tolerant-emit runtime entry points. The engine emits calls to these
  * for instructions/branches/calls it can't translate at compile time;
  * consumers implement them in a runtime hook file (e.g. extras.c).
@@ -619,6 +649,8 @@ void recomp_unhandled_instruction(uint8_t *rdram, recomp_context *ctx,
  * librecomp/src/overlays.cpp. */
 void recomp_register_runtime_fragment(uint8_t *rdram, uint32_t id,
                                        int32_t fragment_ptr);
+void recomp_unregister_runtime_fragment(uint32_t id);
+void pms_diag_script_dispatch(uint8_t *rdram, recomp_context *ctx);
 
 #ifdef __cplusplus
 }

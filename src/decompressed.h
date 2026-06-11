@@ -37,7 +37,8 @@ namespace N64Recomp {
 bool synthesize_decompressed_sections(
     Context& context,
     const std::filesystem::path& rom_path,
-    const std::vector<DecompressedSection>& configs);
+    const std::vector<DecompressedSection>& configs,
+    const std::vector<DecompressedSectionPatch>& patches);
 
 // Auto-discovery: scan the ROM for every wrapper that decompresses
 // to a fragment at the declared vram + format, deduplicate by content
@@ -53,7 +54,8 @@ bool synthesize_decompressed_sections(
 bool synthesize_decompressed_patterns(
     Context& context,
     const std::filesystem::path& rom_path,
-    const std::vector<DecompressedSectionPattern>& patterns);
+    const std::vector<DecompressedSectionPattern>& patterns,
+    const std::vector<DecompressedSectionPatch>& patches);
 
 } // namespace N64Recomp
 

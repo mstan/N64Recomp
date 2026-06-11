@@ -456,15 +456,13 @@ void N64Recomp::CGenerator::emit_tailcall_handling(const std::set<uint32_t>& loc
     //     required for finite menu-exit continuations such as register-quit
     //     (ISSUES.md #7): the continuation must run THIS frame's tail (e.g.
     //     main_pool_try_free) and resume, so it cannot be bubbled away.
-    //   - Past the threshold we are in an UNBOUNDED tailcall loop (e.g. the GB
-    //     Tower emulator's fetch-decode-execute loop, ISSUES.md #11, observed
-    //     recursing 7680+ deep with a CONSTANT guest SP). Re-entering
-    //     recomp_handle_tailcalls per iteration overflows the host stack, so we
-    //     bubble up and let the single outermost trampoline iterate. Constant-SP
-    //     pure tailcalls carry no per-level work, so unwinding to it is lossless.
-    // Threshold is far above any finite continuation depth and far below the
-    // observed overflow depth.
-    fmt::print(output_file, "        if (ctx->tailcall_dispatching >= 1024u) {{\n");
+    //   - Past the threshold, re-entering recomp_handle_tailcalls from large
+    //     generated frames can overflow the host stack before an unbounded
+    //     guest tailcall loop is identified. Bubble up and let the existing
+    //     outer trampoline iterate instead.
+    // Keep the limit low enough to be a stack-safety guard while still allowing
+    // shallow finite continuations to drain locally.
+    fmt::print(output_file, "        if (ctx->tailcall_dispatching >= 64u) {{\n");
     fmt::print(output_file, "            recomp_cf_note(\"call-bubble-dispatch\", (uint32_t)recomp_call_sp, recomp_prev_host_return, recomp_call_host_return, ctx);\n");
     fmt::print(output_file, "            ctx->host_return_target = recomp_prev_host_return;\n");
     fmt::print(output_file, "            return;\n");

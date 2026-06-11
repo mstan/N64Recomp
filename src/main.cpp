@@ -1312,6 +1312,7 @@ bool recompile_single_function(const N64Recomp::Context& context, size_t func_in
     // Write the file header
     fmt::print(output_file,
         "{}\n"
+        "#include \"funcs.h\"\n"
         "\n",
         recomp_include);
 
@@ -1561,7 +1562,8 @@ int main(int argc, char** argv) {
         // of the pipeline treats them like any other ELF section.
         if (!N64Recomp::synthesize_decompressed_sections(
                 context, config.rom_file_path,
-                config.decompressed_sections)) {
+                config.decompressed_sections,
+                config.decompressed_section_patches)) {
             exit_failure("Failed to synthesize decompressed sections\n");
         }
 
@@ -1572,7 +1574,8 @@ int main(int argc, char** argv) {
         // names (<base>__rom_<offset>) per wrapper.
         if (!N64Recomp::synthesize_decompressed_patterns(
                 context, config.rom_file_path,
-                config.decompressed_section_patterns)) {
+                config.decompressed_section_patterns,
+                config.decompressed_section_patches)) {
             exit_failure("Failed to synthesize decompressed patterns\n");
         }
 
@@ -1663,6 +1666,26 @@ int main(int argc, char** argv) {
         exit_failure("Config file must provide either an elf or a symbols file\n");
     }
 
+    // ROM-direct / symbols-file projects need the same runtime-decompressed
+    // fragment synthesis as ELF projects. The ELF path performs this inside
+    // its branch before context dumping; symbols mode cannot dump context, so
+    // synthesize here after the base context is built and before collisions,
+    // hooks, stubs, and codegen consume the final function/section set.
+    if (!config.symbols_file_path.empty()) {
+        if (!N64Recomp::synthesize_decompressed_sections(
+                context, config.rom_file_path,
+                config.decompressed_sections,
+                config.decompressed_section_patches)) {
+            exit_failure("Failed to synthesize decompressed sections\n");
+        }
+
+        if (!N64Recomp::synthesize_decompressed_patterns(
+                context, config.rom_file_path,
+                config.decompressed_section_patterns,
+                config.decompressed_section_patches)) {
+            exit_failure("Failed to synthesize decompressed patterns\n");
+        }
+    }
 
     fmt::print("Function count: {}\n", context.functions.size());
 
@@ -2056,6 +2079,15 @@ int main(int argc, char** argv) {
     for (size_t section_index = 0; section_index < context.sections.size(); section_index++) {
         auto& section = context.sections[section_index];
         auto& section_funcs = section.function_addrs;
+        const uint32_t section_encoded_vram =
+            infer_section_encoded_vram_base(context, section_index);
+        auto section_base_for_vram = [&](uint32_t vram) {
+            if (vram >= section_encoded_vram &&
+                vram <= section_encoded_vram + section.size) {
+                return section_encoded_vram;
+            }
+            return section.ram_addr;
+        };
 
         // Sort the section's functions
         std::sort(section_funcs.begin(), section_funcs.end());
@@ -2065,14 +2097,15 @@ int main(int argc, char** argv) {
         section_statics.assign(statics_set.begin(), statics_set.end());
 
         auto span_ends_after_conditional_branch_delay = [&](uint32_t span_end) {
-            if (span_end < section.ram_addr + sizeof(uint32_t) * 2 ||
-                span_end > section.ram_addr + section.size) {
+            const uint32_t span_base = section_base_for_vram(span_end);
+            if (span_end < span_base + sizeof(uint32_t) * 2 ||
+                span_end > span_base + section.size) {
                 return false;
             }
 
             const uint32_t branch_vram = span_end - sizeof(uint32_t) * 2;
             const uint32_t branch_word = byteswap(*reinterpret_cast<const uint32_t*>(
-                context.rom.data() + section.rom_addr + (branch_vram - section.ram_addr)));
+                context.rom.data() + section.rom_addr + (branch_vram - span_base)));
             rabbitizer::InstructionCpu branch_instr(branch_word, branch_vram);
             return branch_instr.isValid() && is_conditional_branch(branch_instr);
         };
@@ -2101,9 +2134,11 @@ int main(int argc, char** argv) {
             }
 
             // Determine the code span for this static function.
+            const uint32_t static_decode_base =
+                section_base_for_vram(static_func_addr);
             uint32_t code_func_start = static_func_addr;
-            uint32_t code_rom_addr = static_cast<uint32_t>(static_func_addr - section.ram_addr + section.rom_addr);
-            uint32_t cur_func_end = static_cast<uint32_t>(section.size + section.ram_addr);
+            uint32_t code_rom_addr = static_cast<uint32_t>(static_func_addr - static_decode_base + section.rom_addr);
+            uint32_t cur_func_end = static_cast<uint32_t>(section.size + static_decode_base);
             size_t containing_func_index = find_containing_function_in_section(context, static_func_addr, section_index);
 
             if (containing_func_index != (size_t)-1) {
@@ -2131,16 +2166,16 @@ int main(int argc, char** argv) {
 
                 size_t discovered_size = 0;
                 std::string discover_error;
-                const size_t entry_offset = static_func_addr - section.ram_addr;
+                const size_t entry_offset = static_func_addr - static_decode_base;
                 if (N64Recomp::discover_function_bounds(
                         context.rom.data() + section.rom_addr,
                         section.size,
-                        section.ram_addr,
+                        static_decode_base,
                         entry_offset,
                         discovered_size,
                         discover_error)) {
                     cur_func_end = static_func_addr + uint32_t(discovered_size);
-                    cur_func_end = std::min(cur_func_end, static_cast<uint32_t>(section.ram_addr + section.size));
+                    cur_func_end = std::min(cur_func_end, static_cast<uint32_t>(static_decode_base + section.size));
 
                     while (statics_set.contains(cur_func_end) &&
                            span_ends_after_conditional_branch_delay(cur_func_end)) {
@@ -2148,8 +2183,8 @@ int main(int argc, char** argv) {
                         if (!N64Recomp::discover_function_bounds(
                                 context.rom.data() + section.rom_addr,
                                 section.size,
-                                section.ram_addr,
-                                cur_func_end - section.ram_addr,
+                                static_decode_base,
+                                cur_func_end - static_decode_base,
                                 fallthrough_size,
                                 discover_error) ||
                             fallthrough_size == 0) {
@@ -2159,7 +2194,7 @@ int main(int argc, char** argv) {
                         const uint32_t extended_end =
                             std::min<uint32_t>(
                                 cur_func_end + uint32_t(fallthrough_size),
-                                section.ram_addr + section.size);
+                                static_decode_base + section.size);
                         if (extended_end <= cur_func_end) {
                             break;
                         }
@@ -2229,6 +2264,36 @@ int main(int argc, char** argv) {
         }
     }
 
+    if (!context.dispatch_aliases.empty()) {
+        for (const N64Recomp::DispatchAlias& alias : context.dispatch_aliases) {
+            fmt::print(func_header_file,
+                       "void {}(uint8_t* rdram, recomp_context* ctx);\n",
+                       alias.name);
+        }
+
+        std::ofstream alias_file{ config.output_func_path / "dispatch_aliases.c" };
+        fmt::print(alias_file,
+            "{}\n"
+            "#include \"funcs.h\"\n"
+            "\n",
+            config.recomp_include);
+
+        for (const N64Recomp::DispatchAlias& alias : context.dispatch_aliases) {
+            const N64Recomp::Function& target_func =
+                context.functions[alias.target_function_index];
+            fmt::print(alias_file,
+                "RECOMP_FUNC void {}(uint8_t* rdram, recomp_context* ctx) {{\n"
+                "    uint32_t recomp_prev_dispatch_entry = ctx->dispatch_entry_target;\n"
+                "    ctx->dispatch_entry_target = 0x{:08X}u;\n"
+                "    {}(rdram, ctx);\n"
+                "    ctx->dispatch_entry_target = recomp_prev_dispatch_entry;\n"
+                "}}\n",
+                alias.name,
+                alias.vram,
+                target_func.name);
+        }
+    }
+
     if (config.has_entrypoint) {
         std::ofstream lookup_file{ config.output_func_path / "lookup.cpp" };
         
@@ -2266,9 +2331,15 @@ int main(int argc, char** argv) {
         for (size_t section_index = 0; section_index < context.sections.size(); section_index++) {
             const auto& section = context.sections[section_index];
             const auto& section_funcs = context.section_functions[section_index];
+            static const std::vector<size_t> empty_section_aliases;
+            const auto& section_aliases =
+                section_index < context.section_dispatch_aliases.size()
+                    ? context.section_dispatch_aliases[section_index]
+                    : empty_section_aliases;
             const auto& section_relocs = section.relocs;
 
-            if (section.has_mips32_relocs || !section_funcs.empty()) {
+            if (section.has_mips32_relocs || !section_funcs.empty() ||
+                !section_aliases.empty()) {
                 std::string_view section_name_trimmed{ section.name };
 
                 if (section.relocatable) {
@@ -2304,6 +2375,12 @@ int main(int argc, char** argv) {
                         fmt::print(overlay_file, "    {{ .func = {}, .offset = 0x{:08X}, .rom_size = 0x{:08X} }},\n",
                             func.name, func_offset, func_size);
                     }
+                }
+                for (size_t alias_index : section_aliases) {
+                    const auto& alias = context.dispatch_aliases[alias_index];
+                    uint32_t alias_offset = alias.rom - section.rom_addr;
+                    fmt::print(overlay_file, "    {{ .func = {}, .offset = 0x{:08X}, .rom_size = 0x00000000 }},\n",
+                        alias.name, alias_offset);
                 }
 
                 fmt::print(overlay_file, "}};\n");

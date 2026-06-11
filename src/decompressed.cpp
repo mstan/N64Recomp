@@ -23,6 +23,13 @@ uint32_t read_be_u32(const uint8_t* p) {
            (uint32_t(p[2]) << 8)  |  uint32_t(p[3]);
 }
 
+void write_be_u32(uint8_t* p, uint32_t value) {
+    p[0] = uint8_t(value >> 24);
+    p[1] = uint8_t(value >> 16);
+    p[2] = uint8_t(value >> 8);
+    p[3] = uint8_t(value);
+}
+
 // FNV-1a 64-bit content hash. Used to deduplicate wrappers whose
 // decompressed bytes are byte-for-byte identical (Stadium's 0x8FF00000
 // slot has ~11 such pairs out of 279), and as the runtime dispatch key
@@ -34,6 +41,218 @@ uint64_t fnv1a_64(const uint8_t* data, size_t len) {
         h *= 0x100000001B3ull;
     }
     return h;
+}
+
+struct RawFragmentInfo {
+    uint32_t link_vram = 0;
+    uint32_t j_target = 0;
+    uint32_t reloc_offset = 0;
+    uint32_t blob_size = 0;
+};
+
+bool fragment_id_from_vram(uint32_t vram, uint32_t& id_out) {
+    const uint32_t bucket = (vram & 0x0FF00000u) >> 0x14;
+    if (bucket < 0x10u) {
+        return false;
+    }
+    id_out = bucket - 0x10u;
+    return true;
+}
+
+bool apply_decompressed_section_patches(
+    std::vector<uint8_t>& blob,
+    uint32_t rom_wrapper,
+    uint32_t vram,
+    const std::vector<DecompressedSectionPatch>& patches,
+    const std::string& section_name)
+{
+    if (patches.empty()) {
+        return true;
+    }
+
+    uint32_t original_pattern_id = 0;
+    const bool has_original_pattern_id =
+        fragment_id_from_vram(vram, original_pattern_id);
+
+    for (const DecompressedSectionPatch& patch : patches) {
+        if (patch.has_rom_wrapper && patch.rom_wrapper != rom_wrapper) {
+            continue;
+        }
+        if (patch.has_original_pattern_id &&
+            (!has_original_pattern_id ||
+             patch.original_pattern_id != original_pattern_id)) {
+            continue;
+        }
+
+        if (uint64_t(patch.offset) + 4ull > blob.size()) {
+            std::fprintf(stderr,
+                "decompressed: patch for %s ROM 0x%X offset 0x%X is past "
+                "decompressed blob size 0x%zX\n",
+                section_name.c_str(), rom_wrapper, patch.offset,
+                blob.size());
+            return false;
+        }
+
+        const uint32_t old_value =
+            read_be_u32(blob.data() + patch.offset);
+        write_be_u32(blob.data() + patch.offset, patch.value);
+
+        std::fprintf(stderr,
+            "decompressed: patched %s ROM 0x%X offset 0x%X "
+            "0x%08X -> 0x%08X\n",
+            section_name.c_str(), rom_wrapper, patch.offset,
+            old_value, patch.value);
+    }
+
+    return true;
+}
+
+bool decode_fragment_j_target(const uint8_t* bytes,
+                              size_t bytes_size,
+                              uint32_t& target_out) {
+    if (bytes_size < 4) {
+        return false;
+    }
+    const uint32_t j_instr = read_be_u32(bytes);
+    if (((j_instr >> 26) & 0x3Fu) != 0x02u) {
+        return false;
+    }
+    target_out = 0x80000000u | ((j_instr & 0x03FFFFFFu) << 2);
+    return true;
+}
+
+bool decode_mips_jump_target(uint32_t instr,
+                             uint32_t pc_delay_slot,
+                             uint32_t& target_out) {
+    const uint32_t opcode = (instr >> 26) & 0x3Fu;
+    if (opcode != 0x02u && opcode != 0x03u) {
+        return false;
+    }
+    target_out = (pc_delay_slot & 0xF0000000u) |
+                 ((instr & 0x03FFFFFFu) << 2);
+    return true;
+}
+
+bool decode_mips_conditional_branch_target(uint32_t instr,
+                                           uint32_t pc,
+                                           uint32_t& target_out) {
+    const uint32_t opcode = (instr >> 26) & 0x3Fu;
+    bool is_conditional_branch = false;
+    if (opcode == 0x01u) {
+        const uint32_t rt = (instr >> 16) & 0x1Fu;
+        is_conditional_branch =
+            rt == 0x00u || rt == 0x01u || rt == 0x02u || rt == 0x03u ||
+            rt == 0x10u || rt == 0x11u || rt == 0x12u || rt == 0x13u;
+    } else if ((opcode >= 0x04u && opcode <= 0x07u) ||
+               (opcode >= 0x14u && opcode <= 0x17u)) {
+        is_conditional_branch = true;
+    } else if (opcode == 0x11u) {
+        const uint32_t rs = (instr >> 21) & 0x1Fu;
+        is_conditional_branch = rs == 0x08u; // bc1*
+    }
+    if (!is_conditional_branch) {
+        return false;
+    }
+
+    const int16_t imm = int16_t(instr & 0xFFFFu);
+    target_out = pc + 4u + (uint32_t(int32_t(imm)) << 2);
+    return true;
+}
+
+bool decode_fragment_link_vram(const uint8_t* bytes,
+                               size_t bytes_size,
+                               uint32_t& link_vram_out) {
+    if (bytes_size < 0x20) {
+        return false;
+    }
+    if (read_be_u32(bytes + 4) != 0) {
+        return false;
+    }
+    if (std::memcmp(bytes + 0x08, "FRAGMENT", 8) != 0) {
+        return false;
+    }
+
+    uint32_t j_target = 0;
+    if (!decode_fragment_j_target(bytes, bytes_size, j_target)) {
+        return false;
+    }
+
+    const uint32_t entry_offset = read_be_u32(bytes + 0x10);
+    if ((entry_offset & 3u) != 0) {
+        return false;
+    }
+
+    const uint32_t rounded_link_vram = j_target & 0xFFF00000u;
+    if (j_target - rounded_link_vram == entry_offset) {
+        link_vram_out = j_target - entry_offset;
+    } else {
+        link_vram_out = rounded_link_vram;
+    }
+    return true;
+}
+
+bool try_extract_raw_fragment(const std::vector<uint8_t>& rom,
+                              uint32_t rom_offset,
+                              std::vector<uint8_t>& blob_out,
+                              RawFragmentInfo* info_out = nullptr) {
+    if (uint64_t(rom_offset) + 0x20ull > rom.size()) {
+        return false;
+    }
+
+    const uint8_t* base = rom.data() + rom_offset;
+    uint32_t j_target = 0;
+    if (!decode_fragment_j_target(base, 4, j_target)) {
+        return false;
+    }
+    uint32_t link_vram = 0;
+    if (!decode_fragment_link_vram(base, 0x20, link_vram)) {
+        return false;
+    }
+    if (read_be_u32(base + 4) != 0) {
+        return false;
+    }
+    if (std::memcmp(base + 0x08, "FRAGMENT", 8) != 0) {
+        return false;
+    }
+
+    const uint32_t reloc_offset = read_be_u32(base + 0x14);
+    const uint32_t file_size_hint = read_be_u32(base + 0x18);
+    const uint32_t size_in_ram = read_be_u32(base + 0x1C);
+    if ((reloc_offset & 3u) != 0 || reloc_offset < 0x20u) {
+        return false;
+    }
+    if (uint64_t(rom_offset) + uint64_t(reloc_offset) + 4ull >
+        rom.size()) {
+        return false;
+    }
+
+    const uint32_t n_relocs = read_be_u32(base + reloc_offset);
+    // Reloc tables in these fragments are small; this guard keeps false
+    // positives from treating arbitrary ROM bytes as a huge fragment.
+    if (n_relocs > 0x10000u) {
+        return false;
+    }
+    const uint64_t reloc_table_end =
+        uint64_t(reloc_offset) + 4ull + 4ull * uint64_t(n_relocs);
+    uint64_t blob_size = std::max<uint64_t>(reloc_table_end, size_in_ram);
+    if (file_size_hint >= reloc_table_end) {
+        blob_size = std::max<uint64_t>(blob_size, file_size_hint);
+    }
+    if (blob_size > 0x400000ull ||
+        uint64_t(rom_offset) + blob_size > rom.size()) {
+        return false;
+    }
+
+    blob_out.assign(size_t(blob_size), 0);
+    std::memcpy(blob_out.data(), base, size_t(blob_size));
+
+    if (info_out != nullptr) {
+        info_out->j_target = j_target;
+        info_out->link_vram = link_vram;
+        info_out->reloc_offset = reloc_offset;
+        info_out->blob_size = uint32_t(blob_size);
+    }
+    return true;
 }
 
 // Reads an entire file into memory. Returns empty vector on error.
@@ -298,7 +517,8 @@ void resolve_cross_section_targets(Context& context,
 bool synthesize_decompressed_sections(
     Context& context,
     const std::filesystem::path& rom_path,
-    const std::vector<DecompressedSection>& configs)
+    const std::vector<DecompressedSection>& configs,
+    const std::vector<DecompressedSectionPatch>& patches)
 {
     if (configs.empty()) return true;
 
@@ -329,11 +549,23 @@ bool synthesize_decompressed_sections(
                 rom.data() + cfg.rom_wrapper,
                 rom.size() - cfg.rom_wrapper,
                 blob);
-        } else if (cfg.wrapper_format == "yay0") {
+        } else if (cfg.wrapper_format == "yay0" ||
+                   cfg.wrapper_format == "bare_yay0") {
             ok = compression::yay0_decompress(
                 rom.data() + cfg.rom_wrapper,
                 rom.size() - cfg.rom_wrapper,
                 blob);
+        } else if (cfg.wrapper_format == "raw_fragment") {
+            RawFragmentInfo raw_info;
+            ok = try_extract_raw_fragment(
+                rom, cfg.rom_wrapper, blob, &raw_info);
+            if (ok && raw_info.link_vram != cfg.vram) {
+                std::fprintf(stderr,
+                    "decompressed: section %s raw_fragment header derives "
+                    "vram 0x%08X but config says 0x%08X\n",
+                    cfg.name.c_str(), raw_info.link_vram, cfg.vram);
+                return false;
+            }
         } else {
             std::fprintf(stderr,
                 "decompressed: section %s unknown wrapper_format '%s'\n",
@@ -346,6 +578,10 @@ bool synthesize_decompressed_sections(
                 "at ROM 0x%X (format=%s)\n",
                 cfg.name.c_str(), cfg.rom_wrapper,
                 cfg.wrapper_format.c_str());
+            return false;
+        }
+        if (!apply_decompressed_section_patches(
+                blob, cfg.rom_wrapper, cfg.vram, patches, cfg.name)) {
             return false;
         }
 
@@ -396,6 +632,7 @@ bool synthesize_decompressed_sections(
         // section_functions in lockstep.
         context.sections.emplace_back(std::move(section));
         context.section_functions.emplace_back();
+        context.section_dispatch_aliases.emplace_back();
 
         // Synthesize functions for the FRAGMENT layout:
         //
@@ -502,7 +739,8 @@ size_t add_decompressed_section(Context& context,
                                 bool relocatable,
                                 uint64_t content_hash,
                                 uint32_t override_link_ram_addr = 0,
-                                uint32_t original_pattern_id = 0xFFFFFFFFu)
+                                uint32_t original_pattern_id = 0xFFFFFFFFu,
+                                const std::set<uint32_t>* extra_entry_offsets = nullptr)
 {
     // `vram` is the BYTES-ENCODED vram — what the body's R_MIPS_HI16/LO16
     // / R_MIPS_32 / J/JAL targets are encoded relative to. The CFG walker
@@ -599,18 +837,30 @@ size_t add_decompressed_section(Context& context,
 
     context.sections.emplace_back(std::move(section));
     context.section_functions.emplace_back();
+    context.section_dispatch_aliases.emplace_back();
+
+    std::unordered_map<uint32_t, size_t> function_index_by_offset;
 
     auto add_function = [&](uint32_t f_vram, uint32_t f_rom,
                             std::vector<uint32_t> words,
-                            std::string name) {
+                            std::string name,
+                            uint32_t entry_vram = 0) -> size_t {
         const size_t fi = context.functions.size();
         context.functions.emplace_back(
             f_vram, f_rom, std::move(words), name,
-            section_index, false, false, false);
+            section_index, false, false, false, entry_vram);
         context.section_functions[section_index].push_back(fi);
         context.sections[section_index].function_addrs.push_back(f_vram);
         context.functions_by_vram[f_vram].push_back(fi);
+        if (entry_vram != 0 && entry_vram != f_vram) {
+            context.functions_by_vram[entry_vram].push_back(fi);
+        }
         context.functions_by_name[name] = fi;
+        if (f_vram >= vram && f_vram < vram + reloc_offset &&
+            ((f_vram - vram) & 3u) == 0) {
+            function_index_by_offset[f_vram - vram] = fi;
+        }
+        return fi;
     };
 
     // Stadium has two FRAGMENT shapes that share the same +0x00..0x20
@@ -659,7 +909,7 @@ size_t add_decompressed_section(Context& context,
         return section_index;
     }
 
-    // Code fragment path: synthesize entry trampoline + impl function.
+    // Code fragment path: synthesize entry trampoline + direct targets.
 
     // (1) Entry trampoline at vram+0 (8 bytes).
     std::vector<uint32_t> entry_words(2);
@@ -667,6 +917,1041 @@ size_t add_decompressed_section(Context& context,
     add_function(vram, synthetic_rom,
                  std::move(entry_words),
                  section_name + "_entry");
+
+    {
+    std::set<uint32_t> seed_offsets;
+    auto add_seed_if_in_body = [&](uint32_t offset) {
+        if (offset == 0 || (offset & 3u) != 0) {
+            return;
+        }
+        if (offset + 4 > reloc_offset) {
+            return;
+        }
+        seed_offsets.insert(offset);
+    };
+    auto looks_like_function_entry = [&](uint32_t offset) {
+        if ((offset & 3u) != 0 || offset + 4 > reloc_offset) {
+            return false;
+        }
+        const uint32_t word = read_be_u32(blob.data() + offset);
+        // Common MIPS prologue: addiu sp, sp, -frame_size.
+        if ((word & 0xFFFF0000u) == 0x27BD0000u &&
+            (word & 0x8000u) != 0) {
+            return true;
+        }
+        // Tiny leaf/thunk functions can begin with jr ra.
+        if (word == 0x03E00008u) {
+            return true;
+        }
+        // Some Stadium callback tables point at tiny leaf routines that
+        // do not allocate a stack frame. Keep this narrow so data table
+        // words that merely decode as MIPS do not become function seeds.
+        const auto is_stack_store = [](uint32_t insn) {
+            const uint32_t op = (insn >> 26) & 0x3Fu;
+            const uint32_t base = (insn >> 21) & 0x1Fu;
+            return base == 29u && (
+                op == 0x28u || // sb
+                op == 0x29u || // sh
+                op == 0x2Bu || // sw
+                op == 0x39u || // swc1
+                op == 0x3Du);  // sdc1
+        };
+        if (!is_stack_store(word)) {
+            return false;
+        }
+
+        rabbitizer::InstructionCpu first_instr(word, vram + offset);
+        if (!first_instr.isValid() ||
+            first_instr.doesLink() ||
+            first_instr.isBranch()) {
+            return false;
+        }
+
+        constexpr uint32_t MAX_STACK_STORE_LEAF_SIZE = 0x40;
+        size_t func_size = 0;
+        std::string discover_err;
+        if (!discover_function_bounds(
+                blob.data(), reloc_offset,
+                vram, offset,
+                func_size, discover_err)) {
+            return false;
+        }
+
+        const uint64_t func_end = uint64_t(offset) + func_size;
+        if (func_size < 8 ||
+            func_size > MAX_STACK_STORE_LEAF_SIZE ||
+            (func_size & 3u) != 0 ||
+            func_end > reloc_offset ||
+            read_be_u32(blob.data() + uint32_t(func_end) - 8) !=
+                0x03E00008u) {
+            return false;
+        }
+
+        for (uint32_t cur = offset;
+             cur + 4 < uint32_t(func_end);
+             cur += 4) {
+            const uint32_t cur_word = read_be_u32(blob.data() + cur);
+            rabbitizer::InstructionCpu cur_instr(cur_word, vram + cur);
+            if (!cur_instr.isValid() || cur_instr.doesLink()) {
+                return false;
+            }
+            if (cur + 8 < uint32_t(func_end) && cur_instr.isBranch()) {
+                return false;
+            }
+        }
+        return true;
+    };
+
+    uint32_t header_j_target = 0;
+    if (!decode_fragment_j_target(blob.data(), blob.size(), header_j_target) ||
+        header_j_target < vram ||
+        header_j_target >= vram + reloc_offset ||
+        ((header_j_target - vram) & 3u) != 0) {
+        std::fprintf(stderr,
+            "decompressed: section %s â€” code fragment has invalid "
+            "header J target 0x%08X for body [0x%08X..0x%08X)\n",
+            section_name.c_str(), header_j_target, vram,
+            vram + reloc_offset);
+        return size_t(-1);
+    }
+    add_seed_if_in_body(header_j_target - vram);
+
+    if (extra_entry_offsets != nullptr) {
+        for (uint32_t entry_offset : *extra_entry_offsets) {
+            if (looks_like_function_entry(entry_offset)) {
+                add_seed_if_in_body(entry_offset);
+            }
+        }
+    }
+
+    for (const Reloc& reloc : context.sections[section_index].relocs) {
+        if (reloc.type != RelocType::R_MIPS_26) {
+            if (reloc.target_section == section_index &&
+                looks_like_function_entry(reloc.target_section_offset)) {
+                add_seed_if_in_body(reloc.target_section_offset);
+            }
+            continue;
+        }
+        if (reloc.target_section != section_index) {
+            continue;
+        }
+        if (reloc.address < vram) {
+            continue;
+        }
+        const uint32_t reloc_site_offset = reloc.address - vram;
+        if (reloc_site_offset + 4 > reloc_offset) {
+            continue;
+        }
+        const uint32_t reloc_site_word =
+            read_be_u32(blob.data() + reloc_site_offset);
+        const uint32_t reloc_site_opcode =
+            (reloc_site_word >> 26) & 0x3Fu;
+        if (reloc_site_opcode != 0x02u && reloc_site_opcode != 0x03u) {
+            continue;
+        }
+        add_seed_if_in_body(reloc.target_section_offset);
+    }
+
+    if (seed_offsets.empty()) {
+        std::fprintf(stderr,
+            "decompressed: section %s â€” code fragment has no in-body "
+            "direct jump targets to compile\n",
+            section_name.c_str());
+        return size_t(-1);
+    }
+
+    std::set<uint32_t> emitted_offsets;
+    std::set<uint32_t> emitted_alias_offsets;
+    std::vector<std::pair<uint32_t, uint32_t>> emitted_ranges;
+    auto discover_and_add_function = [&](uint32_t entry_offset,
+                                         uint32_t max_end_offset,
+                                         bool hard_failure,
+                                         bool* added_out = nullptr) -> bool {
+        if (added_out != nullptr) {
+            *added_out = false;
+        }
+        if (emitted_offsets.find(entry_offset) != emitted_offsets.end()) {
+            return true;
+        }
+
+        size_t func_size = 0;
+        std::string discover_err;
+        bool ok = discover_function_bounds(
+            blob.data(), reloc_offset,
+            vram, entry_offset,
+            func_size, discover_err);
+        if (!ok) {
+            if (!hard_failure) {
+                return true;
+            }
+            std::fprintf(stderr,
+                "decompressed: section %s â€” function-bounds discovery "
+                "at +0x%X failed: %s\n"
+                "  Build aborted. Resolutions, in order of preference:\n"
+                "    1. If this is a recompiler analysis gap, fix the\n"
+                "       analyzer in src/analysis.cpp.\n"
+                "    2. If the fragment legitimately has a shape the\n"
+                "       analyzer can't handle, declare it via the\n"
+                "       single-block [[input.decompressed_section]] form\n"
+                "       (manual analysis path).\n"
+                "    3. If the wrapper is unused / unreachable in this\n"
+                "       game's runtime path, exclude it via a future\n"
+                "       pattern.exclude config field.\n"
+                "  No graceful skip, no stub. Build refuses to ship.\n",
+                section_name.c_str(), entry_offset,
+                discover_err.c_str());
+            return false;
+        }
+
+        const uint64_t func_end = uint64_t(entry_offset) + func_size;
+        if (func_size == 0 || func_end > reloc_offset ||
+            (func_size & 3u) != 0 ||
+            (max_end_offset != 0 && func_end > max_end_offset)) {
+            if (!hard_failure) {
+                return true;
+            }
+            std::fprintf(stderr,
+                "decompressed: section %s â€” invalid discovered size "
+                "0x%zX for function at +0x%X (body size 0x%X)\n",
+                section_name.c_str(), func_size, entry_offset,
+                reloc_offset);
+            return false;
+        }
+
+        std::vector<uint32_t> func_words(func_size / 4);
+        std::memcpy(func_words.data(),
+                    blob.data() + entry_offset, func_size);
+        const std::string func_name = fmt::format(
+            "func_{:08X}", vram + entry_offset);
+        add_function(vram + entry_offset,
+                     synthetic_rom + entry_offset,
+                     std::move(func_words),
+                     func_name);
+        emitted_offsets.insert(entry_offset);
+        emitted_ranges.emplace_back(entry_offset, uint32_t(func_end));
+        if (added_out != nullptr) {
+            *added_out = true;
+        }
+        return true;
+    };
+
+    auto add_known_size_function = [&](uint32_t entry_offset,
+                                       size_t func_size,
+                                       uint32_t max_end_offset,
+                                       bool* added_out = nullptr,
+                                       uint32_t dispatch_entry_offset = 0) -> bool {
+        if (added_out != nullptr) {
+            *added_out = false;
+        }
+        const uint32_t effective_entry_offset =
+            dispatch_entry_offset != 0 ? dispatch_entry_offset : entry_offset;
+        if (emitted_offsets.find(entry_offset) != emitted_offsets.end() ||
+            emitted_offsets.find(effective_entry_offset) != emitted_offsets.end()) {
+            return true;
+        }
+
+        const uint64_t func_end = uint64_t(entry_offset) + func_size;
+        if (func_size == 0 || func_end > reloc_offset ||
+            (func_size & 3u) != 0 ||
+            effective_entry_offset < entry_offset ||
+            effective_entry_offset >= func_end ||
+            (max_end_offset != 0 && func_end > max_end_offset)) {
+            return true;
+        }
+
+        std::vector<uint32_t> func_words(func_size / 4);
+        std::memcpy(func_words.data(),
+                    blob.data() + entry_offset, func_size);
+        const std::string func_name = fmt::format(
+            "func_{:08X}", vram + effective_entry_offset);
+        add_function(vram + entry_offset,
+                     synthetic_rom + entry_offset,
+                     std::move(func_words),
+                     func_name,
+                     vram + effective_entry_offset);
+        emitted_offsets.insert(entry_offset);
+        emitted_offsets.insert(effective_entry_offset);
+        emitted_ranges.emplace_back(entry_offset, uint32_t(func_end));
+        if (added_out != nullptr) {
+            *added_out = true;
+        }
+        return true;
+    };
+
+    auto add_dispatch_alias = [&](size_t parent_func_index,
+                                  uint32_t entry_offset,
+                                  bool* added_out = nullptr) -> bool {
+        if (added_out != nullptr) {
+            *added_out = false;
+        }
+        if ((entry_offset & 3u) != 0 ||
+            entry_offset >= reloc_offset ||
+            emitted_offsets.find(entry_offset) != emitted_offsets.end() ||
+            emitted_alias_offsets.find(entry_offset) != emitted_alias_offsets.end()) {
+            return true;
+        }
+        if (parent_func_index >= context.functions.size()) {
+            return false;
+        }
+
+        N64Recomp::Function& parent_func = context.functions[parent_func_index];
+        const uint32_t entry_vram = vram + entry_offset;
+        const uint32_t parent_size =
+            uint32_t(parent_func.words.size() * sizeof(parent_func.words[0]));
+        if (entry_vram <= parent_func.vram ||
+            entry_vram >= parent_func.vram + parent_size) {
+            return true;
+        }
+
+        parent_func.dispatch_entry_vrams.insert(entry_vram);
+
+        N64Recomp::DispatchAlias alias{};
+        alias.section_index = uint16_t(section_index);
+        alias.vram = entry_vram;
+        alias.rom = synthetic_rom + entry_offset;
+        alias.name = fmt::format(
+            "dispatch_alias_s{}_{:08X}",
+            section_index,
+            entry_vram);
+        alias.target_function_index = parent_func_index;
+        const size_t alias_index = context.dispatch_aliases.size();
+        context.dispatch_aliases.emplace_back(std::move(alias));
+        if (section_index >= context.section_dispatch_aliases.size()) {
+            context.section_dispatch_aliases.resize(section_index + 1);
+        }
+        context.section_dispatch_aliases[section_index].push_back(alias_index);
+        emitted_alias_offsets.insert(entry_offset);
+        if (added_out != nullptr) {
+            *added_out = true;
+        }
+        return true;
+    };
+
+    for (uint32_t entry_offset : seed_offsets) {
+        if (!discover_and_add_function(entry_offset, 0, true)) {
+            return size_t(-1);
+        }
+    }
+
+    auto looks_like_gap_function_entry = [&](uint32_t offset) {
+        if ((offset & 3u) != 0 || offset + 4 > reloc_offset) {
+            return false;
+        }
+        const uint32_t word = read_be_u32(blob.data() + offset);
+        return (word & 0xFFFF0000u) == 0x27BD0000u &&
+               (word & 0x8000u) != 0;
+    };
+
+    auto has_reloc_site_in_range = [&](uint32_t begin, uint32_t end) {
+        for (const Reloc& reloc : context.sections[section_index].relocs) {
+            if (reloc.address < vram) {
+                continue;
+            }
+            const uint32_t reloc_site_offset = reloc.address - vram;
+            if (reloc_site_offset >= begin && reloc_site_offset < end) {
+                return true;
+            }
+        }
+        return false;
+    };
+
+    auto has_leaf_entry_reloc_site_at = [&](uint32_t offset) {
+        for (const Reloc& reloc : context.sections[section_index].relocs) {
+            if (reloc.address < vram ||
+                reloc.address - vram != offset) {
+                continue;
+            }
+            switch (reloc.type) {
+            case RelocType::R_MIPS_HI16:
+            case RelocType::R_MIPS_32:
+            case RelocType::R_MIPS_GPREL16:
+                return true;
+            default:
+                break;
+            }
+        }
+        return false;
+    };
+
+    auto has_self_pointer_reloc_target_at = [&](uint32_t offset) {
+        for (const Reloc& reloc : context.sections[section_index].relocs) {
+            if (reloc.target_section == section_index &&
+                reloc.target_section_offset == offset &&
+                reloc.type == RelocType::R_MIPS_32) {
+                return true;
+            }
+        }
+        return false;
+    };
+
+    auto has_link_instruction_in_range = [&](uint32_t begin, uint32_t end) {
+        for (uint32_t offset = begin; offset + 4 <= end; offset += 4) {
+            const uint32_t word = read_be_u32(blob.data() + offset);
+            rabbitizer::InstructionCpu instr(word, vram + offset);
+            if (instr.isValid() && instr.doesLink()) {
+                return true;
+            }
+        }
+        return false;
+    };
+
+    auto discover_bounded_no_link_leaf =
+        [&](uint32_t offset, uint32_t gap_end, size_t& func_size_out) {
+        if (gap_end > reloc_offset || offset >= gap_end ||
+            (offset & 3u) != 0 || (gap_end & 3u) != 0) {
+            return false;
+        }
+
+        std::set<uint32_t> visited;
+        std::vector<uint32_t> worklist{offset};
+        uint32_t max_reached = offset;
+        bool saw_return = false;
+
+        auto mark_delay = [&](uint32_t delay) {
+            if (delay + 4 > gap_end) {
+                return false;
+            }
+            visited.insert(delay);
+            max_reached = std::max(max_reached, delay);
+            return true;
+        };
+        auto enqueue_local_target = [&](uint32_t target_vram) {
+            if (target_vram < vram + offset || target_vram >= vram + gap_end) {
+                return false;
+            }
+            const uint32_t target_offset = target_vram - vram;
+            if ((target_offset & 3u) != 0) {
+                return false;
+            }
+            if (!visited.contains(target_offset)) {
+                worklist.push_back(target_offset);
+            }
+            return true;
+        };
+
+        while (!worklist.empty()) {
+            uint32_t cursor = worklist.back();
+            worklist.pop_back();
+            while (cursor + 4 <= gap_end) {
+                if (visited.contains(cursor)) {
+                    break;
+                }
+                visited.insert(cursor);
+                max_reached = std::max(max_reached, cursor);
+
+                const uint32_t word = read_be_u32(blob.data() + cursor);
+                if (word == 0xFFFFFFFFu) {
+                    return false;
+                }
+                rabbitizer::InstructionCpu instr(word, vram + cursor);
+                if (!instr.isValid() || instr.doesLink()) {
+                    return false;
+                }
+
+                const uint32_t opcode = (word >> 26) & 0x3Fu;
+                const uint32_t funct = word & 0x3Fu;
+                if (word == 0x03E00008u) {
+                    if (!mark_delay(cursor + 4)) {
+                        return false;
+                    }
+                    saw_return = true;
+                    break;
+                }
+                if (opcode == 0x00u && (funct == 0x08u || funct == 0x09u)) {
+                    return false;
+                }
+
+                uint32_t target_vram = 0;
+                if (opcode == 0x02u) {
+                    if (!decode_mips_jump_target(
+                            word, vram + cursor + 4, target_vram) ||
+                        !mark_delay(cursor + 4) ||
+                        !enqueue_local_target(target_vram)) {
+                        return false;
+                    }
+                    break;
+                }
+
+                if (decode_mips_conditional_branch_target(
+                        word, vram + cursor, target_vram)) {
+                    if (!mark_delay(cursor + 4) ||
+                        !enqueue_local_target(target_vram)) {
+                        return false;
+                    }
+                    cursor += 8;
+                    continue;
+                }
+
+                cursor += 4;
+            }
+        }
+
+        if (!saw_return) {
+            return false;
+        }
+        const uint32_t func_end = max_reached + 4;
+        if (func_end > gap_end || func_end <= offset) {
+            return false;
+        }
+        func_size_out = func_end - offset;
+        return true;
+    };
+
+    auto looks_like_leaf_gap_function_entry =
+        [&](uint32_t offset,
+            uint32_t gap_begin,
+            uint32_t gap_end,
+            size_t& func_size_out) {
+        constexpr uint32_t MAX_LEAF_GAP_FUNCTION_SIZE = 0x100;
+        if ((offset & 3u) != 0 || offset + 8 > gap_end) {
+            return false;
+        }
+        const bool allow_initial_fragment_leaf = offset == IMPL_OFFSET;
+        const bool allow_adjacent_fragment_leaf =
+            offset == gap_begin && offset != IMPL_OFFSET;
+        if (!allow_initial_fragment_leaf &&
+            !allow_adjacent_fragment_leaf &&
+            !has_leaf_entry_reloc_site_at(offset)) {
+            return false;
+        }
+
+        const uint32_t first_word = read_be_u32(blob.data() + offset);
+        if (first_word == 0 || first_word == 0xFFFFFFFFu) {
+            return false;
+        }
+
+        rabbitizer::InstructionCpu first_instr(first_word, vram + offset);
+        if (!first_instr.isValid() ||
+            first_instr.doesLink() ||
+            first_instr.isBranch()) {
+            return false;
+        }
+
+        if (!discover_bounded_no_link_leaf(
+                offset, gap_end, func_size_out)) {
+            return false;
+        }
+
+        const auto starts_stack_frame_at = [&](uint32_t start) {
+            if (start + 4 > reloc_offset) {
+                return false;
+            }
+            const uint32_t word = read_be_u32(blob.data() + start);
+            return ((word & 0xFFFF0000u) == 0x27BD0000u) &&
+                   ((word & 0x8000u) != 0);
+        };
+        const auto valid_adjacent_leaf_chain_to_frame =
+            [&](uint32_t chain_offset) {
+            uint32_t cursor = chain_offset;
+            for (size_t leaf_count = 0; leaf_count < 16; leaf_count++) {
+                if (cursor == gap_end) {
+                    return starts_stack_frame_at(gap_end);
+                }
+                if (cursor > gap_end || cursor + 8 > gap_end) {
+                    return false;
+                }
+
+                const uint32_t chain_first_word =
+                    read_be_u32(blob.data() + cursor);
+                if (chain_first_word == 0 ||
+                    chain_first_word == 0xFFFFFFFFu) {
+                    return false;
+                }
+                rabbitizer::InstructionCpu chain_first_instr(
+                    chain_first_word, vram + cursor);
+                if (!chain_first_instr.isValid() ||
+                    chain_first_instr.doesLink() ||
+                    chain_first_instr.isBranch()) {
+                    return false;
+                }
+
+                size_t leaf_size = 0;
+                if (!discover_bounded_no_link_leaf(
+                        cursor, gap_end, leaf_size)) {
+                    return false;
+                }
+
+                const uint64_t leaf_end64 = uint64_t(cursor) + leaf_size;
+                if (leaf_size < 8 ||
+                    leaf_size > MAX_LEAF_GAP_FUNCTION_SIZE ||
+                    (leaf_size & 3u) != 0 ||
+                    leaf_end64 > gap_end) {
+                    return false;
+                }
+                const uint32_t leaf_end = uint32_t(leaf_end64);
+                if (read_be_u32(blob.data() + leaf_end - 8) !=
+                    0x03E00008u) {
+                    return false;
+                }
+                cursor = leaf_end;
+            }
+            return false;
+        };
+
+        const uint64_t func_end = uint64_t(offset) + func_size_out;
+        if (func_size_out < 8 ||
+            func_size_out > MAX_LEAF_GAP_FUNCTION_SIZE ||
+            (func_size_out & 3u) != 0 ||
+            func_end > gap_end) {
+            return false;
+        }
+        const bool allow_adjacent_leaf_chain =
+            allow_adjacent_fragment_leaf &&
+            valid_adjacent_leaf_chain_to_frame(offset);
+        if (!allow_initial_fragment_leaf &&
+            !allow_adjacent_leaf_chain &&
+            func_end != gap_end) {
+            return false;
+        }
+        if (allow_initial_fragment_leaf && func_end < gap_end) {
+            const uint32_t next_word =
+                read_be_u32(blob.data() + uint32_t(func_end));
+            if (next_word != 0x03E00008u &&
+                !((next_word & 0xFFFF0000u) == 0x27BD0000u &&
+                  (next_word & 0x8000u) != 0)) {
+                return false;
+            }
+        }
+
+        if (read_be_u32(blob.data() + uint32_t(func_end) - 8) !=
+            0x03E00008u) {
+            return false;
+        }
+
+        // Non-prologue leafs are easiest to confuse with embedded data.
+        // Require a reloc inside the candidate body and a real return at
+        // the discovered end before promoting it to a fragment entry. Some
+        // loader-patched leaves are reached through runtime-computed function
+        // pointers, leaving no durable relocation at the entry or body. Keep
+        // that fallback narrow: adjacent to a known function, a chain of
+        // small bounded no-link leaves that consumes the gap, and then a
+        // stack-frame prologue.
+        // Some valid Stadium first-body leafs load relocated state after a
+        // couple of setup instructions, so +0x20 may lack an entry reloc.
+        if ((!has_reloc_site_in_range(offset, uint32_t(func_end)) &&
+             !allow_adjacent_leaf_chain) ||
+            has_link_instruction_in_range(offset, uint32_t(func_end))) {
+            return false;
+        }
+
+        return true;
+    };
+
+    auto looks_like_fallthrough_gap_function_entry =
+        [&](uint32_t offset, uint32_t gap_end, uint32_t overlap_end) {
+        constexpr uint32_t MAX_FALLTHROUGH_PREAMBLE_SIZE = 0x80;
+        constexpr uint32_t MAX_FALLTHROUGH_FUNCTION_SIZE = 0x800;
+        if ((offset & 3u) != 0 || offset + 4 > gap_end ||
+            gap_end >= overlap_end ||
+            gap_end + 4 > reloc_offset ||
+            (!has_leaf_entry_reloc_site_at(offset) &&
+             !has_self_pointer_reloc_target_at(offset)) ||
+            gap_end - offset > MAX_FALLTHROUGH_PREAMBLE_SIZE) {
+            return false;
+        }
+
+        const uint32_t next_word = read_be_u32(blob.data() + gap_end);
+        if (!((next_word & 0xFFFF0000u) == 0x27BD0000u &&
+              (next_word & 0x8000u) != 0)) {
+            return false;
+        }
+
+        for (uint32_t cur = offset; cur + 4 <= gap_end; cur += 4) {
+            const uint32_t word = read_be_u32(blob.data() + cur);
+            if (word == 0 || word == 0xFFFFFFFFu) {
+                return false;
+            }
+            rabbitizer::InstructionCpu instr(word, vram + cur);
+            if (!instr.isValid() ||
+                instr.doesLink() ||
+                instr.isBranch()) {
+                return false;
+            }
+        }
+
+        size_t func_size = 0;
+        std::string discover_err;
+        if (!discover_function_bounds(
+                blob.data(), reloc_offset,
+                vram, offset,
+                func_size, discover_err)) {
+            return false;
+        }
+
+        const uint64_t func_end = uint64_t(offset) + func_size;
+        if (func_size < 8 ||
+            func_size > MAX_FALLTHROUGH_FUNCTION_SIZE ||
+            (func_size & 3u) != 0 ||
+            func_end <= gap_end ||
+            func_end > overlap_end) {
+            return false;
+        }
+
+        return read_be_u32(blob.data() + uint32_t(func_end) - 8) ==
+            0x03E00008u;
+    };
+
+    size_t gap_added_count = 0;
+    auto scan_gap_for_function = [&](uint32_t gap_begin,
+                                     uint32_t gap_end,
+                                     uint32_t overlap_end) -> bool {
+        gap_begin = std::max(gap_begin, IMPL_OFFSET);
+        gap_begin = (gap_begin + 3u) & ~3u;
+        for (uint32_t offset = gap_begin;
+             offset + 4 <= gap_end;
+             offset += 4) {
+            if (!looks_like_gap_function_entry(offset)) {
+                continue;
+            }
+
+            bool added = false;
+            if (!discover_and_add_function(
+                    offset, gap_end, false, &added)) {
+                return false;
+            }
+            if (added) {
+                gap_added_count++;
+                return true;
+            }
+        }
+        for (uint32_t offset = gap_begin;
+             offset + 4 <= gap_end;
+             offset += 4) {
+            if (!looks_like_fallthrough_gap_function_entry(
+                    offset, gap_end, overlap_end)) {
+                continue;
+            }
+
+            bool added = false;
+            if (!discover_and_add_function(
+                    offset, overlap_end, false, &added)) {
+                return false;
+            }
+            if (added) {
+                gap_added_count++;
+                return true;
+            }
+        }
+        for (uint32_t offset = gap_begin;
+             offset + 8 <= gap_end;
+             offset += 4) {
+            size_t leaf_func_size = 0;
+            if (!looks_like_leaf_gap_function_entry(
+                    offset, gap_begin, gap_end, leaf_func_size)) {
+                continue;
+            }
+
+            bool added = false;
+            if (!add_known_size_function(
+                    offset, leaf_func_size, gap_end, &added)) {
+                return false;
+            }
+            if (added) {
+                gap_added_count++;
+                return true;
+            }
+        }
+        return false;
+    };
+
+    bool added_gap_function = true;
+    while (added_gap_function) {
+        added_gap_function = false;
+        std::vector<std::pair<uint32_t, uint32_t>> ranges = emitted_ranges;
+        std::sort(ranges.begin(), ranges.end());
+
+        uint32_t gap_start = IMPL_OFFSET;
+        for (const auto& range : ranges) {
+            const uint32_t range_start = range.first;
+            const uint32_t range_end = range.second;
+            if (range_end <= gap_start) {
+                continue;
+            }
+            if (range_start > gap_start &&
+                scan_gap_for_function(gap_start, range_start, range_end)) {
+                added_gap_function = true;
+                break;
+            }
+            gap_start = std::max(gap_start, range_end);
+        }
+        if (!added_gap_function && gap_start < reloc_offset &&
+            scan_gap_for_function(gap_start, reloc_offset, reloc_offset)) {
+            added_gap_function = true;
+        }
+    }
+
+    if (gap_added_count != 0) {
+        std::fprintf(stderr,
+            "decompressed: section %s added %zu fragment-local gap "
+            "function(s)\n",
+            section_name.c_str(), gap_added_count);
+    }
+
+    size_t continuation_added_count = 0;
+    {
+        constexpr uint32_t MAX_CONTINUATION_PARENT_SIZE = 0x800;
+        constexpr uint32_t MAX_LARGE_PARENT_CONTINUATION_SIZE = 0x800;
+        // Every post-link instruction is a valid call-return continuation:
+        // if a nested tailcall drain bubbles while this function is being
+        // resumed from the runtime dispatcher, the return label can become an
+        // exact func_map lookup. Emit the suffix entry for small discovered
+        // functions so bounded drains do not depend on the original caller's
+        // local label switch still being on the host stack.
+        constexpr size_t MIN_SUFFIX_LINKS = 1;
+        auto is_stack_load_ra = [](uint32_t insn) {
+            const uint32_t op = (insn >> 26) & 0x3Fu;
+            const uint32_t base = (insn >> 21) & 0x1Fu;
+            const uint32_t rt = (insn >> 16) & 0x1Fu;
+            return op == 0x23u && base == 29u && rt == 31u;
+        };
+        auto is_jalr_instruction = [](uint32_t insn) {
+            return ((insn >> 26) & 0x3Fu) == 0u &&
+                   (insn & 0x3Fu) == 0x09u;
+        };
+
+        auto find_dynamic_continuation_body_start =
+            [&](uint32_t entry_offset,
+                uint32_t range_start,
+                uint32_t range_end) {
+            uint32_t body_start = entry_offset;
+            const uint32_t scan_end = std::min<uint32_t>(
+                range_end,
+                entry_offset + MAX_LARGE_PARENT_CONTINUATION_SIZE);
+
+            for (uint32_t scan = entry_offset;
+                 scan + 4 <= scan_end;
+                 scan += 4) {
+                const uint32_t scan_word = read_be_u32(blob.data() + scan);
+                rabbitizer::InstructionCpu scan_instr(
+                    scan_word, vram + scan);
+                if (!scan_instr.isValid()) {
+                    break;
+                }
+
+                uint32_t target_vram = 0;
+                if (decode_mips_conditional_branch_target(
+                        scan_word, vram + scan, target_vram) &&
+                    target_vram >= vram + range_start &&
+                    target_vram < vram + entry_offset &&
+                    ((target_vram - vram) & 3u) == 0) {
+                    body_start = std::min(body_start, target_vram - vram);
+                }
+
+                if (scan_word == 0x03E00008u) {
+                    break;
+                }
+
+                const uint32_t opcode = (scan_word >> 26) & 0x3Fu;
+                if (opcode == 0x02u) {
+                    break;
+                }
+            }
+
+            return body_start;
+        };
+
+        auto looks_like_large_parent_continuation =
+            [&](uint32_t offset, uint32_t range_end) {
+            if ((offset & 3u) != 0 || offset + 8 > range_end) {
+                return false;
+            }
+
+            const uint32_t first_word = read_be_u32(blob.data() + offset);
+            rabbitizer::InstructionCpu first_instr(first_word, vram + offset);
+            if (!first_instr.isValid()) {
+                return false;
+            }
+
+            const bool starts_with_link = first_instr.doesLink();
+            const bool starts_with_resume_branch = first_instr.isBranch();
+            const bool starts_with_epilogue = is_stack_load_ra(first_word);
+            const bool starts_with_reloc =
+                has_reloc_site_in_range(offset, offset + 4);
+            if (!starts_with_link &&
+                !starts_with_resume_branch &&
+                !starts_with_epilogue &&
+                !starts_with_reloc) {
+                return false;
+            }
+
+            size_t func_size = 0;
+            std::string discover_err;
+            if (!discover_function_bounds(
+                    blob.data(), reloc_offset,
+                    vram, offset,
+                    func_size, discover_err)) {
+                return false;
+            }
+
+            const uint64_t func_end = uint64_t(offset) + func_size;
+            if (func_size < 8 ||
+                func_size > MAX_LARGE_PARENT_CONTINUATION_SIZE ||
+                (func_size & 3u) != 0 ||
+                func_end > range_end) {
+                return false;
+            }
+
+            return read_be_u32(blob.data() + uint32_t(func_end) - 8) ==
+                0x03E00008u;
+        };
+
+        bool added_continuation = true;
+        while (added_continuation) {
+            added_continuation = false;
+            std::vector<std::pair<uint32_t, uint32_t>> ranges =
+                emitted_ranges;
+            std::sort(ranges.begin(), ranges.end());
+
+            for (const auto& range : ranges) {
+                const uint32_t range_start = range.first;
+                const uint32_t range_end = range.second;
+                if (range_end <= range_start ||
+                    range_end - range_start > MAX_CONTINUATION_PARENT_SIZE ||
+                    range_end > reloc_offset) {
+                    continue;
+                }
+
+                for (uint32_t offset = range_start;
+                     offset + 8 <= range_end;
+                     offset += 4) {
+                    const uint32_t instr_vram = vram + offset;
+                    const uint32_t insn_word =
+                        read_be_u32(blob.data() + offset);
+                    rabbitizer::InstructionCpu instr(insn_word, instr_vram);
+                    if (!instr.isValid() || !instr.doesLink()) {
+                        continue;
+                    }
+
+                    const uint32_t continuation_offset = offset + 8;
+                    if (continuation_offset >= range_end ||
+                        emitted_offsets.find(continuation_offset) !=
+                            emitted_offsets.end()) {
+                        continue;
+                    }
+
+                    size_t suffix_links = 1;
+                    for (uint32_t tail_offset = continuation_offset;
+                         tail_offset + 8 <= range_end;
+                         tail_offset += 4) {
+                        const uint32_t tail_word =
+                            read_be_u32(blob.data() + tail_offset);
+                        rabbitizer::InstructionCpu tail_instr(
+                            tail_word, vram + tail_offset);
+                        if (tail_instr.isValid() && tail_instr.doesLink()) {
+                            suffix_links++;
+                        }
+                    }
+                    if (suffix_links < MIN_SUFFIX_LINKS) {
+                        continue;
+                    }
+
+                    bool added = false;
+                    if (!discover_and_add_function(
+                            continuation_offset, range_end, false, &added)) {
+                        return size_t(-1);
+                    }
+                    if (added) {
+                        continuation_added_count++;
+                        added_continuation = true;
+                    }
+                }
+            }
+
+            for (const auto& range : ranges) {
+                const uint32_t range_start = range.first;
+                const uint32_t range_end = range.second;
+                if (range_end <= range_start ||
+                    range_end - range_start <= MAX_CONTINUATION_PARENT_SIZE ||
+                    range_end > reloc_offset) {
+                    continue;
+                }
+
+                for (uint32_t offset = range_start;
+                     offset + 8 <= range_end;
+                     offset += 4) {
+                    const uint32_t instr_vram = vram + offset;
+                    const uint32_t insn_word =
+                        read_be_u32(blob.data() + offset);
+                    rabbitizer::InstructionCpu instr(insn_word, instr_vram);
+                    if (!instr.isValid() || !instr.doesLink()) {
+                        continue;
+                    }
+
+                    const uint32_t continuation_offset = offset + 8;
+                    const bool is_dynamic_link = is_jalr_instruction(insn_word);
+                    if (continuation_offset >= range_end ||
+                        emitted_offsets.find(continuation_offset) !=
+                            emitted_offsets.end()) {
+                        continue;
+                    }
+
+                    bool added = false;
+                    if (is_dynamic_link) {
+                        const uint32_t body_start =
+                            find_dynamic_continuation_body_start(
+                                continuation_offset, range_start, range_end);
+                        size_t func_size = 0;
+                        std::string discover_err;
+                        if (!discover_function_bounds(
+                                blob.data(), reloc_offset,
+                                vram, body_start,
+                                func_size, discover_err)) {
+                            continue;
+                        }
+                        const uint64_t func_end = uint64_t(body_start) +
+                            func_size;
+                        if (func_size < 8 ||
+                            func_size > MAX_LARGE_PARENT_CONTINUATION_SIZE ||
+                            (func_size & 3u) != 0 ||
+                            func_end > range_end ||
+                            read_be_u32(blob.data() +
+                                uint32_t(func_end) - 8) != 0x03E00008u) {
+                            continue;
+                        }
+                        if (!add_known_size_function(
+                                body_start,
+                                func_size,
+                                range_end,
+                                &added,
+                                continuation_offset)) {
+                            return size_t(-1);
+                        }
+                    }
+                    else {
+                        if (!looks_like_large_parent_continuation(
+                                continuation_offset, range_end)) {
+                            continue;
+                        }
+                        auto parent_func_it =
+                            function_index_by_offset.find(range_start);
+                        if (parent_func_it == function_index_by_offset.end()) {
+                            continue;
+                        }
+                        if (!add_dispatch_alias(
+                                parent_func_it->second,
+                                continuation_offset,
+                                &added)) {
+                            return size_t(-1);
+                        }
+                    }
+                    if (added) {
+                        continuation_added_count++;
+                        added_continuation = true;
+                    }
+                }
+            }
+        }
+    }
+
+    if (continuation_added_count != 0) {
+        std::fprintf(stderr,
+            "decompressed: section %s added %zu fragment-local "
+            "continuation entry(s)\n",
+            section_name.c_str(), continuation_added_count);
+    }
+
+    return section_index;
+    }
 
     // (2) Implementation function at vram+0x20. The engine's
     // analysis.cpp::discover_function_bounds runs a real BFS-based
@@ -733,10 +2018,14 @@ bool decompress_wrapper_at(const std::vector<uint8_t>& rom,
         return compression::pers_szp_decompress(
             rom.data() + rom_wrapper,
             rom.size() - rom_wrapper, blob_out);
-    } else if (wrapper_format == "yay0") {
+    } else if (wrapper_format == "yay0" ||
+               wrapper_format == "bare_yay0") {
         return compression::yay0_decompress(
             rom.data() + rom_wrapper,
             rom.size() - rom_wrapper, blob_out);
+    } else if (wrapper_format == "raw_fragment") {
+        return try_extract_raw_fragment(
+            rom, rom_wrapper, blob_out, nullptr);
     }
     return false;
 }
@@ -746,7 +2035,8 @@ bool decompress_wrapper_at(const std::vector<uint8_t>& rom,
 bool synthesize_decompressed_patterns(
     Context& context,
     const std::filesystem::path& rom_path,
-    const std::vector<DecompressedSectionPattern>& patterns)
+    const std::vector<DecompressedSectionPattern>& patterns,
+    const std::vector<DecompressedSectionPatch>& patches)
 {
     if (patterns.empty()) return true;
 
@@ -759,24 +2049,9 @@ bool synthesize_decompressed_patterns(
     }
 
     const uint16_t first_added_index = uint16_t(context.sections.size());
+    size_t synthetic_variant_idx = 0;
 
     for (const DecompressedSectionPattern& p : patterns) {
-        // Compute the J-trampoline encoding we expect at +0x00 of any
-        // matching fragment: J <vram + 0x20> + nop. MIPS J insn:
-        //   opcode 0x02 << 26 | (target >> 2) & 0x03FFFFFF
-        const uint32_t j_target = p.vram + 0x20u;
-        const uint32_t j_insn = 0x08000000u |
-                                ((j_target >> 2) & 0x03FFFFFFu);
-        // Big-endian byte pattern for the first 8 bytes (J + nop).
-        uint8_t expected_first8[8];
-        expected_first8[0] = uint8_t(j_insn >> 24);
-        expected_first8[1] = uint8_t(j_insn >> 16);
-        expected_first8[2] = uint8_t(j_insn >> 8);
-        expected_first8[3] = uint8_t(j_insn);
-        expected_first8[4] = 0;
-        expected_first8[5] = 0;
-        expected_first8[6] = 0;
-        expected_first8[7] = 0;
         const uint8_t fragment_magic[8] = {
             'F', 'R', 'A', 'G', 'M', 'E', 'N', 'T'
         };
@@ -787,9 +2062,56 @@ bool synthesize_decompressed_patterns(
             base_name = fmt::format("frag_{:08X}", p.vram);
         }
 
-        // Scan the ROM for Yay0 magic. For each, decompress 0x40 bytes,
-        // check the J-insn + FRAGMENT-magic match, and accept.
-        std::vector<std::pair<uint32_t, std::vector<uint8_t>>> hits;
+        // Scan the ROM for matching wrappers/fragments and retain the
+        // bytes-encoded vram for each hit. When p.vram is 0, derive the
+        // link vram from each FRAGMENT header so one pattern can cover all
+        // runtime buckets in an archive.
+        struct PatternHit {
+            uint32_t wrap_off;
+            uint32_t vram;
+            std::vector<uint8_t> body;
+        };
+        std::vector<PatternHit> hits;
+        if (p.wrapper_format == "raw_fragment") {
+            size_t scan_pos = 0;
+            while (scan_pos + 16 < rom.size()) {
+                auto it = std::search(
+                    rom.begin() + static_cast<std::vector<uint8_t>::difference_type>(scan_pos), rom.end(),
+                    fragment_magic, fragment_magic + sizeof(fragment_magic));
+                if (it == rom.end()) {
+                    break;
+                }
+                const size_t magic_off = size_t(it - rom.begin());
+                scan_pos = magic_off + sizeof(fragment_magic);
+                if (magic_off < 8) {
+                    continue;
+                }
+
+                const uint32_t raw_off = uint32_t(magic_off - 8);
+                std::vector<uint8_t> body;
+                RawFragmentInfo raw_info;
+                if (!try_extract_raw_fragment(
+                        rom, raw_off, body, &raw_info)) {
+                    continue;
+                }
+                if (p.vram != 0 && raw_info.link_vram != p.vram) {
+                    continue;
+                }
+                uint32_t raw_id = 0;
+                if (!fragment_id_from_vram(raw_info.link_vram, raw_id)) {
+                    continue;
+                }
+                const std::string patch_name = fmt::format(
+                    "{}__rom_{:X}", base_name, raw_off);
+                if (!apply_decompressed_section_patches(
+                        body, raw_off, raw_info.link_vram, patches,
+                        patch_name)) {
+                    return false;
+                }
+                hits.push_back({raw_off, raw_info.link_vram,
+                                std::move(body)});
+            }
+        } else {
         size_t scan_pos = 0;
         while (scan_pos + 16 < rom.size()) {
             // Find next "Yay0" magic.
@@ -810,13 +2132,19 @@ bool synthesize_decompressed_patterns(
                     rom.data() + y0, rom.size() - y0, prefix)) {
                 continue;
             }
-            if (prefix.size() < 0x10) continue;
-            if (std::memcmp(prefix.data(), expected_first8, 8) != 0) continue;
-            if (std::memcmp(prefix.data() + 8, fragment_magic, 8) != 0) continue;
+            uint32_t hit_vram = 0;
+            if (!decode_fragment_link_vram(
+                    prefix.data(), prefix.size(), hit_vram)) {
+                continue;
+            }
+            if (p.vram != 0 && hit_vram != p.vram) {
+                continue;
+            }
 
             // Match — figure out the wrapper offset (PERS-SZP wraps Yay0
             // at -0x18 if the format is pers_szp_yay0; otherwise the
-            // wrapper offset IS the Yay0 offset).
+            // wrapper offset IS the Yay0 offset). bare_yay0 is for
+            // fragment streams that are not owned by a PERS-SZP wrapper.
             uint32_t wrap_off = uint32_t(y0);
             if (p.wrapper_format == "pers_szp_yay0") {
                 if (y0 < 0x18) continue;
@@ -825,6 +2153,12 @@ bool synthesize_decompressed_patterns(
                     continue;
                 }
                 wrap_off = uint32_t(y0 - 0x18);
+            } else if (p.wrapper_format == "bare_yay0") {
+                if (y0 >= 0x18 &&
+                    std::memcmp(rom.data() + (y0 - 0x18),
+                                "PERS-SZP", 8) == 0) {
+                    continue;
+                }
             } else if (p.wrapper_format != "yay0") {
                 std::fprintf(stderr,
                     "decompressed: pattern %s unknown wrapper_format '%s'\n",
@@ -837,7 +2171,14 @@ bool synthesize_decompressed_patterns(
             if (!decompress_wrapper_at(rom, wrap_off, p.wrapper_format, body)) {
                 continue;
             }
-            hits.emplace_back(wrap_off, std::move(body));
+            const std::string patch_name = fmt::format(
+                "{}__rom_{:X}", base_name, wrap_off);
+            if (!apply_decompressed_section_patches(
+                    body, wrap_off, hit_vram, patches, patch_name)) {
+                return false;
+            }
+            hits.push_back({wrap_off, hit_vram, std::move(body)});
+        }
         }
 
         std::fprintf(stderr,
@@ -847,6 +2188,40 @@ bool synthesize_decompressed_patterns(
             hits.size());
 
         if (hits.empty()) continue;
+
+        std::unordered_map<uint32_t, std::set<uint32_t>> jump_slot_entry_seeds;
+        for (const PatternHit& hit : hits) {
+            if (hit.body.size() < 0x28) {
+                continue;
+            }
+            const uint32_t hit_reloc_offset =
+                read_be_u32(hit.body.data() + 0x14);
+            const uint32_t scan_limit =
+                std::min<uint32_t>(hit_reloc_offset, uint32_t(hit.body.size()));
+            for (uint32_t slot_off = 0x20;
+                 slot_off + 8 <= scan_limit;
+                 slot_off += 8) {
+                const uint32_t instr =
+                    read_be_u32(hit.body.data() + slot_off);
+                const uint32_t delay =
+                    read_be_u32(hit.body.data() + slot_off + 4);
+                if (delay != 0) {
+                    break;
+                }
+
+                uint32_t target = 0;
+                if (!decode_mips_jump_target(
+                        instr, hit.vram + slot_off + 4, target)) {
+                    break;
+                }
+
+                const uint32_t target_base = target & 0xFFF00000u;
+                const uint32_t target_offset = target - target_base;
+                if ((target_offset & 3u) == 0) {
+                    jump_slot_entry_seeds[target_base].insert(target_offset);
+                }
+            }
+        }
 
         // Deduplicate by content hash. Hash window is the first 0x100
         // bytes — measured at 95% uniqueness for Stadium's 0x8FF00000
@@ -879,41 +2254,51 @@ bool synthesize_decompressed_patterns(
         // future game, both sides need to bump the pool size.
         const uint32_t kSyntheticPoolBase = 0xC0000000u;
         const uint32_t kSyntheticPoolStride = 0x00100000u;
-        size_t probe_variant_idx = 0;
-        for (auto& [wrap_off, body] : hits) {
-            const size_t window = std::min(HASH_WINDOW, body.size());
+        for (PatternHit& hit : hits) {
+            const size_t window = std::min(HASH_WINDOW, hit.body.size());
             const uint64_t content_hash =
-                fnv1a_64(body.data(), window);
-            auto it = seen_hashes.find(content_hash);
+                fnv1a_64(hit.body.data(), window);
+            const uint32_t variant_id_vram = hit.vram;
+            uint32_t orig_id = 0;
+            if (!fragment_id_from_vram(variant_id_vram, orig_id)) {
+                std::fprintf(stderr,
+                    "decompressed: pattern %s skipping ROM 0x%X with "
+                    "non-runtime fragment vram 0x%08X\n",
+                    base_name.c_str(), hit.wrap_off, variant_id_vram);
+                continue;
+            }
+            const uint64_t dedupe_key =
+                content_hash ^ (uint64_t(orig_id) << 32);
+            auto it = seen_hashes.find(dedupe_key);
             if (it != seen_hashes.end()) {
                 deduped++;
                 continue;
             }
-            seen_hashes.emplace(content_hash, wrap_off);
+            seen_hashes.emplace(dedupe_key, hit.wrap_off);
 
-            // Original game-side fragment id derived from the pattern's
-            // canonical bucket. All variants of this pattern share the
-            // same original id (e.g. 0xEF for stadium_models). Stored
-            // on each section so the runtime can filter synthetic
-            // candidates to the matching id and avoid cross-pattern
-            // hash-collision misregistration.
-            const uint32_t orig_id =
-                ((p.vram & 0x0FF00000u) >> 0x14) - 0x10u;
-
+            // Original game-side fragment id derived from this hit's
+            // bytes-encoded bucket. Wrapped patterns usually share one
+            // id; raw-fragment scans can discover many buckets from one
+            // config entry.
             // Per-variant synthetic link identity. The bytes-encoded
             // vram (used for parsing/CFG) stays at p.vram — only this
             // link identity changes per variant.
             const uint32_t variant_link_addr =
                 kSyntheticPoolBase +
-                uint32_t(probe_variant_idx) * kSyntheticPoolStride;
-            probe_variant_idx++;
+                uint32_t(synthetic_variant_idx) * kSyntheticPoolStride;
+            synthetic_variant_idx++;
 
             const std::string section_name = fmt::format(
-                "{}__rom_{:X}", base_name, wrap_off);
+                "{}__rom_{:X}", base_name, hit.wrap_off);
+            auto extra_seed_it = jump_slot_entry_seeds.find(variant_id_vram);
+            const std::set<uint32_t>* extra_entry_offsets =
+                (extra_seed_it != jump_slot_entry_seeds.end())
+                    ? &extra_seed_it->second
+                    : nullptr;
             size_t si = add_decompressed_section(
-                context, body, wrap_off, p.vram,
+                context, hit.body, hit.wrap_off, variant_id_vram,
                 section_name, p.relocatable, content_hash,
-                variant_link_addr, orig_id);
+                variant_link_addr, orig_id, extra_entry_offsets);
             if (si == size_t(-1)) {
                 // Hard failure: the section's bytes can't be bounded
                 // by our CFG walk (or some other unrecoverable parse
@@ -921,7 +2306,7 @@ bool synthesize_decompressed_patterns(
                 std::fprintf(stderr,
                     "decompressed: pattern %s aborted — section for "
                     "ROM 0x%X failed to synthesize. See message above.\n",
-                    base_name.c_str(), wrap_off);
+                    base_name.c_str(), hit.wrap_off);
                 return false;
             }
             added++;

@@ -70,6 +70,19 @@ namespace N64Recomp {
         bool relocatable = true;
     };
 
+    // [[input.decompressed_section_patch]] -- build-time patches applied to
+    // decompressed fragment bytes before CFG discovery, reloc parsing, and
+    // content hashing. These model game loader fixups that happen after
+    // decompression but before the fragment is executed/registered.
+    struct DecompressedSectionPatch {
+        bool has_rom_wrapper = false;
+        uint32_t rom_wrapper = 0;
+        bool has_original_pattern_id = false;
+        uint32_t original_pattern_id = 0;
+        uint32_t offset = 0;
+        uint32_t value = 0;
+    };
+
     // [output] collision_policy — what to do when two emitted symbols
     // would share a name. "error" (default) aborts the build with a
     // message naming both colliders. "suffix" auto-disambiguates by
@@ -107,6 +120,7 @@ namespace N64Recomp {
         std::vector<ManualFunction> manual_functions;
         std::vector<DecompressedSection> decompressed_sections;
         std::vector<DecompressedSectionPattern> decompressed_section_patterns;
+        std::vector<DecompressedSectionPatch> decompressed_section_patches;
         CollisionPolicy collision_policy = CollisionPolicy::Error;
         std::string bss_section_suffix;
         std::string recomp_include;

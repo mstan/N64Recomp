@@ -1,15 +1,459 @@
+#include <algorithm>
 #include <iostream>
 
 #include <toml++/toml.hpp>
+#include "rabbitizer.hpp"
 #include "fmt/format.h"
 #include "config.h"
 #include "recompiler/context.h"
+#include "analysis.h"
 
 std::filesystem::path concat_if_not_empty(const std::filesystem::path& parent, const std::filesystem::path& child) {
     if (!child.empty()) {
         return parent / child;
     }
     return child;
+}
+
+namespace {
+    bool instruction_has_delay_slot(uint32_t instr_word) {
+        const uint32_t op = (instr_word >> 26) & 0x3Fu;
+        if (op == 2 || op == 3) {
+            return true; // j, jal
+        }
+        if ((op >= 4 && op <= 7) || (op >= 0x14 && op <= 0x17)) {
+            return true; // beq/bne/blez/bgtz and likely variants
+        }
+        if (op == 1) {
+            const uint32_t rt = (instr_word >> 16) & 0x1Fu;
+            return rt == 0 || rt == 1 || rt == 2 || rt == 3 ||
+                   rt == 16 || rt == 17 || rt == 18 || rt == 19;
+        }
+        if (op == 0) {
+            const uint32_t funct = instr_word & 0x3Fu;
+            return funct == 8 || funct == 9; // jr, jalr
+        }
+        if (op == 0x11) {
+            const uint32_t rs = (instr_word >> 21) & 0x1Fu;
+            return rs == 8; // bc1*
+        }
+        return false;
+    }
+
+    bool is_jr_ra(uint32_t instr_word) {
+        return instr_word == 0x03E00008u;
+    }
+
+    bool is_lw_ra_from_sp(uint32_t instr_word) {
+        const uint32_t op = (instr_word >> 26) & 0x3Fu;
+        const uint32_t base = (instr_word >> 21) & 0x1Fu;
+        const uint32_t rt = (instr_word >> 16) & 0x1Fu;
+        return op == 0x23 && base == 29 && rt == 31;
+    }
+
+    bool is_addiu_sp_sp_positive(uint32_t instr_word) {
+        const uint32_t op = (instr_word >> 26) & 0x3Fu;
+        const uint32_t rs = (instr_word >> 21) & 0x1Fu;
+        const uint32_t rt = (instr_word >> 16) & 0x1Fu;
+        const uint16_t imm = instr_word & 0xFFFFu;
+        return op == 0x09 && rs == 29 && rt == 29 && (imm & 0x8000u) == 0 && imm != 0;
+    }
+
+    bool read_symbol_section_word(
+        const std::vector<uint8_t>& rom,
+        const N64Recomp::Section& section,
+        uint32_t instr_vram,
+        uint32_t* raw_word_out,
+        uint32_t* instr_word_out = nullptr) {
+        if (instr_vram < section.ram_addr ||
+            instr_vram + sizeof(uint32_t) > section.ram_addr + section.size) {
+            return false;
+        }
+
+        const uint32_t rom_addr = section.rom_addr + (instr_vram - section.ram_addr);
+        if (rom_addr + sizeof(uint32_t) > rom.size()) {
+            return false;
+        }
+
+        const uint32_t raw_word = *reinterpret_cast<const uint32_t*>(rom.data() + rom_addr);
+        if (raw_word_out != nullptr) {
+            *raw_word_out = raw_word;
+        }
+        if (instr_word_out != nullptr) {
+            *instr_word_out = byteswap(raw_word);
+        }
+        return true;
+    }
+
+    bool is_symbol_delay_slot(
+        const std::vector<uint8_t>& rom,
+        const N64Recomp::Section& section,
+        uint32_t instr_vram) {
+        if (instr_vram < section.ram_addr + sizeof(uint32_t)) {
+            return false;
+        }
+
+        uint32_t prev_instr = 0;
+        if (!read_symbol_section_word(rom, section, instr_vram - sizeof(uint32_t), nullptr, &prev_instr)) {
+            return false;
+        }
+
+        return instruction_has_delay_slot(prev_instr);
+    }
+
+    void repair_truncated_symbol_function_ranges(N64Recomp::Context& context, const std::vector<uint8_t>& rom) {
+        if (rom.empty()) {
+            return;
+        }
+
+        for (size_t section_index = 0; section_index < context.sections.size(); section_index++) {
+            const auto& section = context.sections[section_index];
+            if (!section.executable) {
+                continue;
+            }
+
+            for (size_t func_index : context.section_functions[section_index]) {
+                auto& func = context.functions[func_index];
+                if (func.words.empty()) {
+                    continue;
+                }
+
+                const uint32_t func_start = func.vram;
+                const uint32_t func_end = func.vram + uint32_t(func.words.size() * sizeof(uint32_t));
+                uint32_t next_boundary = section.ram_addr + section.size;
+
+                for (size_t other_index : context.section_functions[section_index]) {
+                    if (other_index == func_index) {
+                        continue;
+                    }
+                    const auto& other = context.functions[other_index];
+                    if (!other.words.empty() && other.vram > func_start && other.vram < next_boundary) {
+                        next_boundary = other.vram;
+                    }
+                }
+
+                auto append_word = [&](uint32_t instr_vram) {
+                    uint32_t raw_word = 0;
+                    if (!read_symbol_section_word(rom, section, instr_vram, &raw_word)) {
+                        return false;
+                    }
+                    func.words.push_back(raw_word);
+                    return true;
+                };
+
+                uint32_t end_instr = 0;
+                const uint32_t last_instr = byteswap(func.words.back());
+                uint32_t restore_sp_instr = 0;
+                uint32_t jr_instr = 0;
+                if (func_end + sizeof(uint32_t) * 3 <= next_boundary &&
+                    is_lw_ra_from_sp(last_instr) &&
+                    read_symbol_section_word(rom, section, func_end, nullptr, &restore_sp_instr) &&
+                    read_symbol_section_word(rom, section, func_end + sizeof(uint32_t), nullptr, &jr_instr) &&
+                    is_addiu_sp_sp_positive(restore_sp_instr) &&
+                    is_jr_ra(jr_instr) &&
+                    append_word(func_end) &&
+                    append_word(func_end + sizeof(uint32_t)) &&
+                    append_word(func_end + sizeof(uint32_t) * 2)) {
+                    fmt::print(stderr,
+                        "[Info] Extended symbol function {} from 0x{:X} to 0x{:X}: "
+                        "range ended after restoring $ra at 0x{:08X}; included stack restore, return, and delay slot.\n",
+                        func.name,
+                        func_end - func_start,
+                        uint32_t(func.words.size() * sizeof(uint32_t)),
+                        func_end - sizeof(uint32_t));
+                    continue;
+                }
+
+                if (func_end + sizeof(uint32_t) * 2 <= next_boundary &&
+                    read_symbol_section_word(rom, section, func_end, nullptr, &end_instr) &&
+                    is_jr_ra(end_instr) &&
+                    append_word(func_end) &&
+                    append_word(func_end + sizeof(uint32_t))) {
+                    fmt::print(stderr,
+                        "[Info] Extended symbol function {} from 0x{:X} to 0x{:X}: "
+                        "range ended immediately before jr $ra at 0x{:08X}; included return and delay slot.\n",
+                        func.name,
+                        func_end - func_start,
+                        uint32_t(func.words.size() * sizeof(uint32_t)),
+                        func_end);
+                    continue;
+                }
+
+                if (func_end + sizeof(uint32_t) <= next_boundary &&
+                    instruction_has_delay_slot(last_instr) &&
+                    append_word(func_end)) {
+                    fmt::print(stderr,
+                        "[Info] Extended symbol function {} from 0x{:X} to 0x{:X}: "
+                        "range ended with branch/jump at 0x{:08X}; included delay slot.\n",
+                        func.name,
+                        func_end - func_start,
+                        uint32_t(func.words.size() * sizeof(uint32_t)),
+                        func_end - sizeof(uint32_t));
+                }
+            }
+        }
+    }
+
+    void remap_function_vram(
+        N64Recomp::Context& context,
+        N64Recomp::Section& section,
+        size_t function_index,
+        uint32_t old_vram,
+        uint32_t new_vram) {
+        auto old_it = context.functions_by_vram.find(old_vram);
+        if (old_it != context.functions_by_vram.end()) {
+            auto& indices = old_it->second;
+            indices.erase(std::remove(indices.begin(), indices.end(), function_index), indices.end());
+            if (indices.empty()) {
+                context.functions_by_vram.erase(old_it);
+            }
+        }
+
+        context.functions_by_vram[new_vram].push_back(function_index);
+
+        auto addr_it = std::find(section.function_addrs.begin(), section.function_addrs.end(), old_vram);
+        if (addr_it != section.function_addrs.end()) {
+            *addr_it = new_vram;
+        }
+        else {
+            section.function_addrs.push_back(new_vram);
+        }
+    }
+
+    void repair_late_symbol_function_starts(N64Recomp::Context& context, const std::vector<uint8_t>& rom) {
+        if (rom.empty()) {
+            return;
+        }
+
+        constexpr uint32_t kMaxPrefixGapToScan = 0x40;
+
+        for (size_t section_index = 0; section_index < context.sections.size(); section_index++) {
+            auto& section = context.sections[section_index];
+            if (!section.executable || section.rom_addr + section.size > rom.size()) {
+                continue;
+            }
+
+            std::vector<size_t> sorted_funcs = context.section_functions[section_index];
+            std::sort(sorted_funcs.begin(), sorted_funcs.end(),
+                [&](size_t lhs, size_t rhs) {
+                    return context.functions[lhs].vram < context.functions[rhs].vram;
+                });
+
+            for (size_t i = 0; i + 1 < sorted_funcs.size(); i++) {
+                const auto& prev_func = context.functions[sorted_funcs[i]];
+                const size_t cur_index = sorted_funcs[i + 1];
+                auto& cur_func = context.functions[cur_index];
+                if (prev_func.words.empty() || cur_func.words.empty() || cur_func.vram <= prev_func.vram) {
+                    continue;
+                }
+
+                const uint32_t prev_end = prev_func.vram + uint32_t(prev_func.words.size() * sizeof(uint32_t));
+                const uint32_t old_start = cur_func.vram;
+                const uint32_t old_end = cur_func.vram + uint32_t(cur_func.words.size() * sizeof(uint32_t));
+                if (prev_end >= old_start || old_start - prev_end > kMaxPrefixGapToScan) {
+                    continue;
+                }
+
+                for (uint32_t prefix_start = prev_end; prefix_start + sizeof(uint32_t) <= old_start; prefix_start += sizeof(uint32_t)) {
+                    uint32_t instr_word = 0;
+                    if (!read_symbol_section_word(rom, section, prefix_start, nullptr, &instr_word)) {
+                        break;
+                    }
+                    if (instr_word == 0) {
+                        continue;
+                    }
+                    if (context.functions_by_vram.find(prefix_start) != context.functions_by_vram.end()) {
+                        continue;
+                    }
+                    if (is_symbol_delay_slot(rom, section, prefix_start)) {
+                        continue;
+                    }
+
+                    size_t discovered_size = 0;
+                    std::string discover_error;
+                    const uint32_t entry_offset = prefix_start - section.ram_addr;
+                    if (!N64Recomp::discover_function_bounds(
+                            rom.data() + section.rom_addr,
+                            section.size,
+                            section.ram_addr,
+                            entry_offset,
+                            discovered_size,
+                            discover_error)) {
+                        continue;
+                    }
+
+                    if ((discovered_size & 3u) != 0) {
+                        continue;
+                    }
+                    if (prefix_start + discovered_size <= old_start) {
+                        break;
+                    }
+                    if (discovered_size <= old_start - prefix_start ||
+                        prefix_start + discovered_size != old_end) {
+                        continue;
+                    }
+
+                    const uint32_t new_rom = section.rom_addr + (prefix_start - section.ram_addr);
+                    std::vector<uint32_t> repaired_words;
+                    repaired_words.reserve(discovered_size / sizeof(uint32_t));
+                    for (uint32_t rom_addr = new_rom; rom_addr < new_rom + discovered_size; rom_addr += sizeof(uint32_t)) {
+                        repaired_words.push_back(*reinterpret_cast<const uint32_t*>(rom.data() + rom_addr));
+                    }
+
+                    cur_func.vram = prefix_start;
+                    cur_func.rom = new_rom;
+                    if (cur_func.entry_vram == old_start) {
+                        cur_func.entry_vram = prefix_start;
+                    }
+                    cur_func.words = std::move(repaired_words);
+
+                    remap_function_vram(context, section, cur_index, old_start, prefix_start);
+
+                    fmt::print(stderr,
+                        "[Info] Moved symbol function {} start from 0x{:08X} to 0x{:08X}: "
+                        "decoded 0x{:X}-byte prefix in gap after {} and preserved end 0x{:08X}.\n",
+                        cur_func.name,
+                        old_start,
+                        prefix_start,
+                        old_start - prefix_start,
+                        prev_func.name,
+                        old_end);
+                    break;
+                }
+            }
+        }
+    }
+
+    void synthesize_small_symbol_gap_functions(N64Recomp::Context& context, const std::vector<uint8_t>& rom) {
+        if (rom.empty()) {
+            return;
+        }
+
+        constexpr uint32_t kMaxGapToScan = 0x400;
+        auto rom_contains_be32 = [&](uint32_t value) {
+            const uint8_t needle[4] = {
+                uint8_t(value >> 24),
+                uint8_t(value >> 16),
+                uint8_t(value >> 8),
+                uint8_t(value),
+            };
+            return std::search(
+                rom.begin(), rom.end(),
+                needle, needle + sizeof(needle)) != rom.end();
+        };
+
+        for (size_t section_index = 0; section_index < context.sections.size(); section_index++) {
+            auto& section = context.sections[section_index];
+            if (!section.executable || section.rom_addr + section.size > rom.size()) {
+                continue;
+            }
+
+            std::vector<size_t> sorted_funcs = context.section_functions[section_index];
+            std::sort(sorted_funcs.begin(), sorted_funcs.end(),
+                [&](size_t lhs, size_t rhs) {
+                    return context.functions[lhs].vram < context.functions[rhs].vram;
+                });
+
+            for (size_t i = 0; i + 1 < sorted_funcs.size(); i++) {
+                const auto& prev_ref = context.functions[sorted_funcs[i]];
+                const auto& next_ref = context.functions[sorted_funcs[i + 1]];
+                if (prev_ref.words.empty() || next_ref.words.empty() || next_ref.vram <= prev_ref.vram) {
+                    continue;
+                }
+
+                const std::string prev_name = prev_ref.name;
+                const std::string next_name = next_ref.name;
+                uint32_t cursor = prev_ref.vram + uint32_t(prev_ref.words.size() * sizeof(uint32_t));
+                const uint32_t gap_end = next_ref.vram;
+                if (cursor >= gap_end || gap_end - cursor > kMaxGapToScan) {
+                    continue;
+                }
+
+                while (cursor + sizeof(uint32_t) * 2 <= gap_end) {
+                    uint32_t instr_word = 0;
+                    if (!read_symbol_section_word(rom, section, cursor, nullptr, &instr_word)) {
+                        break;
+                    }
+                    if (instr_word == 0) {
+                        cursor += sizeof(uint32_t);
+                        continue;
+                    }
+                    if (context.functions_by_vram.find(cursor) != context.functions_by_vram.end()) {
+                        cursor += sizeof(uint32_t);
+                        continue;
+                    }
+
+                    size_t discovered_size = 0;
+                    std::string discover_error;
+                    const uint32_t entry_offset = cursor - section.ram_addr;
+                    if (!N64Recomp::discover_function_bounds(
+                            rom.data() + section.rom_addr,
+                            section.size,
+                            section.ram_addr,
+                            entry_offset,
+                            discovered_size,
+                            discover_error)) {
+                        cursor += sizeof(uint32_t);
+                        continue;
+                    }
+                    const uint32_t next_end =
+                        next_ref.vram +
+                        uint32_t(next_ref.words.size() * sizeof(uint32_t));
+                    const bool overlaps_next_entry =
+                        cursor + discovered_size > gap_end &&
+                        cursor + discovered_size == next_end &&
+                        rom_contains_be32(cursor);
+                    if (discovered_size < sizeof(uint32_t) * 2 ||
+                        (cursor + discovered_size > gap_end && !overlaps_next_entry) ||
+                        (discovered_size & 3u) != 0) {
+                        cursor += sizeof(uint32_t);
+                        continue;
+                    }
+
+                    bool has_return = false;
+                    for (uint32_t off = 0; off + sizeof(uint32_t) <= discovered_size; off += sizeof(uint32_t)) {
+                        uint32_t cur_word = 0;
+                        if (read_symbol_section_word(rom, section, cursor + off, nullptr, &cur_word) &&
+                            is_jr_ra(cur_word)) {
+                            has_return = true;
+                            break;
+                        }
+                    }
+                    if (!has_return) {
+                        cursor += sizeof(uint32_t);
+                        continue;
+                    }
+
+                    N64Recomp::Function gap_func{};
+                    gap_func.name = fmt::format("func_{:08X}", cursor);
+                    gap_func.vram = cursor;
+                    gap_func.rom = section.rom_addr + (cursor - section.ram_addr);
+                    gap_func.section_index = uint16_t(section_index);
+                    gap_func.words.reserve(discovered_size / sizeof(uint32_t));
+                    for (uint32_t rom_addr = gap_func.rom;
+                         rom_addr < gap_func.rom + discovered_size;
+                         rom_addr += sizeof(uint32_t)) {
+                        gap_func.words.push_back(*reinterpret_cast<const uint32_t*>(rom.data() + rom_addr));
+                    }
+
+                    const size_t function_index = context.functions.size();
+                    section.function_addrs.push_back(gap_func.vram);
+                    context.functions_by_name[gap_func.name] = function_index;
+                    context.functions_by_vram[gap_func.vram].push_back(function_index);
+                    context.section_functions[section_index].push_back(function_index);
+                    context.functions.emplace_back(std::move(gap_func));
+
+                    fmt::print(stderr,
+                        "[Info] Synthesized symbol-gap function func_{:08X} "
+                        "size 0x{:X} in section {} between {} and {}.\n",
+                        cursor, uint32_t(discovered_size),
+                        section.name, prev_name, next_name);
+
+                    cursor += uint32_t(discovered_size);
+                }
+            }
+        }
+    }
 }
 
 std::vector<N64Recomp::ManualFunction> get_manual_funcs(const toml::array* manual_funcs_array) {
@@ -96,6 +540,50 @@ std::vector<N64Recomp::DecompressedSection> get_decompressed_sections(const toml
         } else {
             throw toml::parse_error(
                 "Invalid decompressed_section entry", el.source());
+        }
+    });
+    return ret;
+}
+
+std::vector<N64Recomp::DecompressedSectionPatch> get_decompressed_section_patches(const toml::array* arr) {
+    std::vector<N64Recomp::DecompressedSectionPatch> ret;
+    ret.reserve(arr->size());
+    arr->for_each([&ret](auto&& el) {
+        if constexpr (toml::is_table<decltype(el)>) {
+            std::optional<uint32_t> rom_wrapper =
+                el["rom_wrapper"].template value<uint32_t>();
+            std::optional<uint32_t> original_pattern_id =
+                el["original_pattern_id"].template value<uint32_t>();
+            std::optional<uint32_t> offset =
+                el["offset"].template value<uint32_t>();
+            std::optional<uint32_t> value =
+                el["value"].template value<uint32_t>();
+
+            if (!offset.has_value() || !value.has_value() ||
+                (!rom_wrapper.has_value() && !original_pattern_id.has_value())) {
+                throw toml::parse_error(
+                    "decompressed_section_patch requires offset, value, "
+                    "and at least one selector: rom_wrapper or "
+                    "original_pattern_id", el.source());
+            }
+
+            if ((offset.value() & 0b11) != 0) {
+                throw toml::parse_error(
+                    "decompressed_section_patch offset is not word-aligned",
+                    el.source());
+            }
+
+            N64Recomp::DecompressedSectionPatch patch;
+            patch.has_rom_wrapper = rom_wrapper.has_value();
+            patch.rom_wrapper = rom_wrapper.value_or(0);
+            patch.has_original_pattern_id = original_pattern_id.has_value();
+            patch.original_pattern_id = original_pattern_id.value_or(0);
+            patch.offset = offset.value();
+            patch.value = value.value();
+            ret.emplace_back(std::move(patch));
+        } else {
+            throw toml::parse_error(
+                "Invalid decompressed_section_patch entry", el.source());
         }
     });
     return ret;
@@ -434,6 +922,16 @@ N64Recomp::Config::Config(const char* path) {
                 decompressed_pattern_data.as_array());
         }
 
+        // Decompressed section patches (optional). These are applied to
+        // decompressed fragment bytes before analysis/hashing to mirror
+        // loader fixups that happen before runtime registration.
+        toml::node_view decompressed_patch_data =
+            input_data["decompressed_section_patch"];
+        if (decompressed_patch_data.is_array()) {
+            decompressed_section_patches = get_decompressed_section_patches(
+                decompressed_patch_data.as_array());
+        }
+
         // Output policies (optional [output] table).
         toml::node_view output_data = config_data["output"];
         if (output_data.is_table()) {
@@ -605,6 +1103,7 @@ bool N64Recomp::Context::from_symbol_file(const std::filesystem::path& symbol_fi
 
         const toml::array* config_sections = config_sections_value.as_array();
         ret.section_functions.resize(config_sections->size());
+        ret.section_dispatch_aliases.resize(config_sections->size());
 
         config_sections->for_each([&ret, &rom, with_relocs](auto&& el) {
             if constexpr (toml::is_table<decltype(el)>) {
@@ -744,6 +1243,10 @@ bool N64Recomp::Context::from_symbol_file(const std::filesystem::path& symbol_fi
         return false;
     }
 
+    repair_truncated_symbol_function_ranges(ret, rom);
+    repair_late_symbol_function_starts(ret, rom);
+    synthesize_small_symbol_gap_functions(ret, rom);
+
     ret.rom = std::move(rom);
     out = std::move(ret);
     return true;
@@ -879,4 +1382,3 @@ bool N64Recomp::Context::read_data_reference_syms(const std::filesystem::path& d
 
     return true;
 }
-
