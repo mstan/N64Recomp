@@ -344,6 +344,15 @@ bool process_instruction(GeneratorType& generator, const N64Recomp::Context& con
     uint32_t instr_vram = instr.getVram();
     InstrId instr_id = instr.getUniqueId();
 
+#ifdef JIT_REPRO_TRACE
+    {
+        std::string _dis = instr.disassemble(0);
+        std::fprintf(stderr, "[JITTRACE] idx=%zu vram=0x%08X id=%d : %s\n",
+            instr_index, (unsigned)instr_vram, (int)instr_id, _dis.c_str());
+        std::fflush(stderr);
+    }
+#endif
+
     auto print_indent = [&]() {
         fmt::print(output_file, "    ");
     };

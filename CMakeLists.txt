@@ -92,6 +92,12 @@ target_include_directories(N64Recomp PUBLIC
 
 target_link_libraries(N64Recomp SymbolLists fmt rabbitizer tomlplusplus::tomlplusplus)
 
+# Debug-only: per-instruction trace in process_instruction for the JIT hang repro.
+option(JIT_REPRO_TRACE "Emit per-instruction trace from the recompiler (debug)" OFF)
+if(JIT_REPRO_TRACE)
+    target_compile_definitions(N64Recomp PRIVATE JIT_REPRO_TRACE)
+endif()
+
 # N64 recompiler elf parsing
 project(N64RecompElf)
 add_library(N64RecompElf)
@@ -197,6 +203,17 @@ target_include_directories(LiveRecompTest PRIVATE
 )
 
 target_link_libraries(LiveRecompTest LiveRecomp)
+
+# Standalone JIT hang reproduction (single hardcoded function, no game launch)
+project(JitHangRepro)
+add_executable(JitHangRepro)
+target_sources(JitHangRepro PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/LiveRecomp/jit_hang_repro.cpp
+)
+target_include_directories(JitHangRepro PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/lib/sljit/sljit_src
+)
+target_link_libraries(JitHangRepro LiveRecomp)
 
 # Ares oracle bridge — generic divergence-checking oracle for any
 # N64Recomp consumer. Stub by default; opt in to real Ares with
