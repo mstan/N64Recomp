@@ -1575,7 +1575,8 @@ int main(int argc, char** argv) {
         if (!N64Recomp::synthesize_decompressed_patterns(
                 context, config.rom_file_path,
                 config.decompressed_section_patterns,
-                config.decompressed_section_patches)) {
+                config.decompressed_section_patches,
+                config.decompressed_force_function_vrams)) {
             exit_failure("Failed to synthesize decompressed patterns\n");
         }
 
@@ -1682,7 +1683,8 @@ int main(int argc, char** argv) {
         if (!N64Recomp::synthesize_decompressed_patterns(
                 context, config.rom_file_path,
                 config.decompressed_section_patterns,
-                config.decompressed_section_patches)) {
+                config.decompressed_section_patches,
+                config.decompressed_force_function_vrams)) {
             exit_failure("Failed to synthesize decompressed patterns\n");
         }
     }

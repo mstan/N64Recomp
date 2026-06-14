@@ -121,6 +121,18 @@ namespace N64Recomp {
         std::vector<DecompressedSection> decompressed_sections;
         std::vector<DecompressedSectionPattern> decompressed_section_patterns;
         std::vector<DecompressedSectionPatch> decompressed_section_patches;
+        // Authoritative function-entry seeds for decompressed sections,
+        // expressed as absolute (bytes-encoded) link VRAMs. The engine's
+        // CFG discovery cannot resolve indirect (jalr) / data-table function
+        // pointers, so an entry only reached that way is never seeded and a
+        // runtime call to it misses get_function. Each VRAM here that falls
+        // inside a decompressed section's code region is force-seeded: if it
+        // lands inside an already-emitted function it becomes a dispatch
+        // alias (no parent split); otherwise a standalone function. This is
+        // the manifest sink that the runtime capture loop folds back into
+        // (see the runtime-overlay-discovery design). A VRAM matching no
+        // section, or already covered, is a harmless no-op.
+        std::vector<uint32_t> decompressed_force_function_vrams;
         CollisionPolicy collision_policy = CollisionPolicy::Error;
         std::string bss_section_suffix;
         std::string recomp_include;

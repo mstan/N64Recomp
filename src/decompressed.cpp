@@ -518,8 +518,10 @@ bool synthesize_decompressed_sections(
     Context& context,
     const std::filesystem::path& rom_path,
     const std::vector<DecompressedSection>& configs,
-    const std::vector<DecompressedSectionPatch>& patches)
+    const std::vector<DecompressedSectionPatch>& patches,
+    const std::vector<uint32_t>& forced_function_vrams)
 {
+    (void)forced_function_vrams;  // explicit-section path does not seed yet
     if (configs.empty()) return true;
 
     const std::vector<uint8_t> rom = read_rom_file(rom_path);
@@ -740,7 +742,8 @@ size_t add_decompressed_section(Context& context,
                                 uint64_t content_hash,
                                 uint32_t override_link_ram_addr = 0,
                                 uint32_t original_pattern_id = 0xFFFFFFFFu,
-                                const std::set<uint32_t>* extra_entry_offsets = nullptr)
+                                const std::set<uint32_t>* extra_entry_offsets = nullptr,
+                                const std::vector<uint32_t>* forced_function_vrams = nullptr)
 {
     // `vram` is the BYTES-ENCODED vram — what the body's R_MIPS_HI16/LO16
     // / R_MIPS_32 / J/JAL targets are encoded relative to. The CFG walker
@@ -1224,6 +1227,39 @@ size_t add_decompressed_section(Context& context,
         if (added_out != nullptr) {
             *added_out = true;
         }
+        return true;
+    };
+
+    // Lighter sibling of add_dispatch_alias: register `entry_offset` as a
+    // resumable dispatch entry into the enclosing parent (emits a
+    // `case ...: goto L_...` + label in the parent's recompiled body) but
+    // does NOT create a standalone alias FuncEntry / func_map row. Used by
+    // the universal jal-return pass below: every return address after a
+    // linking instruction must be resumable because the runtime
+    // tailcall-bubble dispatcher AND the librecomp lookup-miss self-heal
+    // re-enter the parent via ctx->dispatch_entry_target. Registering a
+    // func_map alias for every such point would bloat the table; instead
+    // the runtime finds the resident enclosing function itself and
+    // dispatches into it. Idempotent (dispatch_entry_vrams is a set).
+    auto add_dispatch_label_only = [&](size_t parent_func_index,
+                                       uint32_t entry_offset) -> bool {
+        if ((entry_offset & 3u) != 0 ||
+            entry_offset >= reloc_offset ||
+            emitted_offsets.find(entry_offset) != emitted_offsets.end()) {
+            return true;  // misaligned, OOB, or already a real function entry
+        }
+        if (parent_func_index >= context.functions.size()) {
+            return false;
+        }
+        N64Recomp::Function& parent_func = context.functions[parent_func_index];
+        const uint32_t entry_vram = vram + entry_offset;
+        const uint32_t parent_size =
+            uint32_t(parent_func.words.size() * sizeof(parent_func.words[0]));
+        if (entry_vram <= parent_func.vram ||
+            entry_vram >= parent_func.vram + parent_size) {
+            return true;  // not strictly interior to this parent
+        }
+        parent_func.dispatch_entry_vrams.insert(entry_vram);
         return true;
     };
 
@@ -1950,6 +1986,146 @@ size_t add_decompressed_section(Context& context,
             section_name.c_str(), continuation_added_count);
     }
 
+    // ── Universal jal-return dispatch labels (self-heal enabler) ─────────
+    // The runtime tailcall-bubble dispatcher (recomp_handle_tailcalls) and
+    // the librecomp lookup-miss self-heal can re-enter ANY function at the
+    // return address after a linking instruction (`jal`/`jalr`/`bal` site
+    // +8): when a deep callee returns by bubbling back through the
+    // dispatcher, it does get_function(return_addr) and resumes there.
+    // Those interior return points are never function starts, so without a
+    // dispatch case+label they miss -> abort. The continuation pass above
+    // only registers points that look like clean sub-functions; the real
+    // return targets are arbitrary mid-function resume points. Register
+    // EVERY jal-return as a label-only dispatch entry (no func_map alias)
+    // so the resident parent can always resume there. Linear in
+    // instruction count; the parent's dispatch switch is emitted once.
+    {
+        size_t jal_return_label_count = 0;
+        std::vector<std::pair<uint32_t, uint32_t>> jr_ranges = emitted_ranges;
+        std::sort(jr_ranges.begin(), jr_ranges.end());
+        for (const auto& range : jr_ranges) {
+            const uint32_t range_start = range.first;
+            const uint32_t range_end = range.second;
+            if (range_end <= range_start || range_end > reloc_offset) {
+                continue;
+            }
+            auto parent_it = function_index_by_offset.find(range_start);
+            if (parent_it == function_index_by_offset.end()) {
+                continue;
+            }
+            const size_t parent_index = parent_it->second;
+            for (uint32_t offset = range_start;
+                 offset + 8 <= range_end;
+                 offset += 4) {
+                const uint32_t insn_word = read_be_u32(blob.data() + offset);
+                rabbitizer::InstructionCpu instr(insn_word, vram + offset);
+                if (!instr.isValid() || !instr.doesLink()) {
+                    continue;
+                }
+                const uint32_t continuation_offset = offset + 8;
+                if (continuation_offset >= range_end) {
+                    continue;
+                }
+                const size_t before = context.functions[parent_index]
+                                          .dispatch_entry_vrams.size();
+                if (!add_dispatch_label_only(parent_index,
+                                             continuation_offset)) {
+                    return size_t(-1);
+                }
+                if (context.functions[parent_index].dispatch_entry_vrams.size()
+                        != before) {
+                    jal_return_label_count++;
+                }
+            }
+        }
+        if (jal_return_label_count != 0) {
+            std::fprintf(stderr,
+                "decompressed: section %s added %zu jal-return dispatch "
+                "label(s)\n",
+                section_name.c_str(), jal_return_label_count);
+        }
+    }
+
+    // Authoritative forced-function seeding. force_function_vrams holds
+    // absolute (bytes-encoded) link VRAMs that the CFG walk above could not
+    // reach (indirect jalr / data-table function pointers). For each that
+    // lands in this section's code region and isn't already covered: if it
+    // falls strictly inside an already-emitted function, attach a dispatch
+    // alias (an alternate entry into the same compiled body — no split, no
+    // duplication); otherwise discover+emit it as a standalone function.
+    // A false entry is near-harmless (an unused func_map row / alias).
+    if (forced_function_vrams != nullptr) {
+        size_t forced_added_count = 0;
+        for (uint32_t forced_vram : *forced_function_vrams) {
+            if (forced_vram < vram) {
+                continue;
+            }
+            const uint32_t forced_offset = forced_vram - vram;
+            if (forced_offset == 0 || (forced_offset & 3u) != 0 ||
+                forced_offset + 4 > reloc_offset) {
+                continue;  // not in this section's code region
+            }
+            if (emitted_offsets.find(forced_offset) != emitted_offsets.end() ||
+                emitted_alias_offsets.find(forced_offset) !=
+                    emitted_alias_offsets.end()) {
+                continue;  // already covered
+            }
+
+            // Find an emitted function whose body strictly contains it.
+            size_t parent_func_index = size_t(-1);
+            for (const auto& range : emitted_ranges) {
+                if (forced_offset > range.first &&
+                    forced_offset < range.second) {
+                    auto it = function_index_by_offset.find(range.first);
+                    if (it != function_index_by_offset.end()) {
+                        parent_func_index = it->second;
+                    }
+                    break;
+                }
+            }
+
+            bool added = false;
+            if (parent_func_index != size_t(-1)) {
+                if (!add_dispatch_alias(parent_func_index, forced_offset,
+                                        &added)) {
+                    return size_t(-1);
+                }
+                if (added) {
+                    std::fprintf(stderr,
+                        "decompressed: section %s forced dispatch alias at "
+                        "vram 0x%08X (+0x%X) into parent function\n",
+                        section_name.c_str(), forced_vram, forced_offset);
+                }
+            } else {
+                if (!discover_and_add_function(forced_offset, 0, false,
+                                               &added)) {
+                    return size_t(-1);
+                }
+                if (added) {
+                    std::fprintf(stderr,
+                        "decompressed: section %s forced standalone function "
+                        "at vram 0x%08X (+0x%X)\n",
+                        section_name.c_str(), forced_vram, forced_offset);
+                }
+            }
+            if (added) {
+                forced_added_count++;
+            } else {
+                std::fprintf(stderr,
+                    "decompressed: section %s WARNING forced vram 0x%08X "
+                    "(+0x%X) could not be emitted (discovery failed or shape "
+                    "rejected); runtime fallback will handle it if hit\n",
+                    section_name.c_str(), forced_vram, forced_offset);
+            }
+        }
+        if (forced_added_count != 0) {
+            std::fprintf(stderr,
+                "decompressed: section %s added %zu forced function "
+                "entry(s)\n",
+                section_name.c_str(), forced_added_count);
+        }
+    }
+
     return section_index;
     }
 
@@ -2036,7 +2212,8 @@ bool synthesize_decompressed_patterns(
     Context& context,
     const std::filesystem::path& rom_path,
     const std::vector<DecompressedSectionPattern>& patterns,
-    const std::vector<DecompressedSectionPatch>& patches)
+    const std::vector<DecompressedSectionPatch>& patches,
+    const std::vector<uint32_t>& forced_function_vrams)
 {
     if (patterns.empty()) return true;
 
@@ -2298,7 +2475,8 @@ bool synthesize_decompressed_patterns(
             size_t si = add_decompressed_section(
                 context, hit.body, hit.wrap_off, variant_id_vram,
                 section_name, p.relocatable, content_hash,
-                variant_link_addr, orig_id, extra_entry_offsets);
+                variant_link_addr, orig_id, extra_entry_offsets,
+                &forced_function_vrams);
             if (si == size_t(-1)) {
                 // Hard failure: the section's bytes can't be bounded
                 // by our CFG walk (or some other unrecoverable parse

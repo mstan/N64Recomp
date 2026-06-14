@@ -932,6 +932,24 @@ N64Recomp::Config::Config(const char* path) {
                 decompressed_patch_data.as_array());
         }
 
+        // force_function_vrams (optional). Flat array of absolute link
+        // VRAMs to force-seed as function entries in whatever decompressed
+        // section contains them (indirect/jalr/data-table targets the CFG
+        // walk can't find). e.g. force_function_vrams = [0x82117ED4, ...].
+        toml::node_view force_function_vrams_data =
+            input_data["force_function_vrams"];
+        if (force_function_vrams_data.is_array()) {
+            for (const toml::node& el : *force_function_vrams_data.as_array()) {
+                std::optional<uint32_t> v = el.value<uint32_t>();
+                if (!v.has_value()) {
+                    throw toml::parse_error(
+                        "force_function_vrams entries must be integers",
+                        el.source());
+                }
+                decompressed_force_function_vrams.push_back(v.value());
+            }
+        }
+
         // Output policies (optional [output] table).
         toml::node_view output_data = config_data["output"];
         if (output_data.is_table()) {
