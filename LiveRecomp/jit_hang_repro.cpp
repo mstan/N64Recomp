@@ -10,6 +10,7 @@
 #include <string>
 #include <sstream>
 #include <memory>
+#include <cmath>
 
 #include "sljitLir.h"
 #include "recompiler/live_recompiler.h"
@@ -118,8 +119,88 @@ static bool compile_one(const char* name, uint32_t vram,
     return true;
 }
 
+// Compile a function and return its callable pointer (or nullptr). Keeps the
+// LiveGeneratorOutput alive via the out-param so the code stays mapped.
+static recomp_func_t* compile_callable(uint32_t vram, const uint32_t* words,
+        size_t nwords,
+        std::unique_ptr<N64Recomp::LiveGeneratorOutput>& out_keep,
+        std::unique_ptr<int32_t[]>& sect_keep) {
+    using namespace N64Recomp;
+    auto bswap32 = [](uint32_t v) {
+        return (v >> 24) | ((v >> 8) & 0xFF00u) | ((v << 8) & 0xFF0000u) | (v << 24);
+    };
+    std::vector<uint32_t> w(nwords);
+    for (size_t i = 0; i < nwords; i++) w[i] = bswap32(words[i]);
+
+    Context ctx{};
+    Section sec{};
+    sec.rom_addr = 0; sec.ram_addr = vram; sec.size = (uint32_t)(nwords * 4);
+    sec.name = "jit"; sec.executable = true;
+    ctx.sections.push_back(std::move(sec));
+    ctx.functions.emplace_back(vram, 0u, w, "jit_" + std::to_string(vram), (uint16_t)0);
+    ctx.section_functions.push_back(std::vector<size_t>{0});
+    ctx.use_lookup_for_all_function_calls = true;
+
+    sect_keep = std::make_unique<int32_t[]>(1);
+    sect_keep[0] = (int32_t)vram;
+
+    LiveGeneratorInputs inputs{};
+    inputs.cop0_status_write = repro_cop0_status_write;
+    inputs.cop0_status_read = repro_cop0_status_read;
+    inputs.switch_error = repro_switch_error;
+    inputs.do_break = repro_do_break;
+    inputs.get_function = repro_get_function;
+    inputs.reference_section_addresses = sect_keep.get();
+    inputs.local_section_addresses = sect_keep.get();
+    inputs.original_section_indices = std::vector<size_t>{0};
+
+    LiveGenerator generator{ ctx.functions.size(), inputs };
+    std::ostringstream dummy_ostream;
+    std::vector<std::vector<uint32_t>> dummy_static_funcs(ctx.sections.size());
+    if (!recompile_function_live(generator, ctx, 0, dummy_ostream,
+                                 dummy_static_funcs, false)) {
+        return nullptr;
+    }
+    out_keep = std::make_unique<LiveGeneratorOutput>(generator.finish());
+    if (!out_keep->good || out_keep->functions.empty()) return nullptr;
+    return out_keep->functions[0];
+}
+
+// Execution test: JIT the sqrt leaf (f0 = sqrt(f12)) and verify it actually
+// runs and computes the right float. Proves the live recompiler's codegen is
+// not just crash-free but numerically correct end-to-end.
+static bool exec_test_sqrt() {
+    std::unique_ptr<N64Recomp::LiveGeneratorOutput> keep;
+    std::unique_ptr<int32_t[]> sect;
+    recomp_func_t* fn = compile_callable(sqrt_vram, sqrt_words,
+        sizeof(sqrt_words) / sizeof(sqrt_words[0]), keep, sect);
+    if (!fn) { printf("exec sqrt: compile FAILED\n"); return false; }
+
+    std::vector<uint8_t> rdram(0x800000, 0);
+    bool all_ok = true;
+    const float inputs[] = { 4.0f, 2.0f, 16.0f, 100.0f, 0.25f, 1234.5f };
+    for (float in : inputs) {
+        recomp_context ctx{};
+        ctx.r29 = 0xFFFFFFFF80000000ull + rdram.size() - 0x20;
+        ctx.f12.fl = in;
+        fn(rdram.data(), &ctx);
+        float got = ctx.f0.fl;
+        float want = std::sqrt(in);
+        bool ok = std::fabs(got - want) < 1e-4f * (want + 1.0f);
+        printf("  sqrt(%.4f) = %.6f (want %.6f) %s\n", in, got, want,
+               ok ? "OK" : "MISMATCH");
+        all_ok = all_ok && ok;
+    }
+    printf("exec sqrt: %s\n", all_ok ? "PASS" : "FAIL");
+    return all_ok;
+}
+
 int main(int argc, const char** argv) {
     N64Recomp::live_recompiler_init();
+    {
+        std::string a = argc > 1 ? argv[1] : "";
+        if (a == "exec") { return exec_test_sqrt() ? 0 : 1; }
+    }
 
     std::string which = argc > 1 ? argv[1] : "both";
     if (which == "main" || which == "both") {
