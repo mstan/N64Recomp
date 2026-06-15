@@ -1683,6 +1683,14 @@ bool recompile_function_impl(GeneratorType& generator, const N64Recomp::Context&
                 fallthrough_vram,
                 func.section_index);
 
+            // A bodyless fall-through target (e.g. a fragmentN_TEXT_END
+            // section-end label) is not an emitted function — the declaration
+            // loop skips zero-word symbols — so a named tailcall to it would be
+            // an undeclared identifier. Resolve those by vram at runtime
+            // instead; real functions still take the direct named tailcall.
+            const bool fallthrough_has_body =
+                fallthrough_func_index != (size_t)-1 &&
+                !context.functions[fallthrough_func_index].words.empty();
             if (fallthrough_func_index != (size_t)-1 && fallthrough_func_index != func_index) {
                 fmt::print(
                     output_file,
@@ -1693,11 +1701,18 @@ bool recompile_function_impl(GeneratorType& generator, const N64Recomp::Context&
                 }
                 fmt::print(output_file, "        return;\n");
                 fmt::print(output_file, "    }}\n");
-                fmt::print(
-                    output_file,
-                    "    recomp_request_tailcall_func_target(ctx, {}, 0x{:08X}u);\n",
-                    context.functions[fallthrough_func_index].name,
-                    fallthrough_vram);
+                if (fallthrough_has_body) {
+                    fmt::print(
+                        output_file,
+                        "    recomp_request_tailcall_func_target(ctx, {}, 0x{:08X}u);\n",
+                        context.functions[fallthrough_func_index].name,
+                        fallthrough_vram);
+                } else {
+                    fmt::print(
+                        output_file,
+                        "    recomp_request_tailcall(ctx, (gpr)(int32_t)0x{:08X}u);\n",
+                        fallthrough_vram);
+                }
                 if (context.trace_mode) {
                     fmt::print(output_file, "    TRACE_RETURN()\n");
                 }

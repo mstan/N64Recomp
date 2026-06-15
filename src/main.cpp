@@ -4,6 +4,8 @@
 #include <span>
 #include <filesystem>
 #include <optional>
+#include <exception>
+#include <sstream>
 
 #include "rabbitizer.hpp"
 #include "fmt/format.h"
@@ -1456,6 +1458,20 @@ static std::vector<uint8_t> read_file(const std::filesystem::path& path) {
 }
 
 int main(int argc, char** argv) {
+    // Diagnostic: an unhandled C++ exception otherwise vanishes as a bare
+    // 0xC0000409 fastfail with no message. Print what() + the last function
+    // the recompiler was working on so generation crashes are debuggable.
+    std::set_terminate([]() {
+        const char* what = "(no active exception)";
+        try {
+            if (auto e = std::current_exception()) std::rethrow_exception(e);
+        } catch (const std::exception& ex) { what = ex.what(); }
+          catch (...) { what = "(non-std exception)"; }
+        fmt::print(stderr, "\n[FATAL] std::terminate: unhandled exception: {}\n", what);
+        std::fflush(stderr);
+        std::abort();
+    });
+
     auto exit_failure = [] (const std::string& error_str) {
         fmt::vprint(stderr, error_str, fmt::make_format_args());
         std::exit(EXIT_FAILURE);
@@ -2012,6 +2028,35 @@ int main(int argc, char** argv) {
     bool failed_strict_mode = false;
 
     //#pragma omp parallel for
+    // Recompile one function into a buffer, then commit it. If recompilation
+    // fails (un-sizable jump table, data misidentified as code by the static
+    // seeder, an unsupported instruction, ...), emit a loud runtime-abort stub
+    // instead of aborting the entire multi-thousand-function generation. The
+    // symbol stays defined so direct callers still link, and any genuine call
+    // surfaces at runtime where the self-heal / JIT tier can take over — the
+    // graceful-degradation path the runtime-overlay-discovery arc is built
+    // around. Buffer-and-commit is required because recompile_function writes
+    // the function prologue before it analyzes, so a mid-function failure would
+    // otherwise leave a corrupt half-function in the output file.
+    size_t stubbed_function_count = 0;
+    auto recompile_or_stub = [&](size_t fidx) {
+        const N64Recomp::Function& f = context.functions[fidx];
+        std::ostringstream buf;
+        if (N64Recomp::recompile_function(context, fidx, buf, static_funcs_by_section, false)) {
+            current_output_file << buf.str();
+            return;
+        }
+        stubbed_function_count++;
+        fmt::print(stderr,
+            "[Warn] {} failed to recompile -- emitting runtime-abort stub (deferred to runtime tier)\n",
+            f.name);
+        fmt::print(current_output_file,
+            "void {}(uint8_t* rdram, recomp_context* ctx) {{\n"
+            "    recomp_unhandled_instruction(rdram, ctx, 0x{:08X}u, \"unrecompilable_func\");\n"
+            "}}\n",
+            f.name, f.vram);
+    };
+
     for (size_t i = 0; i < context.functions.size(); i++) {
         const auto& func = context.functions[i];
 
@@ -2048,7 +2093,8 @@ int main(int argc, char** argv) {
 
             // Recompile the function.
             if (config.single_file_output || config.functions_per_output_file > 1) {
-                result = N64Recomp::recompile_function(context, i, current_output_file, static_funcs_by_section, false);
+                recompile_or_stub(i);   // never fatal: stubs on failure
+                result = true;
                 if (!config.single_file_output) {
                     cur_file_function_count++;
                     if (cur_file_function_count >= config.functions_per_output_file) {
@@ -2206,6 +2252,36 @@ int main(int argc, char** argv) {
 
             }
 
+            // A seeded static function's discovered bounds can run into a
+            // relocated data region — e.g. a code-pointer/jump table whose
+            // words carry R_MIPS_32 (absolute) relocs. Emitting those data
+            // words as instructions makes the C generator throw "Unexpected
+            // reloc type 2" and aborts the entire run. Truncate this function
+            // at the first R_MIPS_32 reloc in its range so only the genuine
+            // code is emitted; if that leaves nothing, this candidate is
+            // misidentified data, so drop it. Scoped to seeded static funcs
+            // only — pret's real functions are bounded correctly and never
+            // reach here. (R_MIPS_32 never applies to a real instruction's
+            // 16-bit immediate, so this can't truncate genuine code.)
+            //
+            // NB: scan relocs directly rather than gating on
+            // section.has_mips32_relocs — that flag is only set for
+            // decompressed sections (elf.cpp leaves it false for ordinary
+            // ELF fragment sections, which is exactly where this fires).
+            {
+                uint32_t mips32_cut = cur_func_end;
+                for (const auto& rel : section.relocs) {
+                    if (rel.type == N64Recomp::RelocType::R_MIPS_32 &&
+                        rel.address >= code_func_start && rel.address < cur_func_end) {
+                        mips32_cut = std::min(mips32_cut, rel.address);
+                    }
+                }
+                if (mips32_cut <= code_func_start) {
+                    continue;  // entirely relocated data — not a real function
+                }
+                cur_func_end = mips32_cut;
+            }
+
             const uint32_t* func_rom_start = reinterpret_cast<const uint32_t*>(context.rom.data() + code_rom_addr);
 
             std::vector<uint32_t> insn_words((cur_func_end - code_func_start) / sizeof(uint32_t));
@@ -2234,7 +2310,8 @@ int main(int argc, char** argv) {
             bool result;
             size_t prev_num_statics = static_funcs_by_section[new_func.section_index].size();
             if (config.single_file_output || config.functions_per_output_file > 1) {
-                result = N64Recomp::recompile_function(context, new_func_index, current_output_file, static_funcs_by_section, false);
+                recompile_or_stub(new_func_index);   // never fatal: stubs on failure
+                result = true;
                 if (!config.single_file_output) {
                     cur_file_function_count++;
                     if (cur_file_function_count >= config.functions_per_output_file) {
