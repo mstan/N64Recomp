@@ -1301,6 +1301,105 @@ void seed_static_entrypoints_from_indirect_dispatch(
     }
 }
 
+// Register interior computed-call entry points produced by the hand-written
+// MIPS "PC-arithmetic" idiom as resumable dispatch entries of their enclosing
+// function.
+//
+// In hand-written code (e.g. the Stadium audio synth, func_80021834) a
+// conditional branch-and-link that is statically never taken — canonically
+// `bltzal $zero, X` (`$zero` is never < 0) — is used purely to load `$ra` with
+// a known PC, after which `addiu rX, $ra, imm` materializes the address of an
+// INTERIOR label X and `jalr rX` calls it. X is exactly the branch target of
+// the branch-and-link. The recompiler already emits a label at X (the branch is
+// emitted as an always-false `goto`), but nothing lets the runtime ENTER at X:
+// `get_function(X)` finds no registered function (X is mid-function) and the
+// lookup-miss self-heal, lacking a dispatch switch in the enclosing function,
+// re-runs it from the top — corrupting state and crashing.
+//
+// Resolve each such interior target two ways, mirroring the synthetic-arena
+// dispatch machinery in decompressed.cpp:
+//   1. Add X to the enclosing function's dispatch_entry_vrams so recompilation
+//      emits `case X: goto L_X;` in its prologue switch — entering past the
+//      stack-frame setup, with the FULL function body present so a target block
+//      that branches backward into shared code still resolves.
+//   2. Emit a DispatchAlias FuncEntry at X so `get_function(X)` HITS directly
+//      (sets ctx->dispatch_entry_target = X, tail-calls the parent) — the fast
+//      path, avoiding the per-call lookup-miss trampoline on these hot calls.
+// This is a generation-side class fix: every interior branch-and-link target in
+// every recompiled function is handled, not just the one that crashed.
+static void register_interior_dispatch_aliases(N64Recomp::Context& context) {
+    size_t added = 0;
+
+    // Guard against creating two aliases at the same (section, vram) — the
+    // synthetic-arena pass may already have registered some.
+    std::set<std::pair<uint16_t, uint32_t>> existing_aliases;
+    for (const auto& alias : context.dispatch_aliases) {
+        existing_aliases.emplace(alias.section_index, alias.vram);
+    }
+
+    // Snapshot the original function count: aliases are appended to
+    // context.functions-adjacent tables, not to context.functions itself, so the
+    // loop bound is stable, but be explicit.
+    const size_t original_func_count = context.functions.size();
+    for (size_t func_index = 0; func_index < original_func_count; func_index++) {
+        N64Recomp::Function& func = context.functions[func_index];
+        if (func.words.empty() || func.ignored || func.reimplemented || func.stubbed) {
+            continue;
+        }
+        const uint32_t func_vram_end =
+            func.vram + uint32_t(func.words.size() * sizeof(func.words[0]));
+
+        for (size_t word_index = 0; word_index < func.words.size(); word_index++) {
+            const uint32_t instr_vram =
+                func.vram + uint32_t(word_index * sizeof(func.words[0]));
+            rabbitizer::InstructionCpu instr(byteswap(func.words[word_index]), instr_vram);
+            // Only conditional branch-and-link (bltzal/bgezal/bltzall/bgezall)
+            // encodes an interior code address as its branch target. `jal`/`bal`
+            // are direct calls (their target is a real function start or an
+            // already-emitted goto), and `jalr` has no static target.
+            if (!instr.isValid() || !instr.doesLink() || !is_conditional_branch(instr)) {
+                continue;
+            }
+            const uint32_t target = (uint32_t)instr.getBranchVramGeneric();
+            if ((target & 3u) != 0 || target <= func.vram || target >= func_vram_end) {
+                continue;  // not strictly interior to this function
+            }
+            // A target that is itself a known function start needs no alias —
+            // get_function(target) already hits it directly.
+            if (find_exact_function_in_section(context, target, func.section_index) != (size_t)-1) {
+                continue;
+            }
+
+            func.dispatch_entry_vrams.insert(target);
+
+            if (!existing_aliases.emplace(func.section_index, target).second) {
+                continue;  // alias already exists at this (section, vram)
+            }
+            N64Recomp::DispatchAlias alias{};
+            alias.section_index = func.section_index;
+            alias.vram = target;
+            alias.rom = func.rom + (target - func.vram);
+            alias.name = fmt::format(
+                "dispatch_alias_s{}_{:08X}", func.section_index, target);
+            alias.target_function_index = func_index;
+            const size_t alias_index = context.dispatch_aliases.size();
+            context.dispatch_aliases.emplace_back(std::move(alias));
+            if (func.section_index >= context.section_dispatch_aliases.size()) {
+                context.section_dispatch_aliases.resize(func.section_index + 1);
+            }
+            context.section_dispatch_aliases[func.section_index].push_back(alias_index);
+            added++;
+        }
+    }
+
+    if (added != 0) {
+        fmt::print(
+            "[Info] Registered {} interior computed-call dispatch alias{} "
+            "(branch-and-link PC-arithmetic idiom)\n",
+            added, added == 1 ? "" : "es");
+    }
+}
+
 bool recompile_single_function(const N64Recomp::Context& context, size_t func_index, const std::string& recomp_include, const std::filesystem::path& output_path, std::span<std::vector<uint32_t>> static_funcs_out) {
     // Open the temporary output file
     std::filesystem::path temp_path = output_path;
@@ -2022,6 +2121,12 @@ int main(int argc, char** argv) {
             }
         }
     }
+
+    // Register interior computed-call entry points (hand-written branch-and-link
+    // PC-arithmetic idiom) as resumable dispatch entries before recompilation, so
+    // each enclosing function emits its dispatch switch and a func_map alias is
+    // available for the fast entry path.
+    register_interior_dispatch_aliases(context);
 
     std::vector<size_t> export_function_indices{};
 
