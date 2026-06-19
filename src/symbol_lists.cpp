@@ -60,6 +60,10 @@ const std::unordered_set<std::string> N64Recomp::reimplemented_funcs {
     "__osContRamRead",
     "__osContRamWrite",
     "__osPfsGetStatus",
+    // The universal SI chokepoint: a joybus processor (librecomp/si_joybus.cpp)
+    // answers the accessory read/write/info commands from the same cart model, so
+    // games with a custom-named accessory path bind by naming just this primitive.
+    "__osSiRawStartDma",
     // Parallel interface (cartridge, DMA, etc.) functions
     "osCartRomInit",
     "osCreatePiManager",
@@ -258,7 +262,6 @@ const std::unordered_set<std::string> N64Recomp::ignored_funcs {
     // Low level serial interface functions
     "__osSiDeviceBusy",
     "__osSiGetStatus",
-    "__osSiRawStartDma",
     "__osSiRawReadIo",
     "__osSiRawWriteIo",
     "__osSiCreateAccessQueue",
