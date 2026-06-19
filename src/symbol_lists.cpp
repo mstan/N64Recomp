@@ -55,6 +55,11 @@ const std::unordered_set<std::string> N64Recomp::reimplemented_funcs {
     "osPfsFileState",
     "osPfsFindFile",
     "osPfsReadWriteFile",
+    // Transfer Pak (GB Pak) accessory block I/O — HLE in librecomp/gbpak.cpp,
+    // backed by the shared librecomp::gbcart model.
+    "__osContRamRead",
+    "__osContRamWrite",
+    "__osPfsGetStatus",
     // Parallel interface (cartridge, DMA, etc.) functions
     "osCartRomInit",
     "osCreatePiManager",
@@ -200,8 +205,6 @@ const std::unordered_set<std::string> N64Recomp::ignored_funcs {
     "__osContAddressCrc",
     "__osContDataCrc",
     "__osContGetInitData",
-    "__osContRamRead",
-    "__osContRamWrite",
     "__osContChannelReset",
     // EEPROM functions
     "osEepromLongRead",
@@ -247,7 +250,6 @@ const std::unordered_set<std::string> N64Recomp::ignored_funcs {
     "__osPackRequestData",
     "__osPfsGetInitData",
     "__osPfsGetOneChannelData",
-    "__osPfsGetStatus",
     "__osPfsRequestData",
     "__osPfsRequestOneChannel",
     "__osPfsCreateAccessQueue",
