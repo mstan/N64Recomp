@@ -530,6 +530,14 @@ struct recomp_context {
     recomp_func_t* tailcall_func;
     uint32_t host_return_target;
     uint32_t dispatch_entry_target;
+    // Set by a generated function's dispatch-entry switch DEFAULT arm when the
+    // requested interior entry PC is not one of that function's emitted labels:
+    // it means "this compiled function cannot service that entry PC," so the
+    // function returns WITHOUT executing guest code and librecomp's self-heal
+    // interprets from the exact PC instead of mis-running the function from its
+    // prologue. _target carries the rejected entry PC (interpreter + telemetry).
+    uint32_t dispatch_entry_rejected;
+    uint32_t dispatch_entry_rejected_target;
 };
 
 // Checks if the target is an even float register or that mips3 float mode is enabled

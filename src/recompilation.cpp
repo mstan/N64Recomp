@@ -1517,8 +1517,26 @@ bool recompile_function_impl(GeneratorType& generator, const N64Recomp::Context&
                         dispatch_entry_vram);
                 }
             }
+            // A requested interior dispatch entry that is NOT one of this
+            // function's emitted labels means "this compiled function cannot
+            // service that entry PC" — NOT "run this function from its
+            // prologue." Falling through to the prologue (the old
+            // `default: break;`) silently executed the WRONG function body for
+            // an indirect-only function-start that the recompiler merged into a
+            // neighbor's range (e.g. GB-CPU opcode handlers), producing a
+            // garbage computed pointer. Instead REJECT: flag it + record the
+            // target and return WITHOUT executing any guest code, so the
+            // librecomp self-heal falls through to the interpreter floor which
+            // runs the function correctly from the exact missed PC. The switch
+            // is the authoritative legal-entry set, so the default arm is
+            // exactly where this is detected. (This is the first guest-semantic
+            // statement in the function — only host-local inits / TRACE precede
+            // it — so a bare return here leaves no half-mutated guest state.)
             fmt::print(output_file,
-                "        default: break;\n"
+                "        default:\n"
+                "            ctx->dispatch_entry_rejected = 1;\n"
+                "            ctx->dispatch_entry_rejected_target = recomp_dispatch_entry;\n"
+                "            return;\n"
                 "        }}\n"
                 "    }}\n");
         }
