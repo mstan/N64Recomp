@@ -1,10 +1,15 @@
 # N64: Recompiled
 
-> **Fork notice** — This is a fork maintained as part of **SS Anne**, a
-> [Pokémon Stadium recompilation project](https://github.com/mstan/PokemonStadiumRecomp).
-> The changes here exist to support that port; they may lag behind
-> upstream and are not intended as a replacement for the canonical
-> project. For canonical N64Recomp, see
+> **Fork notice** — This is a fork maintained for two Pokémon Stadium
+> recompilation projects that share these engine forks:
+> - [PokemonStadiumRecomp](https://github.com/mstan/PokemonStadiumRecomp) —
+>   *Pokémon Stadium* (US)
+> - [PocketMonstersStadiumRecomp](https://github.com/mstan/PocketMonstersStadiumRecomp) —
+>   *Pocket Monsters Stadium* (Japan)
+>
+> The changes here exist to support those ports; they may lag behind upstream
+> and are not intended as a replacement for the canonical project. For
+> canonical N64Recomp, see
 > [N64Recomp/N64Recomp](https://github.com/N64Recomp/N64Recomp).
 
 ## Changes in this fork
