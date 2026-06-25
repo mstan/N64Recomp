@@ -70,13 +70,6 @@ namespace N64Recomp {
 
     private:
         void* state = nullptr;  // TCCState* — owns the code memory.
-        // Stable backing for the generated code's `section_addresses` data
-        // symbol: `section_addrs_storage` holds the per-shard section bases and
-        // `section_addrs_cell` is the int32_t* the symbol resolves to (its
-        // address is what gets bound, so it must never move — hence heap-owned
-        // here for the life of the compiled code).
-        std::vector<int32_t> section_addrs_storage;
-        int32_t* section_addrs_cell = nullptr;
         friend TccRecompOutput recompile_function_tcc(const Context&, size_t,
             const std::vector<TccSymbol>&, const std::vector<int32_t>&, const TccToolchain&);
     };
@@ -86,10 +79,14 @@ namespace N64Recomp {
     bool tcc_backend_available(const TccToolchain& toolchain);
 
     // Build the full C translation unit for one function: the embedded recomp.h
-    // prelude followed by the CGenerator output for `function_index`. Returns
-    // false if the C emitter failed. `func_name_out` receives the emitted
-    // function's symbol name (context.functions[function_index].name).
+    // prelude, an in-shard definition of `section_addresses` from the
+    // compile-time-known section bases (tcc 0.9.27 can't satisfy an external
+    // DATA symbol via tcc_add_symbol on Windows, so it must be defined in the
+    // shard rather than bound), then the CGenerator output for `function_index`.
+    // Returns false if the C emitter failed. `func_name_out` receives the
+    // emitted function's symbol name (context.functions[function_index].name).
     bool emit_function_c_source(const Context& context, size_t function_index,
+                                const std::vector<int32_t>& section_addresses,
                                 std::string& source_out, std::string& func_name_out);
 
     // Compile one function's C with libtcc in-memory and return a callable

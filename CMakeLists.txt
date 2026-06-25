@@ -223,6 +223,15 @@ target_include_directories(LiveRecompTest PRIVATE
 
 target_link_libraries(LiveRecompTest LiveRecomp)
 
+# In-process libtcc backend smoke test (builds a Context like jit_compile_inner,
+# compiles via libtcc, runs the result). No game launch, no test-data files.
+project(TccRecompTest)
+add_executable(TccRecompTest)
+target_sources(TccRecompTest PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/LiveRecomp/tcc_recompiler_test.cpp
+)
+target_link_libraries(TccRecompTest LiveRecomp)
+
 # Standalone JIT hang reproduction (single hardcoded function, no game launch)
 project(JitHangRepro)
 add_executable(JitHangRepro)

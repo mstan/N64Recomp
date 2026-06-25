@@ -137,7 +137,6 @@ TccRecompOutput::~TccRecompOutput() {
         state = nullptr;
     }
     func = nullptr;
-    section_addrs_cell = nullptr;
 }
 
 TccRecompOutput& TccRecompOutput::operator=(TccRecompOutput&& rhs) noexcept {
@@ -149,11 +148,8 @@ TccRecompOutput& TccRecompOutput::operator=(TccRecompOutput&& rhs) noexcept {
         source = std::move(rhs.source);
         code_size = rhs.code_size;
         state = rhs.state;
-        section_addrs_storage = std::move(rhs.section_addrs_storage);
-        section_addrs_cell = rhs.section_addrs_cell;
         rhs.func = nullptr;
         rhs.state = nullptr;
-        rhs.section_addrs_cell = nullptr;
         rhs.code_size = 0;
     }
     return *this;
@@ -164,6 +160,7 @@ bool tcc_backend_available(const TccToolchain& toolchain) {
 }
 
 bool emit_function_c_source(const Context& context, size_t function_index,
+                            const std::vector<int32_t>& section_addresses,
                             std::string& source_out, std::string& func_name_out) {
     if (function_index >= context.functions.size()) {
         return false;
@@ -181,7 +178,24 @@ bool emit_function_c_source(const Context& context, size_t function_index,
     }
 
     std::ostringstream src;
-    src << g_tcc_recomp_prelude << "\n" << body.str();
+    src << g_tcc_recomp_prelude << "\n";
+    // Define `section_addresses` (declared extern in recomp.h) inside the shard
+    // from compile-time-known bases. tcc_add_symbol can satisfy external CODE
+    // symbols but NOT external DATA on Windows (it would need dllimport
+    // indirection), so RELOC_HI16/LO16's `section_addresses[i]` is resolved by
+    // baking the bases into the translation unit. With no relocations the
+    // generated code never references it, but defining it is harmless and keeps
+    // any relocated shard self-contained.
+    src << "static int32_t _shard_section_addresses[] = {";
+    if (section_addresses.empty()) {
+        src << "0";
+    } else {
+        for (int32_t a : section_addresses) {
+            src << "(int32_t)0x" << std::hex << (uint32_t)a << std::dec << ",";
+        }
+    }
+    src << "};\nint32_t* section_addresses = _shard_section_addresses;\n";
+    src << body.str();
     source_out = src.str();
     return true;
 }
@@ -199,17 +213,11 @@ TccRecompOutput recompile_function_tcc(const Context& context, size_t function_i
     }
 
     std::string func_name;
-    if (!emit_function_c_source(context, function_index, out.source, func_name)) {
+    if (!emit_function_c_source(context, function_index, section_addresses,
+                                out.source, func_name)) {
         out.error = "CGenerator failed to emit C for function";
         return out;
     }
-
-    // Stable backing for the `section_addresses` data symbol (see header).
-    out.section_addrs_storage = section_addresses;
-    if (out.section_addrs_storage.empty()) {
-        out.section_addrs_storage.push_back(0);
-    }
-    out.section_addrs_cell = out.section_addrs_storage.data();
 
     TCCState* s = lib.tcc_new();
     if (!s) {
@@ -241,11 +249,13 @@ TccRecompOutput recompile_function_tcc(const Context& context, size_t function_i
         return out;
     }
 
-    // Bind the caller-provided host helpers + the section_addresses data symbol.
+    // Bind the caller-provided host helpers. These are all CODE symbols
+    // (get_function, cop0_*, switch_error, do_break, ...), which tcc_add_symbol
+    // resolves correctly; the only DATA symbol (section_addresses) is defined
+    // in the shard itself (see emit_function_c_source).
     for (const TccSymbol& sym_entry : symbols) {
         lib.tcc_add_symbol(s, sym_entry.name.c_str(), sym_entry.addr);
     }
-    lib.tcc_add_symbol(s, "section_addresses", &out.section_addrs_cell);
 
     if (lib.tcc_relocate(s, TCC_RELOCATE_AUTO) < 0) {
         out.error = "tcc_relocate failed (unbound symbol?): " + err_acc;
