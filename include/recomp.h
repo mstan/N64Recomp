@@ -25,7 +25,14 @@
 #include <assert.h>
 
 // Compiler definition to disable inter-procedural optimization, allowing multiple functions to be in a single file without breaking interposition.
-#if defined(_MSC_VER) && !defined(__clang__) && !defined(__INTEL_COMPILER)
+#if defined(__TINYC__)
+    // TinyCC — the in-process libtcc overlay/fragment shard backend compiles
+    // exactly ONE function per translation unit, so there is no interposition
+    // to defeat and tcc performs no inter-procedural optimization anyway. No
+    // attribute needed, and tcc has no FENV_ACCESS pragma.
+    #define RECOMP_FUNC
+    #define SET_FENV_ACCESS()
+#elif defined(_MSC_VER) && !defined(__clang__) && !defined(__INTEL_COMPILER)
     // MSVC's __declspec(noinline) seems to disable inter-procedural optimization entirely, so it's all that's needed.
     #define RECOMP_FUNC __declspec(noinline)
     
@@ -59,7 +66,37 @@
 #endif
 
 // Implementation of 64-bit multiply and divide instructions
-#if defined(__SIZEOF_INT128__)
+#if defined(__TINYC__)
+
+// TinyCC path — used by the in-process libtcc overlay/fragment shard backend.
+// tcc 0.9.27 has neither __int128 nor the MSVC _mul128 intrinsics, so the
+// 64x64 -> 128 multiply is done manually from 32-bit limbs. The signed product
+// reuses the unsigned one and corrects the high word with the standard identity
+// hi_signed = hi_unsigned - (a<0 ? b : 0) - (b<0 ? a : 0). 64-bit divide/modulo
+// (DDIV/DDIVU below) are emitted by tcc via libtcc1 (__divdi3/__moddi3), so they
+// need no special-casing here.
+static inline void DMULTU(uint64_t a, uint64_t b, uint64_t* lo64, uint64_t* hi64) {
+    uint64_t a_lo = (uint32_t)a, a_hi = a >> 32;
+    uint64_t b_lo = (uint32_t)b, b_hi = b >> 32;
+    uint64_t ll = a_lo * b_lo;
+    uint64_t lh = a_lo * b_hi;
+    uint64_t hl = a_hi * b_lo;
+    uint64_t hh = a_hi * b_hi;
+    uint64_t cross = (ll >> 32) + (uint32_t)lh + (uint32_t)hl;
+    *lo64 = (ll & 0xFFFFFFFFull) | (cross << 32);
+    *hi64 = hh + (lh >> 32) + (hl >> 32) + (cross >> 32);
+}
+
+static inline void DMULT(int64_t a, int64_t b, int64_t* lo64, int64_t* hi64) {
+    uint64_t ulo, uhi;
+    DMULTU((uint64_t)a, (uint64_t)b, &ulo, &uhi);
+    if (a < 0) uhi -= (uint64_t)b;
+    if (b < 0) uhi -= (uint64_t)a;
+    *lo64 = (int64_t)ulo;
+    *hi64 = (int64_t)uhi;
+}
+
+#elif defined(__SIZEOF_INT128__)
 
 static inline void DMULT(int64_t a, int64_t b, int64_t* lo64, int64_t* hi64) {
     __int128 full128 = ((__int128)a) * ((__int128)b);

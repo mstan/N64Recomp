@@ -179,8 +179,27 @@ target_link_libraries(OfflineModRecomp fmt rabbitizer tomlplusplus::tomlplusplus
 project(LiveRecomp)
 add_library(LiveRecomp)
 
+# Embed recomp.h as the prelude prepended to every libtcc-compiled shard, so a
+# shard is self-contained apart from the C standard headers (resolved from the
+# bundled tcc include/ dir). Regenerated whenever recomp.h changes.
+set(_tcc_prelude_c ${CMAKE_CURRENT_BINARY_DIR}/tcc_recomp_prelude.c)
+add_custom_command(
+    OUTPUT ${_tcc_prelude_c}
+    COMMAND ${CMAKE_COMMAND}
+        -DINPUT=${CMAKE_CURRENT_SOURCE_DIR}/include/recomp.h
+        -DOUTPUT=${_tcc_prelude_c}
+        -DSYMBOL=g_tcc_recomp_prelude
+        -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed_file.cmake
+    DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/include/recomp.h
+            ${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed_file.cmake
+    COMMENT "Embedding recomp.h as the libtcc shard prelude"
+    VERBATIM
+)
+
 target_sources(LiveRecomp PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/LiveRecomp/live_generator.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/LiveRecomp/tcc_generator.cpp
+    ${_tcc_prelude_c}
     ${CMAKE_CURRENT_SOURCE_DIR}/lib/sljit/sljit_src/sljitLir.c
 )
 
