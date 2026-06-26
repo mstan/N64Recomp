@@ -196,6 +196,13 @@ add_custom_command(
     VERBATIM
 )
 
+# LiveRecomp hosts BOTH JIT backends:
+#  - tcc_generator (CGenerator -> C -> libtcc in-memory): the runtime overlay/
+#    fragment JIT backend, which REPLACED sljit there (librecomp/overlays.cpp).
+#  - live_generator (sljit LiveGenerator): RETAINED only for the mod recompiler
+#    (librecomp/mods.cpp recompiles mod code via recompile_function_live with full
+#    reference-symbol/import context). Migrating mods to tcc is a separate effort;
+#    until then sljit stays for mods. The overlay tier no longer uses it.
 target_sources(LiveRecomp PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/LiveRecomp/live_generator.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/LiveRecomp/tcc_generator.cpp
@@ -209,20 +216,6 @@ target_include_directories(LiveRecomp PRIVATE
 
 target_link_libraries(LiveRecomp N64Recomp)
 
-# Live recompiler test
-project(LiveRecompTest)
-add_executable(LiveRecompTest)
-
-target_sources(LiveRecompTest PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/LiveRecomp/live_recompiler_test.cpp
-)
-
-target_include_directories(LiveRecompTest PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/lib/sljit/sljit_src
-)
-
-target_link_libraries(LiveRecompTest LiveRecomp)
-
 # In-process libtcc backend smoke test (builds a Context like jit_compile_inner,
 # compiles via libtcc, runs the result). No game launch, no test-data files.
 project(TccRecompTest)
@@ -231,6 +224,17 @@ target_sources(TccRecompTest PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/LiveRecomp/tcc_recompiler_test.cpp
 )
 target_link_libraries(TccRecompTest LiveRecomp)
+
+# Live recompiler test (sljit) — retained alongside the sljit mod recompiler.
+project(LiveRecompTest)
+add_executable(LiveRecompTest)
+target_sources(LiveRecompTest PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/LiveRecomp/live_recompiler_test.cpp
+)
+target_include_directories(LiveRecompTest PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/lib/sljit/sljit_src
+)
+target_link_libraries(LiveRecompTest LiveRecomp)
 
 # Standalone JIT hang reproduction (single hardcoded function, no game launch)
 project(JitHangRepro)
