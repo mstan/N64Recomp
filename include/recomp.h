@@ -612,8 +612,13 @@ void do_break(uint32_t vram);
 typedef void (recomp_func_ext_t)(uint8_t* rdram, recomp_context* ctx, uintptr_t arg);
 
 recomp_func_t* get_function(int32_t vram);
+void pms_gbexec_tailcall_probe(recomp_context* ctx, uint32_t target);
+void pms_gbexec_r2minus1_probe(uint32_t site, uint8_t* rdram, recomp_context* ctx);
+void pms_gbexec_r24_probe(uint32_t site, uint8_t* rdram, recomp_context* ctx);
+void pms_gbexec_pc_probe(uint32_t site, uint8_t* rdram, recomp_context* ctx);
 
 static inline void recomp_request_tailcall(recomp_context* ctx, gpr target) {
+    pms_gbexec_tailcall_probe(ctx, (uint32_t)target);
     ctx->tailcall_target = (uint32_t)target;
     ctx->tailcall_func = NULL;
     ctx->tailcall_pending = 1;
@@ -626,6 +631,7 @@ static inline void recomp_request_tailcall_func(recomp_context* ctx, recomp_func
 }
 
 static inline void recomp_request_tailcall_func_target(recomp_context* ctx, recomp_func_t* func, uint32_t target) {
+    pms_gbexec_tailcall_probe(ctx, target);
     ctx->tailcall_target = target;
     ctx->tailcall_func = func;
     ctx->tailcall_pending = 1;
