@@ -102,31 +102,34 @@ struct HookV1 {
     uint32_t flags; // end
 };
 
+// Bounds-checked view of `count` consecutive T's at the current cursor. Returns
+// null (and leaves the cursor untouched) if they'd run past the end of the
+// buffer; otherwise advances the cursor past them.
 template <typename T>
-const T* reinterpret_data(std::span<const char> data, size_t& offset, size_t count = 1) {
-    if (offset + (sizeof(T) * count) > data.size()) {
+const T* read_struct(std::span<const char> data, size_t& cursor, size_t count = 1) {
+    if (cursor + (sizeof(T) * count) > data.size()) {
         return nullptr;
     }
 
-    size_t original_offset = offset;
-    offset += sizeof(T) * count;
-    return reinterpret_cast<const T*>(data.data() + original_offset);
+    size_t at = cursor;
+    cursor += sizeof(T) * count;
+    return reinterpret_cast<const T*>(data.data() + at);
 }
 
-bool check_magic(const FileHeader* header) {
+bool magic_matches(const FileHeader* header) {
     static const char good_magic[] = {'N','6','4','R','S','Y','M','S'};
     static_assert(sizeof(good_magic) == sizeof(FileHeader::magic));
 
     return memcmp(header->magic, good_magic, sizeof(good_magic)) == 0;
 }
 
-static inline uint32_t round_up_4(uint32_t value) {
+static inline uint32_t align_up_4(uint32_t value) {
     return (value + 3) & (~3);
 }
 
-bool parse_v1(std::span<const char> data, const std::unordered_map<uint32_t, uint16_t>& sections_by_vrom, N64Recomp::Context& mod_context) {
-    size_t offset = sizeof(FileHeader);
-    const FileSubHeaderV1* subheader = reinterpret_data<FileSubHeaderV1>(data, offset);
+bool parse_symbols_v1(std::span<const char> data, const std::unordered_map<uint32_t, uint16_t>& sections_by_vrom, N64Recomp::Context& mod_context) {
+    size_t cursor = sizeof(FileHeader);
+    const FileSubHeaderV1* subheader = read_struct<FileSubHeaderV1>(data, cursor);
     if (subheader == nullptr) {
         return false;
     }
@@ -147,14 +150,14 @@ bool parse_v1(std::span<const char> data, const std::unordered_map<uint32_t, uin
         return false;
     }
 
-    const char* string_data = reinterpret_data<char>(data, offset, string_data_size);
+    const char* string_data = read_struct<char>(data, cursor, string_data_size);
     if (string_data == nullptr) {
         return false;
     }
 
     // TODO add proper creation methods for the remaining vectors and change these to reserves instead.
     mod_context.sections.resize(num_sections); // Add method
-    mod_context.dependencies_by_name.reserve(num_dependencies); 
+    mod_context.dependencies_by_name.reserve(num_dependencies);
     mod_context.import_symbols.reserve(num_imports);
     mod_context.dependency_events.reserve(num_dependency_events);
     mod_context.replacements.resize(num_replacements); // Add method
@@ -164,7 +167,7 @@ bool parse_v1(std::span<const char> data, const std::unordered_map<uint32_t, uin
     mod_context.hooks.reserve(num_provided_events);
 
     for (size_t section_index = 0; section_index < num_sections; section_index++) {
-        const SectionHeaderV1* section_header = reinterpret_data<SectionHeaderV1>(data, offset);
+        const SectionHeaderV1* section_header = read_struct<SectionHeaderV1>(data, cursor);
         if (section_header == nullptr) {
             return false;
         }
@@ -193,13 +196,13 @@ bool parse_v1(std::span<const char> data, const std::unordered_map<uint32_t, uin
         uint32_t num_funcs = section_header->num_funcs;
         uint32_t num_relocs = section_header->num_relocs;
 
-        const FuncV1* funcs = reinterpret_data<FuncV1>(data, offset, num_funcs);
+        const FuncV1* funcs = read_struct<FuncV1>(data, cursor, num_funcs);
         if (funcs == nullptr) {
             printf("Failed to read funcs (count: %d)\n", num_funcs);
             return false;
         }
 
-        const RelocV1* relocs = reinterpret_data<RelocV1>(data, offset, num_relocs);
+        const RelocV1* relocs = read_struct<RelocV1>(data, cursor, num_relocs);
         if (relocs == nullptr) {
             printf("Failed to read relocs (count: %d)\n", num_relocs);
             return false;
@@ -240,18 +243,21 @@ bool parse_v1(std::span<const char> data, const std::unordered_map<uint32_t, uin
             uint32_t reloc_target_section_offset;
             uint32_t reloc_symbol_index;
             if (target_section_vrom == SectionImportVromV1) {
+                // Reloc into an imported symbol: the offset field carries the symbol index.
                 reloc_target_section = N64Recomp::SectionImport;
                 reloc_target_section_offset = 0; // Not used for imports or reference symbols.
                 reloc_symbol_index = reloc_in.target_section_offset_or_index;
                 cur_reloc.reference_symbol = true;
             }
             else if (target_section_vrom == SectionEventVromV1) {
+                // Reloc into an event symbol: the offset field carries the symbol index.
                 reloc_target_section = N64Recomp::SectionEvent;
                 reloc_target_section_offset = 0; // Not used for event symbols.
                 reloc_symbol_index = reloc_in.target_section_offset_or_index;
                 cur_reloc.reference_symbol = true;
             }
             else if (target_section_vrom & SectionSelfVromFlagV1) {
+                // Reloc into one of the mod's own sections; the low bits are the section index.
                 reloc_target_section = static_cast<uint16_t>(target_section_vrom & ~SectionSelfVromFlagV1);
                 reloc_target_section_offset = reloc_in.target_section_offset_or_index;
                 reloc_symbol_index = 0; // Not used for normal relocs.
@@ -263,6 +269,7 @@ bool parse_v1(std::span<const char> data, const std::unordered_map<uint32_t, uin
                 }
             }
             else {
+                // Otherwise this is a reference into a base-game section, identified by its vrom.
                 // TODO lookup by section index by original vrom
                 auto find_section_it = sections_by_vrom.find(target_section_vrom);
                 if (find_section_it == sections_by_vrom.end()) {
@@ -281,7 +288,7 @@ bool parse_v1(std::span<const char> data, const std::unordered_map<uint32_t, uin
         }
     }
 
-    const DependencyV1* dependencies = reinterpret_data<DependencyV1>(data, offset, num_dependencies);
+    const DependencyV1* dependencies = read_struct<DependencyV1>(data, cursor, num_dependencies);
     if (dependencies == nullptr) {
         printf("Failed to read dependencies (count: %zu)\n", num_dependencies);
         return false;
@@ -302,7 +309,7 @@ bool parse_v1(std::span<const char> data, const std::unordered_map<uint32_t, uin
         mod_context.add_dependency(std::string{mod_id});
     }
 
-    const ImportV1* imports = reinterpret_data<ImportV1>(data, offset, num_imports);
+    const ImportV1* imports = read_struct<ImportV1>(data, cursor, num_imports);
     if (imports == nullptr) {
         printf("Failed to read imports (count: %zu)\n", num_imports);
         return false;
@@ -331,12 +338,12 @@ bool parse_v1(std::span<const char> data, const std::unordered_map<uint32_t, uin
         mod_context.add_import_symbol(std::string{import_name}, dependency_index);
     }
 
-    const DependencyEventV1* dependency_events = reinterpret_data<DependencyEventV1>(data, offset, num_dependency_events);
+    const DependencyEventV1* dependency_events = read_struct<DependencyEventV1>(data, cursor, num_dependency_events);
     if (dependency_events == nullptr) {
         printf("Failed to read dependency events (count: %zu)\n", num_dependency_events);
         return false;
     }
-    
+
     for (size_t dependency_event_index = 0; dependency_event_index < num_dependency_events; dependency_event_index++) {
         const DependencyEventV1& dependency_event_in = dependency_events[dependency_event_index];
         uint32_t name_start = dependency_event_in.name_start;
@@ -355,7 +362,7 @@ bool parse_v1(std::span<const char> data, const std::unordered_map<uint32_t, uin
         mod_context.add_dependency_event(std::string{dependency_event_name}, dependency_index, dummy_dependency_event_index);
     }
 
-    const ReplacementV1* replacements = reinterpret_data<ReplacementV1>(data, offset, num_replacements);
+    const ReplacementV1* replacements = read_struct<ReplacementV1>(data, cursor, num_replacements);
     if (replacements == nullptr) {
         printf("Failed to read replacements (count: %zu)\n", num_replacements);
         return false;
@@ -370,7 +377,7 @@ bool parse_v1(std::span<const char> data, const std::unordered_map<uint32_t, uin
         cur_replacement.flags = static_cast<N64Recomp::ReplacementFlags>(replacements[replacement_index].flags);
     }
 
-    const ExportV1* exports = reinterpret_data<ExportV1>(data, offset, num_exports);
+    const ExportV1* exports = read_struct<ExportV1>(data, cursor, num_exports);
     if (exports == nullptr) {
         printf("Failed to read exports (count: %zu)\n", num_exports);
         return false;
@@ -410,7 +417,7 @@ bool parse_v1(std::span<const char> data, const std::unordered_map<uint32_t, uin
         mod_context.functions[func_index].name = std::move(export_name);
     }
 
-    const CallbackV1* callbacks = reinterpret_data<CallbackV1>(data, offset, num_callbacks);
+    const CallbackV1* callbacks = read_struct<CallbackV1>(data, cursor, num_callbacks);
     if (callbacks == nullptr) {
         printf("Failed to read callbacks (count: %zu)\n", num_callbacks);
         return false;
@@ -439,7 +446,7 @@ bool parse_v1(std::span<const char> data, const std::unordered_map<uint32_t, uin
         }
     }
 
-    const EventV1* events = reinterpret_data<EventV1>(data, offset, num_provided_events);
+    const EventV1* events = read_struct<EventV1>(data, cursor, num_provided_events);
     if (events == nullptr) {
         printf("Failed to read events (count: %zu)\n", num_provided_events);
         return false;
@@ -461,7 +468,7 @@ bool parse_v1(std::span<const char> data, const std::unordered_map<uint32_t, uin
         mod_context.add_event_symbol(std::string{import_name});
     }
 
-    const HookV1* hooks = reinterpret_data<HookV1>(data, offset, num_hooks);
+    const HookV1* hooks = read_struct<HookV1>(data, cursor, num_hooks);
     if (hooks == nullptr) {
         printf("Failed to read hooks (count: %zu)\n", num_hooks);
         return false;
@@ -477,19 +484,20 @@ bool parse_v1(std::span<const char> data, const std::unordered_map<uint32_t, uin
         hook_out.flags = static_cast<N64Recomp::HookFlags>(hook_in.flags);
     }
 
-    return offset == data.size();
+    // A well-formed file ends exactly where the cursor lands.
+    return cursor == data.size();
 }
 
 N64Recomp::ModSymbolsError N64Recomp::parse_mod_symbols(std::span<const char> data, std::span<const uint8_t> binary, const std::unordered_map<uint32_t, uint16_t>& sections_by_vrom, Context& mod_context_out) {
-    size_t offset = 0;
+    size_t cursor = 0;
     mod_context_out = {};
-    const FileHeader* header = reinterpret_data<FileHeader>(data, offset);
+    const FileHeader* header = read_struct<FileHeader>(data, cursor);
 
     if (header == nullptr) {
         return ModSymbolsError::NotASymbolFile;
     }
 
-    if (!check_magic(header)) {
+    if (!magic_matches(header)) {
         return ModSymbolsError::NotASymbolFile;
     }
 
@@ -497,7 +505,7 @@ N64Recomp::ModSymbolsError N64Recomp::parse_mod_symbols(std::span<const char> da
 
     switch (header->version) {
         case 1:
-            valid = parse_v1(data, sections_by_vrom, mod_context_out);
+            valid = parse_symbols_v1(data, sections_by_vrom, mod_context_out);
             break;
         default:
             return ModSymbolsError::UnknownSymbolFileVersion;
@@ -508,7 +516,8 @@ N64Recomp::ModSymbolsError N64Recomp::parse_mod_symbols(std::span<const char> da
         return ModSymbolsError::CorruptSymbolFile;
     }
 
-    // Fill in the words for each function.
+    // The symbol file only records function sizes; copy the actual instruction
+    // words for each function out of the mod binary.
     for (auto& cur_func : mod_context_out.functions) {
         if (cur_func.rom + cur_func.words.size() * sizeof(cur_func.words[0]) > binary.size()) {
             mod_context_out = {};
@@ -523,14 +532,16 @@ N64Recomp::ModSymbolsError N64Recomp::parse_mod_symbols(std::span<const char> da
     return ModSymbolsError::Good;
 }
 
+// Append a raw struct's bytes to the output buffer.
 template <typename T>
-void vec_put(std::vector<uint8_t>& vec, const T* data) {
+void append_bytes(std::vector<uint8_t>& vec, const T* data) {
     size_t start_size = vec.size();
     vec.resize(vec.size() + sizeof(T));
     memcpy(vec.data() + start_size, data, sizeof(T));
 }
 
-void vec_put(std::vector<uint8_t>& vec, const std::string& data) {
+// Append a string's characters (no terminator) to the output buffer.
+void append_bytes(std::vector<uint8_t>& vec, const std::string& data) {
     size_t start_size = vec.size();
     vec.resize(vec.size() + data.size());
     memcpy(vec.data() + start_size, data.data(), data.size());
@@ -545,7 +556,7 @@ std::vector<uint8_t> N64Recomp::symbols_to_bin_v1(const N64Recomp::Context& cont
         .version = 1
     };
 
-    vec_put(ret, &header);
+    append_bytes(ret, &header);
 
     size_t num_dependencies = context.dependencies_by_name.size();
     size_t num_imported_funcs = context.import_symbols.size();
@@ -570,13 +581,13 @@ std::vector<uint8_t> N64Recomp::symbols_to_bin_v1(const N64Recomp::Context& cont
         .string_data_size = 0,
     };
 
-    // Record the sub-header offset so the string data size can be filled in later.
+    // Remember where the sub-header lands so its string_data_size can be patched once known.
     size_t sub_header_offset = ret.size();
-    vec_put(ret, &sub_header);
+    append_bytes(ret, &sub_header);
 
-    // Build the string data from the exports and imports.
+    // The string table begins here; every name below is appended and its offset recorded.
     size_t strings_start = ret.size();
-    
+
     // Order the dependencies by their index. This isn't necessary, but it makes the dependency name order
     // in the symbol file match the indices of the dependencies makes debugging easier.
     std::vector<std::string> dependencies_ordered{};
@@ -586,17 +597,17 @@ std::vector<uint8_t> N64Recomp::symbols_to_bin_v1(const N64Recomp::Context& cont
         dependencies_ordered[dependency_index] = dependency;
     }
 
-    // Track the start of every dependency's name in the string data.
+    // Record where each dependency's name begins within the string table.
     std::vector<uint32_t> dependency_name_positions{};
     dependency_name_positions.resize(num_dependencies);
     for (size_t dependency_index = 0; dependency_index < num_dependencies; dependency_index++) {
         const std::string& dependency = dependencies_ordered[dependency_index];
 
         dependency_name_positions[dependency_index] = static_cast<uint32_t>(ret.size() - strings_start);
-        vec_put(ret, dependency);
+        append_bytes(ret, dependency);
     }
 
-    // Track the start of every imported function's name in the string data.
+    // Record where each imported function's name begins within the string table.
     std::vector<uint32_t> imported_func_name_positions{};
     imported_func_name_positions.resize(num_imported_funcs);
     for (size_t import_index = 0; import_index < num_imported_funcs; import_index++) {
@@ -604,20 +615,20 @@ std::vector<uint8_t> N64Recomp::symbols_to_bin_v1(const N64Recomp::Context& cont
 
         // Write this import's name into the strings data.
         imported_func_name_positions[import_index] = static_cast<uint32_t>(ret.size() - strings_start);
-        vec_put(ret, imported_func.base.name);
+        append_bytes(ret, imported_func.base.name);
     }
 
-    // Track the start of every dependency event's name in the string data.
+    // Record where each dependency event's name begins within the string table.
     std::vector<uint32_t> dependency_event_name_positions{};
     dependency_event_name_positions.resize(num_dependency_events);
     for (size_t dependency_event_index = 0; dependency_event_index < num_dependency_events; dependency_event_index++) {
         const DependencyEvent& dependency_event = context.dependency_events[dependency_event_index];
 
         dependency_event_name_positions[dependency_event_index] = static_cast<uint32_t>(ret.size() - strings_start);
-        vec_put(ret, dependency_event.event_name);
+        append_bytes(ret, dependency_event.event_name);
     }
-    
-    // Track the start of every exported function's name in the string data.
+
+    // Record where each exported function's name begins within the string table.
     std::vector<uint32_t> exported_func_name_positions{};
     exported_func_name_positions.resize(num_exported_funcs);
     for (size_t export_index = 0; export_index < num_exported_funcs; export_index++) {
@@ -625,10 +636,10 @@ std::vector<uint8_t> N64Recomp::symbols_to_bin_v1(const N64Recomp::Context& cont
         const Function& exported_func = context.functions[function_index];
 
         exported_func_name_positions[export_index] = static_cast<uint32_t>(ret.size() - strings_start);
-        vec_put(ret, exported_func.name);
+        append_bytes(ret, exported_func.name);
     }
 
-    // Track the start of every provided event's name in the string data.
+    // Record where each provided event's name begins within the string table.
     std::vector<uint32_t> event_name_positions{};
     event_name_positions.resize(num_events);
     for (size_t event_index = 0; event_index < num_events; event_index++) {
@@ -636,14 +647,14 @@ std::vector<uint8_t> N64Recomp::symbols_to_bin_v1(const N64Recomp::Context& cont
 
         // Write this event's name into the strings data.
         event_name_positions[event_index] = static_cast<uint32_t>(ret.size() - strings_start);
-        vec_put(ret, event_symbol.base.name);
+        append_bytes(ret, event_symbol.base.name);
     }
 
-    // Align the data after the strings to 4 bytes.
-    size_t strings_size = round_up_4(ret.size() - strings_start);
+    // Pad the string table out to a 4-byte boundary so following structs stay aligned.
+    size_t strings_size = align_up_4(ret.size() - strings_start);
     ret.resize(strings_size + strings_start);
 
-    // Fill in the string data size in the sub-header.
+    // Now that the string table size is known, patch it into the sub-header.
     reinterpret_cast<FileSubHeaderV1*>(ret.data() + sub_header_offset)->string_data_size = strings_size;
 
     for (size_t section_index = 0; section_index < context.sections.size(); section_index++) {
@@ -657,16 +668,16 @@ std::vector<uint8_t> N64Recomp::symbols_to_bin_v1(const N64Recomp::Context& cont
             .num_relocs = static_cast<uint32_t>(cur_section.relocs.size())
         };
 
-        vec_put(ret, &section_out);
+        append_bytes(ret, &section_out);
 
         for (size_t func_index : context.section_functions[section_index]) {
             const Function& cur_func = context.functions[func_index];
             FuncV1 func_out {
                 .section_offset = cur_func.vram - cur_section.ram_addr,
-                .size = (uint32_t)(cur_func.words.size() * sizeof(cur_func.words[0])) 
+                .size = (uint32_t)(cur_func.words.size() * sizeof(cur_func.words[0]))
             };
 
-            vec_put(ret, &func_out);
+            append_bytes(ret, &func_out);
         }
 
         for (size_t reloc_index = 0; reloc_index < cur_section.relocs.size(); reloc_index++) {
@@ -704,7 +715,7 @@ std::vector<uint8_t> N64Recomp::symbols_to_bin_v1(const N64Recomp::Context& cont
                 .target_section_vrom = target_section_vrom
             };
 
-            vec_put(ret, &reloc_out);
+            append_bytes(ret, &reloc_out);
         }
     }
 
@@ -717,7 +728,7 @@ std::vector<uint8_t> N64Recomp::symbols_to_bin_v1(const N64Recomp::Context& cont
             .mod_id_size = static_cast<uint32_t>(dependency.size())
         };
 
-        vec_put(ret, &dependency_out);
+        append_bytes(ret, &dependency_out);
     }
 
     // Write the imported functions.
@@ -731,7 +742,7 @@ std::vector<uint8_t> N64Recomp::symbols_to_bin_v1(const N64Recomp::Context& cont
             .dependency = static_cast<uint32_t>(imported_func.dependency_index)
         };
 
-        vec_put(ret, &import_out);
+        append_bytes(ret, &import_out);
     }
 
     // Write the dependency events.
@@ -744,7 +755,7 @@ std::vector<uint8_t> N64Recomp::symbols_to_bin_v1(const N64Recomp::Context& cont
             .dependency = static_cast<uint32_t>(dependency_event.dependency_index)
         };
 
-        vec_put(ret, &dependency_event_out);
+        append_bytes(ret, &dependency_event_out);
     }
 
     // Write the function replacements.
@@ -761,7 +772,7 @@ std::vector<uint8_t> N64Recomp::symbols_to_bin_v1(const N64Recomp::Context& cont
             .flags = flags
         };
 
-        vec_put(ret, &replacement_out);
+        append_bytes(ret, &replacement_out);
     };
 
     // Write the exported functions.
@@ -775,7 +786,7 @@ std::vector<uint8_t> N64Recomp::symbols_to_bin_v1(const N64Recomp::Context& cont
             .name_size = static_cast<uint32_t>(exported_func.name.size())
         };
 
-        vec_put(ret, &export_out);
+        append_bytes(ret, &export_out);
     }
 
     // Write the callbacks.
@@ -787,7 +798,7 @@ std::vector<uint8_t> N64Recomp::symbols_to_bin_v1(const N64Recomp::Context& cont
             .function_index = static_cast<uint32_t>(callback.function_index)
         };
 
-        vec_put(ret, &callback_out);
+        append_bytes(ret, &callback_out);
     }
 
     // Write the provided events.
@@ -799,7 +810,7 @@ std::vector<uint8_t> N64Recomp::symbols_to_bin_v1(const N64Recomp::Context& cont
             .name_size = static_cast<uint32_t>(event_symbol.base.name.size())
         };
 
-        vec_put(ret, &event_out);
+        append_bytes(ret, &event_out);
     }
 
     // Write the hooks.
@@ -816,7 +827,7 @@ std::vector<uint8_t> N64Recomp::symbols_to_bin_v1(const N64Recomp::Context& cont
             .flags = flags
         };
 
-        vec_put(ret, &hook_out);
+        append_bytes(ret, &hook_out);
     }
 
     return ret;

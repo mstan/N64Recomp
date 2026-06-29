@@ -6,22 +6,25 @@
 #include "recompiler/context.h"
 #include "rabbitizer.hpp"
 
-static std::vector<uint8_t> read_file(const std::filesystem::path& path, bool& found) {
-    std::vector<uint8_t> ret;
-    found = false;
+// Slurp an entire file into a byte buffer. The success flag is set through
+// the out-parameter so the caller can distinguish an empty file from a
+// missing one.
+static std::vector<uint8_t> slurp_file(const std::filesystem::path& path, bool& ok) {
+    std::vector<uint8_t> bytes;
+    ok = false;
 
-    std::ifstream file{ path, std::ios::binary};
+    std::ifstream stream{ path, std::ios::binary };
 
-    if (file.good()) {
-        file.seekg(0, std::ios::end);
-        ret.resize(file.tellg());
-        file.seekg(0, std::ios::beg);
+    if (stream.good()) {
+        stream.seekg(0, std::ios::end);
+        bytes.resize(stream.tellg());
+        stream.seekg(0, std::ios::beg);
 
-        file.read(reinterpret_cast<char*>(ret.data()), ret.size());
-        found = true;
+        stream.read(reinterpret_cast<char*>(bytes.data()), bytes.size());
+        ok = true;
     }
 
-    return ret;
+    return bytes;
 }
 
 int main(int argc, const char** argv) {
@@ -29,24 +32,30 @@ int main(int argc, const char** argv) {
         printf("Usage: %s [mod symbol file] [mod binary file] [recomp symbols file] [output C file]\n", argv[0]);
         return EXIT_SUCCESS;
     }
-    bool found;
-    std::vector<uint8_t> symbol_data = read_file(argv[1], found);
-    if (!found) {
+
+    bool loaded;
+
+    // The mod's serialized symbol blob.
+    std::vector<uint8_t> mod_symbol_bytes = slurp_file(argv[1], loaded);
+    if (!loaded) {
         fprintf(stderr, "Failed to open symbol file\n");
         return EXIT_FAILURE;
     }
 
-    std::vector<uint8_t> rom_data = read_file(argv[2], found);
-    if (!found) {
+    // The mod's recompiled binary image.
+    std::vector<uint8_t> mod_binary_bytes = slurp_file(argv[2], loaded);
+    if (!loaded) {
         fprintf(stderr, "Failed to open ROM\n");
         return EXIT_FAILURE;
     }
 
-    std::span<const char> symbol_data_span { reinterpret_cast<const char*>(symbol_data.data()), symbol_data.size() };
+    std::span<const char> mod_symbol_span { reinterpret_cast<const char*>(mod_symbol_bytes.data()), mod_symbol_bytes.size() };
 
-    std::vector<uint8_t> dummy_rom{};
+    // Load the base game's symbols. These share the recompilation symbol file
+    // format, so they go through the same loader into a throwaway context.
+    std::vector<uint8_t> empty_rom{};
     N64Recomp::Context reference_context{};
-    if (!N64Recomp::Context::from_symbol_file(argv[3], std::move(dummy_rom), reference_context, false)) {
+    if (!N64Recomp::Context::from_symbol_file(argv[3], std::move(empty_rom), reference_context, false)) {
         printf("Failed to load provided function reference symbol file\n");
         return EXIT_FAILURE;
     }
@@ -58,6 +67,8 @@ int main(int argc, const char** argv) {
     //    }
     //}
 
+    // Index the reference sections by their ROM (vrom) address so relocs can
+    // resolve which base-game section they point at.
     std::unordered_map<uint32_t, uint16_t> sections_by_vrom{};
     for (uint16_t section_index = 0; section_index < reference_context.sections.size(); section_index++) {
         sections_by_vrom[reference_context.sections[section_index].rom_addr] = section_index;
@@ -65,7 +76,7 @@ int main(int argc, const char** argv) {
 
     N64Recomp::Context mod_context;
 
-	N64Recomp::ModSymbolsError error = N64Recomp::parse_mod_symbols(symbol_data_span, rom_data, sections_by_vrom, mod_context);
+    N64Recomp::ModSymbolsError error = N64Recomp::parse_mod_symbols(mod_symbol_span, mod_binary_bytes, sections_by_vrom, mod_context);
     if (error != N64Recomp::ModSymbolsError::Good) {
         fprintf(stderr, "Error parsing mod symbols: %d\n", (int)error);
         return EXIT_FAILURE;
@@ -73,7 +84,9 @@ int main(int argc, const char** argv) {
 
     mod_context.import_reference_context(reference_context);
 
-    // Populate R_MIPS_26 reloc symbol indices. Start by building a map of vram address to matching reference symbols.
+    // R_MIPS_26 relocs carry no symbol index from the symbol file, so resolve
+    // them here. First, group every reference symbol by the vram address it
+    // resolves to.
     std::unordered_map<uint32_t, std::vector<size_t>> reference_symbols_by_vram{};
     for (size_t reference_symbol_index = 0; reference_symbol_index < mod_context.num_regular_reference_symbols(); reference_symbol_index++) {
         const auto& sym = mod_context.get_regular_reference_symbol(reference_symbol_index);
@@ -83,8 +96,9 @@ int main(int argc, const char** argv) {
             reference_symbols_by_vram[section_vram + sym.section_offset].push_back(reference_symbol_index);
         }
     }
-    
-    // Use the mapping to populate the symbol index for every R_MIPS_26 reference symbol reloc. 
+
+    // Walk the relocs and assign each R_MIPS_26 reference reloc the symbol that
+    // lives in the section it targets.
     for (auto& section : mod_context.sections) {
         for (auto& reloc : section.relocs) {
             if (reloc.type == N64Recomp::RelocType::R_MIPS_26 && reloc.reference_symbol) {
@@ -92,19 +106,19 @@ int main(int argc, const char** argv) {
                     uint32_t section_vram = mod_context.get_reference_section_vram(reloc.target_section);
                     uint32_t target_vram = section_vram + reloc.target_section_offset;
 
-                    auto find_funcs_it = reference_symbols_by_vram.find(target_vram);
-                    bool found = false;
-                    if (find_funcs_it != reference_symbols_by_vram.end()) {
-                        for (size_t symbol_index : find_funcs_it->second) {
+                    auto candidates_it = reference_symbols_by_vram.find(target_vram);
+                    bool resolved = false;
+                    if (candidates_it != reference_symbols_by_vram.end()) {
+                        for (size_t symbol_index : candidates_it->second) {
                             const auto& cur_symbol = mod_context.get_reference_symbol(reloc.target_section, symbol_index);
                             if (cur_symbol.section_index == reloc.target_section) {
                                 reloc.symbol_index = symbol_index;
-                                found = true;
+                                resolved = true;
                                 break;
                             }
                         }
                     }
-                    if (!found) {
+                    if (!resolved) {
                         fprintf(stderr, "Failed to find R_MIPS_26 relocation target in section %d with vram 0x%08X\n", reloc.target_section, target_vram);
                         return EXIT_FAILURE;
                     }
@@ -113,7 +127,7 @@ int main(int argc, const char** argv) {
         }
     }
 
-    mod_context.rom = std::move(rom_data);
+    mod_context.rom = std::move(mod_binary_bytes);
 
     std::vector<std::vector<uint32_t>> static_funcs_by_section{};
     static_funcs_by_section.resize(mod_context.sections.size());
@@ -134,7 +148,8 @@ int main(int argc, const char** argv) {
 
     output_file << "// Values populated by the runtime:\n\n";
 
-    // Write import function pointer array and defines (i.e. `#define testmod_inner_import imported_funcs[0]`)
+    // Emit the imported-function pointer table plus a #define aliasing each
+    // import name to its slot (e.g. `#define testmod_inner_import imported_funcs[0]`).
     output_file << "// Array of pointers to imported functions with defines to alias their names.\n";
     size_t num_imports = mod_context.import_symbols.size();
     for (size_t import_index = 0; import_index < num_imports; import_index++) {
@@ -145,7 +160,8 @@ int main(int argc, const char** argv) {
     output_file << "RECOMP_EXPORT recomp_func_t* imported_funcs[" << std::max(size_t{1}, num_imports) << "] = {0};\n";
     output_file << "\n";
 
-    // Use reloc list to write reference symbol function pointer array and defines (i.e. `#define func_80102468 reference_symbol_funcs[0]`)
+    // Scan the relocs to emit the reference-symbol pointer table plus aliasing
+    // defines (e.g. `#define func_80102468 reference_symbol_funcs[0]`).
     output_file << "// Array of pointers to functions from the original ROM with defines to alias their names.\n";
     std::unordered_set<std::string> written_reference_symbols{};
     size_t num_reference_symbols = 0;
@@ -154,8 +170,10 @@ int main(int argc, const char** argv) {
             if (reloc.type == N64Recomp::RelocType::R_MIPS_26 && reloc.reference_symbol && mod_context.is_regular_reference_section(reloc.target_section)) {
                 const auto& sym = mod_context.get_reference_symbol(reloc.target_section, reloc.symbol_index);
 
-                // Prevent writing multiple of the same define. This means there are duplicate symbols in the array if a function is called more than once,
-                // but only the first of each set of duplicates is referenced. This is acceptable, since offline mod recompilation is mainly meant for debug purposes.
+                // Only emit one define per unique name. A symbol called more
+                // than once therefore leaves duplicate (unused) slots in the
+                // table, which is fine since offline recompilation is a debug
+                // aid rather than a production path.
                 if (!written_reference_symbols.contains(sym.name)) {
                     output_file << "#define " << sym.name << " reference_symbol_funcs[" << num_reference_symbols << "]\n";
                     written_reference_symbols.emplace(sym.name);
@@ -164,7 +182,8 @@ int main(int argc, const char** argv) {
             }
         }
     }
-    // C doesn't allow 0-sized arrays, so always add at least one member to all arrays. The actual size will be pulled from the mod symbols.
+    // C forbids zero-length arrays, so guarantee at least one slot in each
+    // table. The real size comes from the mod symbols.
     output_file << "RECOMP_EXPORT recomp_func_t* reference_symbol_funcs[" << std::max(size_t{1},num_reference_symbols) << "] = {0};\n\n";
 
     // Write provided event array (maps internal event indices to global ones).
@@ -204,14 +223,16 @@ int main(int argc, const char** argv) {
     output_file << "// Array of this mod's loaded section addresses.\n";
     output_file << "RECOMP_EXPORT int32_t section_addresses[" << std::max(size_t{1}, num_sections) << "] = {0};\n\n";
 
-    // Create a set of the export indices to avoid renaming them.
+    // Collect the exported function indices so the naming pass leaves their
+    // symbol-file names intact.
     std::unordered_set<size_t> export_indices{mod_context.exported_funcs.begin(), mod_context.exported_funcs.end()};
 
-    // Name all the functions in a first pass so function calls emitted in the second are correct. Also emit function prototypes.
+    // First pass: assign every non-export a generated name (so calls emitted in
+    // the second pass resolve correctly) and emit a prototype for each function.
     output_file << "// Function prototypes.\n";
     for (size_t func_index = 0; func_index < mod_context.functions.size(); func_index++) {
         auto& func = mod_context.functions[func_index];
-        // Don't rename exports since they already have a name from the mod symbol file.
+        // Exports keep the name they were given in the mod symbol file.
         if (!export_indices.contains(func_index)) {
             func.name = "mod_func_" + std::to_string(func_index);
         }
@@ -219,7 +240,7 @@ int main(int argc, const char** argv) {
     }
     output_file << "\n";
 
-    // Perform a second pass for recompiling all the functions.
+    // Second pass: recompile every function body.
     for (size_t func_index = 0; func_index < mod_context.functions.size(); func_index++) {
         if (!N64Recomp::recompile_function(mod_context, func_index, output_file, static_funcs_by_section, true)) {
             output_file.close();
@@ -229,5 +250,5 @@ int main(int argc, const char** argv) {
         }
     }
 
-	return EXIT_SUCCESS;
+    return EXIT_SUCCESS;
 }

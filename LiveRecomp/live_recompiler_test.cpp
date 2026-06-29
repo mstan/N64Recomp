@@ -7,42 +7,46 @@
 #include "recompiler/live_recompiler.h"
 #include "recomp.h"
 
-static std::vector<uint8_t> read_file(const std::filesystem::path& path, bool& found) {
-    std::vector<uint8_t> ret;
-    found = false;
+// Read a whole file into a byte vector; reports success via the out flag.
+static std::vector<uint8_t> load_file(const std::filesystem::path& path, bool& ok) {
+    std::vector<uint8_t> bytes;
+    ok = false;
 
-    std::ifstream file{ path, std::ios::binary};
+    std::ifstream stream{ path, std::ios::binary };
 
-    if (file.good()) {
-        file.seekg(0, std::ios::end);
-        ret.resize(file.tellg());
-        file.seekg(0, std::ios::beg);
+    if (stream.good()) {
+        stream.seekg(0, std::ios::end);
+        bytes.resize(stream.tellg());
+        stream.seekg(0, std::ios::beg);
 
-        file.read(reinterpret_cast<char*>(ret.data()), ret.size());
-        found = true;
+        stream.read(reinterpret_cast<char*>(bytes.data()), bytes.size());
+        ok = true;
     }
 
-    return ret;
+    return bytes;
 }
 
-
-uint32_t read_u32_swap(const std::vector<uint8_t>& vec, size_t offset) {
+// Read a big-endian (byteswapped) 32-bit word out of a buffer.
+uint32_t read_be_u32(const std::vector<uint8_t>& vec, size_t offset) {
     return byteswap(*reinterpret_cast<const uint32_t*>(&vec[offset]));
 }
 
-uint32_t read_u32(const std::vector<uint8_t>& vec, size_t offset) {
+// Read a host-endian 32-bit word out of a buffer.
+uint32_t read_host_u32(const std::vector<uint8_t>& vec, size_t offset) {
     return *reinterpret_cast<const uint32_t*>(&vec[offset]);
 }
 
 std::vector<uint8_t> rdram;
 
-void byteswap_copy(uint8_t* dst, uint8_t* src, size_t count) {
+// Copy bytes while flipping each within its 4-byte lane (host <-> N64 endianness).
+void copy_byteswapped(uint8_t* dst, uint8_t* src, size_t count) {
     for (size_t i = 0; i < count; i++) {
         dst[i ^ 3] = src[i];
     }
 }
 
-bool byteswap_compare(uint8_t* a, uint8_t* b, size_t count) {
+// Compare two buffers where the first is stored byteswapped within 4-byte lanes.
+bool compare_byteswapped(uint8_t* a, uint8_t* b, size_t count) {
     for (size_t i = 0; i < count; i++) {
         if (a[i ^ 3] != b[i]) {
             return false;
@@ -66,13 +70,16 @@ struct TestStats {
     uint64_t code_size;
 };
 
-void write1(uint8_t* rdram, recomp_context* ctx) {
+// Stand-in imported function used by the test harness: stores 1 to the byte
+// addressed by argument register a0.
+void store_one(uint8_t* rdram, recomp_context* ctx) {
     MEM_B(0, ctx->r4) = 1;
 }
 
+// Resolves the single vram the tests are allowed to call into.
 recomp_func_t* test_get_function(int32_t vram) {
     if (vram == 0x80100000) {
-        return write1;
+        return store_one;
     }
     assert(false);
     return nullptr;
@@ -87,36 +94,37 @@ TestStats run_test(const std::filesystem::path& tests_dir, const std::string& te
     std::filesystem::path data_dump_path = tests_dir / (test_name + "_data_out.bin");
 
     bool found;
-    std::vector<uint8_t> file_data = read_file(input_path, found);
+    std::vector<uint8_t> file_data = load_file(input_path, found);
 
     if (!found) {
         printf("Failed to open file: %s\n", input_path.string().c_str());
         return { TestError::FailedToOpenInput };
     }
 
-    // Parse the test file.
-    uint32_t text_offset = read_u32_swap(file_data, 0x00);
-    uint32_t text_length = read_u32_swap(file_data, 0x04);
-    uint32_t init_data_offset = read_u32_swap(file_data, 0x08);
-    uint32_t good_data_offset = read_u32_swap(file_data, 0x0C);
-    uint32_t data_length = read_u32_swap(file_data, 0x10);
-    uint32_t text_address = read_u32_swap(file_data, 0x14);
-    uint32_t data_address = read_u32_swap(file_data, 0x18);
-    uint32_t next_struct_address = read_u32_swap(file_data, 0x1C);
+    // Decode the fixed-size test header.
+    uint32_t text_offset = read_be_u32(file_data, 0x00);
+    uint32_t text_length = read_be_u32(file_data, 0x04);
+    uint32_t init_data_offset = read_be_u32(file_data, 0x08);
+    uint32_t good_data_offset = read_be_u32(file_data, 0x0C);
+    uint32_t data_length = read_be_u32(file_data, 0x10);
+    uint32_t text_address = read_be_u32(file_data, 0x14);
+    uint32_t data_address = read_be_u32(file_data, 0x18);
+    uint32_t next_struct_address = read_be_u32(file_data, 0x1C);
 
     recomp_context ctx{};
 
-    byteswap_copy(&rdram[text_address - 0x80000000], &file_data[text_offset], text_length);
-    byteswap_copy(&rdram[data_address - 0x80000000], &file_data[init_data_offset], data_length);
+    // Stage the code and the initial data into emulated RDRAM.
+    copy_byteswapped(&rdram[text_address - 0x80000000], &file_data[text_offset], text_length);
+    copy_byteswapped(&rdram[data_address - 0x80000000], &file_data[init_data_offset], data_length);
 
     // Build recompiler context.
     N64Recomp::Context context{};
 
-    // Move the file data into the context.
+    // Hand ownership of the file bytes to the context's ROM buffer.
     context.rom = std::move(file_data);
 
     context.sections.resize(2);
-    // Create a section for the function to exist in.
+    // Section 0 holds the code under test.
     context.sections[0].ram_addr = text_address;
     context.sections[0].rom_addr = text_offset;
     context.sections[0].size = text_length;
@@ -124,7 +132,7 @@ TestStats run_test(const std::filesystem::path& tests_dir, const std::string& te
     context.sections[0].executable = true;
     context.sections[0].relocatable = true;
     context.section_functions.resize(context.sections.size());
-    // Create a section for .data (used for relocations)
+    // Section 1 holds .data, which relocations can point at.
     context.sections[1].ram_addr = data_address;
     context.sections[1].rom_addr = init_data_offset;
     context.sections[1].size = data_length;
@@ -136,11 +144,11 @@ TestStats run_test(const std::filesystem::path& tests_dir, const std::string& te
     uint32_t function_desc_address = 0;
     uint32_t reloc_desc_address = 0;
 
-    // Read any extra structs.
+    // Walk the optional linked list of extra descriptor structs.
     while (next_struct_address != 0) {
         uint32_t cur_struct_address = next_struct_address;
-        uint32_t struct_type = read_u32_swap(context.rom, next_struct_address + 0x00);
-        next_struct_address = read_u32_swap(context.rom, next_struct_address + 0x04);
+        uint32_t struct_type = read_be_u32(context.rom, next_struct_address + 0x00);
+        next_struct_address = read_be_u32(context.rom, next_struct_address + 0x04);
 
         switch (struct_type) {
             case 1: // Function desc
@@ -155,18 +163,16 @@ TestStats run_test(const std::filesystem::path& tests_dir, const std::string& te
         }
     }
 
-    // Check if a function description exists.
+    // Without a function descriptor, the whole .text blob is a single function.
     if (function_desc_address == 0) {
-        // No function description, so treat the whole thing as one function.
-
-        // Get the function's instruction words.
+        // Pull out the function's instruction words.
         std::vector<uint32_t> text_words{};
         text_words.resize(text_length / sizeof(uint32_t));
         for (size_t i = 0; i < text_words.size(); i++) {
-            text_words[i] = read_u32(context.rom, text_offset + i * sizeof(uint32_t));
+            text_words[i] = read_host_u32(context.rom, text_offset + i * sizeof(uint32_t));
         }
 
-        // Add the function to the context.
+        // Register the single function with the context.
         context.functions_by_vram[text_address].emplace_back(context.functions.size());
         context.section_functions.emplace_back(context.functions.size());
         context.sections[0].function_addrs.emplace_back(text_address);
@@ -180,23 +186,23 @@ TestStats run_test(const std::filesystem::path& tests_dir, const std::string& te
         start_func_index = 0;
     }
     else {
-        // Use the function description.
-        uint32_t num_funcs = read_u32_swap(context.rom, function_desc_address + 0x08);
-        start_func_index = read_u32_swap(context.rom, function_desc_address + 0x0C);
+        // A descriptor is present, so split .text into the listed functions.
+        uint32_t num_funcs = read_be_u32(context.rom, function_desc_address + 0x08);
+        start_func_index = read_be_u32(context.rom, function_desc_address + 0x0C);
 
         for (size_t func_index = 0; func_index < num_funcs; func_index++) {
-            uint32_t cur_func_address = read_u32_swap(context.rom, function_desc_address + 0x10 + 0x00 + 0x08 * func_index);
-            uint32_t cur_func_length = read_u32_swap(context.rom, function_desc_address + 0x10 + 0x04 + 0x08 * func_index);
+            uint32_t cur_func_address = read_be_u32(context.rom, function_desc_address + 0x10 + 0x00 + 0x08 * func_index);
+            uint32_t cur_func_length = read_be_u32(context.rom, function_desc_address + 0x10 + 0x04 + 0x08 * func_index);
             uint32_t cur_func_offset = cur_func_address - text_address + text_offset;
 
-            // Get the function's instruction words.
+            // Pull out this function's instruction words.
             std::vector<uint32_t> text_words{};
             text_words.resize(cur_func_length / sizeof(uint32_t));
             for (size_t i = 0; i < text_words.size(); i++) {
-                text_words[i] = read_u32(context.rom, cur_func_offset + i * sizeof(uint32_t));
+                text_words[i] = read_host_u32(context.rom, cur_func_offset + i * sizeof(uint32_t));
             }
 
-            // Add the function to the context.
+            // Register this function with the context.
             context.functions_by_vram[cur_func_address].emplace_back(context.functions.size());
             context.section_functions.emplace_back(context.functions.size());
             context.sections[0].function_addrs.emplace_back(cur_func_address);
@@ -210,15 +216,15 @@ TestStats run_test(const std::filesystem::path& tests_dir, const std::string& te
         }
     }
 
-    // Check if a relocation description exists.
+    // Apply the relocation descriptor if the test provides one.
     if (reloc_desc_address != 0) {
-        uint32_t num_relocs = read_u32_swap(context.rom, reloc_desc_address + 0x08);
+        uint32_t num_relocs = read_be_u32(context.rom, reloc_desc_address + 0x08);
         for (uint32_t reloc_index = 0; reloc_index < num_relocs; reloc_index++) {
             uint32_t cur_desc_address = reloc_desc_address + 0x0C + reloc_index * 4 * sizeof(uint32_t);
-            uint32_t reloc_type = read_u32_swap(context.rom, cur_desc_address + 0x00);
-            uint32_t reloc_section = read_u32_swap(context.rom, cur_desc_address + 0x04);
-            uint32_t reloc_address = read_u32_swap(context.rom, cur_desc_address + 0x08);
-            uint32_t reloc_target_offset = read_u32_swap(context.rom, cur_desc_address + 0x0C);
+            uint32_t reloc_type = read_be_u32(context.rom, cur_desc_address + 0x00);
+            uint32_t reloc_section = read_be_u32(context.rom, cur_desc_address + 0x04);
+            uint32_t reloc_address = read_be_u32(context.rom, cur_desc_address + 0x08);
+            uint32_t reloc_target_offset = read_be_u32(context.rom, cur_desc_address + 0x0C);
 
             context.sections[0].relocs.emplace_back(N64Recomp::Reloc{
                 .address = reloc_address,
@@ -245,7 +251,7 @@ TestStats run_test(const std::filesystem::path& tests_dir, const std::string& te
         .local_section_addresses = section_addresses.data()
     };
 
-    // Create the sljit compiler and the generator.
+    // Stand up the sljit-backed live generator.
     N64Recomp::LiveGenerator generator{ context.functions.size(), generator_inputs };
 
     for (size_t func_index = 0; func_index < context.functions.size(); func_index++) {
@@ -258,7 +264,7 @@ TestStats run_test(const std::filesystem::path& tests_dir, const std::string& te
         }
     }
 
-    // Generate the code.
+    // Finalize codegen into runnable function pointers.
     N64Recomp::LiveGeneratorOutput output = generator.finish();
 
     auto after_codegen = std::chrono::system_clock::now();
@@ -267,7 +273,7 @@ TestStats run_test(const std::filesystem::path& tests_dir, const std::string& te
 
     int old_rounding = fegetround();
 
-    // Run the generated code.
+    // Execute the generated entry function.
     ctx.r29 = 0xFFFFFFFF80000000 + rdram.size() - 0x10; // Set the stack pointer.
     output.functions[start_func_index](rdram.data(), &ctx);
 
@@ -275,20 +281,20 @@ TestStats run_test(const std::filesystem::path& tests_dir, const std::string& te
 
     auto after_execution = std::chrono::system_clock::now();
 
-    // Check the result of running the code.
-    bool good = byteswap_compare(&rdram[data_address - 0x80000000], &context.rom[good_data_offset], data_length);
+    // Compare the resulting data region against the expected ("good") copy.
+    bool good = compare_byteswapped(&rdram[data_address - 0x80000000], &context.rom[good_data_offset], data_length);
 
-    // Dump the data if the results don't match.
+    // On mismatch, dump the produced data (re-swapped back to N64 order) for inspection.
     if (!good) {
         std::ofstream data_dump_file{ data_dump_path, std::ios::binary };
         std::vector<uint8_t> data_swapped;
         data_swapped.resize(data_length);
-        byteswap_copy(data_swapped.data(), &rdram[data_address - 0x80000000], data_length);
+        copy_byteswapped(data_swapped.data(), &rdram[data_address - 0x80000000], data_length);
         data_dump_file.write(reinterpret_cast<char*>(data_swapped.data()), data_length);
         return { TestError::DataDifference };
     }
 
-    // Return the test's stats.
+    // Gather timing and size stats for a passing test.
     TestStats ret{};
     ret.error = TestError::Success;
     ret.codegen_microseconds = std::chrono::duration_cast<std::chrono::microseconds>(after_codegen - before_codegen).count();
@@ -308,7 +314,7 @@ int main(int argc, const char** argv) {
 
     rdram.resize(0x8000000);
 
-    // Skip the first argument (program name) and second argument (test directory).
+    // argv[0] is the program and argv[1] is the test directory; the rest are tests.
     int count = argc - 1 - 1;
     int passed_count = 0;
 
