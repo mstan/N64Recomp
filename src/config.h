@@ -1,23 +1,32 @@
-#ifndef __RECOMP_CONFIG_H__
-#define __RECOMP_CONFIG_H__
+#ifndef N64RECOMP_CONFIG_H
+#define N64RECOMP_CONFIG_H
 
 #include <cstdint>
 #include <filesystem>
 #include <vector>
 
+// Parsed recompiler configuration. Config mirrors the TOML config file: the
+// [input]/[output] options plus the per-function modifier lists (stubs, ignores,
+// renames, instruction patches, hooks, manual sizes/functions) and the
+// decompressed-section descriptors. The structs below are the in-memory shape
+// each config section is read into by config.cpp.
+
 namespace N64Recomp {
+    // One-instruction override: replace the word at `vram` in `func_name`.
     struct InstructionPatch {
         std::string func_name;
         int32_t vram;
         uint32_t value;
     };
 
+    // Inject literal text into a function's output just before `before_vram`.
     struct FunctionTextHook {
         std::string func_name;
         int32_t before_vram;
         std::string text;
     };
 
+    // Manual size override for a function the symbol table sized as zero.
     struct FunctionSize {
         std::string func_name;
         uint32_t size_bytes;
@@ -25,6 +34,8 @@ namespace N64Recomp {
         FunctionSize(const std::string& func_name, uint32_t size_bytes) : func_name(std::move(func_name)), size_bytes(size_bytes) {}
     };
 
+    // A function declared entirely by the config (name + section + address +
+    // size) rather than discovered from the symbol table.
     struct ManualFunction {
         std::string func_name;
         std::string section_name;
@@ -92,6 +103,8 @@ namespace N64Recomp {
         Suffix,
     };
 
+    // The fully-parsed configuration handed to the recompiler driver. The
+    // good()/bad pair reports whether construction (parsing) succeeded.
     struct Config {
         int32_t entrypoint;
         int32_t functions_per_output_file;
