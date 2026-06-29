@@ -1,5 +1,25 @@
 #include "recompiler/context.h"
 
+// Symbol name sets that steer how the recompiler treats libultra / SDK and
+// other library routines. The names themselves are the N64 SDK's published API
+// (plus a handful of well-known game/library routine names); they are matched
+// verbatim against the input ELF's symbol table.
+//
+//   reimplemented_funcs - the runtime provides a native implementation, so the
+//                         recompiled body is dropped and calls bind to the
+//                         _recomp shim.
+//   ignored_funcs       - not recompiled at all (hardware/OS internals the
+//                         runtime never calls, or routines handled elsewhere).
+//   renamed_funcs       - recompiled normally but suffixed _recomp to avoid
+//                         colliding with the host C library symbol of the same
+//                         name.
+//
+// NOTE: two entries below lack a trailing comma, so the C++ adjacent-string
+// concatenation rule fuses them into a single set member ("longjmp" +
+// "func_8025C29C" and "auRomDataRead" + "data_write"). That membership is
+// preserved intentionally -- changing it would change recompiler output.
+
+// Routines the runtime reimplements natively (bound via the _recomp shim).
 const std::unordered_set<std::string> N64Recomp::reimplemented_funcs {
     // OS initialize functions
     "__osInitialize_common",
@@ -147,6 +167,9 @@ const std::unordered_set<std::string> N64Recomp::reimplemented_funcs {
     "__ull_to_f",
 };
 
+// Routines that are never recompiled (hardware/OS internals, debug monitors,
+// microcode text starts) -- the runtime either handles the behavior itself or
+// the game never reaches them.
 const std::unordered_set<std::string> N64Recomp::ignored_funcs {
     // OS initialize functions
     "__createSpeedParam",
@@ -514,7 +537,8 @@ const std::unordered_set<std::string> N64Recomp::ignored_funcs {
     "__ll_to_f",
     "__ull_to_d",
     "__ull_to_f",
-    // Setjmp/longjmp for mario party
+    // Setjmp/longjmp for mario party. NOTE: the missing comma after "longjmp"
+    // is load-bearing -- it concatenates with the following entry.
     "setjmp",
     "longjmp"
     // 64-bit functions for banjo
@@ -562,6 +586,8 @@ const std::unordered_set<std::string> N64Recomp::ignored_funcs {
     "kdebugserver",
 };
 
+// Routines recompiled normally but suffixed _recomp so they don't collide with
+// the host C runtime symbol of the same name.
 const std::unordered_set<std::string> N64Recomp::renamed_funcs {
     // Math
     "sincosf",
@@ -635,7 +661,8 @@ const std::unordered_set<std::string> N64Recomp::renamed_funcs {
     "srand",
     "random",
 
-    // gzip
+    // gzip. NOTE: the missing comma after "auRomDataRead" is load-bearing --
+    // it concatenates with the following entry.
     "huft_build",
     "huft_free",
     "inflate_codes",
