@@ -45,9 +45,14 @@ static bool decode_conditional_branch_target(
 
 extern "C" const char* RabbitizerRegister_getNameGpr(uint8_t regValue);
 
-// If 64-bit addressing is ever implemented, these will need to be changed to 64-bit values
+// Abstract value tracked per GPR while scanning for jump tables. It records the
+// in-progress address computation (lui -> addiu -> addu-with-index) and, once a
+// table base has been loaded, the loaded-from-table state used to recognize the
+// final `jr`. Two parallel sets of fields cover the direct (lui-based) and
+// position-independent (GOT-based) addressing forms.
+// (If 64-bit addressing is ever supported these would need to widen to 64 bits.)
 struct RegState {
-    // For tracking a register that will be used to load from RAM
+    // In-progress base address computation.
     uint32_t prev_lui;
     uint32_t prev_addiu_vram;
     uint32_t prev_addu_vram;
@@ -57,7 +62,7 @@ struct RegState {
     bool valid_addiu;
     bool valid_addend;
     bool valid_got_offset;
-    // For tracking a register that has been loaded from RAM
+    // State after the table base has been loaded from RAM.
     uint32_t loaded_lw_vram;
     uint32_t loaded_addu_vram;
     uint32_t loaded_address;
@@ -93,9 +98,9 @@ using InstrId = rabbitizer::InstrId::UniqueId;
 using RegId = rabbitizer::Registers::Cpu::GprO32;
 
 bool analyze_instruction(const rabbitizer::InstructionCpu& instr, const N64Recomp::Function& func, N64Recomp::FunctionStats& stats,
-    RegState reg_states[32], std::vector<RegState>& stack_states, bool is_got_addr_defined) {
+    RegState regs[32], std::vector<RegState>& stack_states, bool is_got_addr_defined) {
     // Temporary register state for tracking the register being operated on
-    RegState temp{};
+    RegState work_state{};
 
     int rd = (int)instr.GetO32_rd();
     int rs = (int)instr.GetO32_rs();
@@ -108,72 +113,72 @@ bool analyze_instruction(const rabbitizer::InstructionCpu& instr, const N64Recom
     auto check_move = [&]() {
         if (rs == 0) {
             // rs is zero so copy rt to rd
-            reg_states[rd] = reg_states[rt];
+            regs[rd] = regs[rt];
         } else if (rt == 0) {
             // rt is zero so copy rs to rd
-            reg_states[rd] = reg_states[rs];
+            regs[rd] = regs[rs];
         } else {
             // Not a move, invalidate rd
-            reg_states[rd].invalidate();
+            regs[rd].invalidate();
         }
     };
 
     switch (instr.getUniqueId()) {
     case InstrId::cpu_lui:
         // rt has been completely overwritten, so invalidate it
-        reg_states[rt].invalidate();
-        reg_states[rt].prev_lui = (int16_t)imm << 16;
-        reg_states[rt].valid_lui = true;
+        regs[rt].invalidate();
+        regs[rt].prev_lui = (int16_t)imm << 16;
+        regs[rt].valid_lui = true;
         break;
     case InstrId::cpu_addiu:
         // The target reg is a copy of the source reg plus an immediate, so copy the source reg's state
-        reg_states[rt] = reg_states[rs];
+        regs[rt] = regs[rs];
         // Set the addiu state if and only if there hasn't been an addiu already
-        if (!reg_states[rt].valid_addiu) {
-            reg_states[rt].prev_addiu_vram = (int16_t)imm;
-            reg_states[rt].valid_addiu = true;
+        if (!regs[rt].valid_addiu) {
+            regs[rt].prev_addiu_vram = (int16_t)imm;
+            regs[rt].valid_addiu = true;
         } else {
             // Otherwise, there have been 2 or more consecutive addius so invalidate the whole register
-            reg_states[rt].invalidate();
+            regs[rt].invalidate();
         }
         break;
     case InstrId::cpu_addu:
         // rd has been completely overwritten, so invalidate it
-        temp.invalidate();
-        if (reg_states[rs].valid_got_offset != reg_states[rt].valid_got_offset) {
+        work_state.invalidate();
+        if (regs[rs].valid_got_offset != regs[rt].valid_got_offset) {
             // Track which of the two registers has the valid GOT offset state and which is the addend
-            int valid_got_offset_reg = reg_states[rs].valid_got_offset ? rs : rt;
-            int addend_reg = reg_states[rs].valid_got_offset ? rt : rs;
+            int valid_got_offset_reg = regs[rs].valid_got_offset ? rs : rt;
+            int addend_reg = regs[rs].valid_got_offset ? rt : rs;
 
             // Copy the got offset reg's state into the destination reg, then set the destination reg's addend to the other operand
-            temp = reg_states[valid_got_offset_reg];
-            temp.valid_addend = true;
-            temp.prev_addend_reg = addend_reg;
-            temp.prev_addu_vram = instr.getVram();
+            work_state = regs[valid_got_offset_reg];
+            work_state.valid_addend = true;
+            work_state.prev_addend_reg = addend_reg;
+            work_state.prev_addu_vram = instr.getVram();
         } else if (((rs == (int)RegId::GPR_O32_gp) || (rt == (int)RegId::GPR_O32_gp)) 
-                && reg_states[rs].valid_got_loaded != reg_states[rt].valid_got_loaded) {
+                && regs[rs].valid_got_loaded != regs[rt].valid_got_loaded) {
             // `addu rd, rs, $gp` or `addu rd, $gp, rt` after valid GOT load, this is the last part of a position independent
             // jump table call. Keep the register state intact.
-            int valid_got_loaded_reg = reg_states[rs].valid_got_loaded ? rs : rt;
+            int valid_got_loaded_reg = regs[rs].valid_got_loaded ? rs : rt;
 
-            temp = reg_states[valid_got_loaded_reg];
+            work_state = regs[valid_got_loaded_reg];
         }
         // Exactly one of the two addend register states should have a valid lui at this time
-        else if (reg_states[rs].valid_lui != reg_states[rt].valid_lui) {
+        else if (regs[rs].valid_lui != regs[rt].valid_lui) {
             // Track which of the two registers has the valid lui state and which is the addend
-            int valid_lui_reg = reg_states[rs].valid_lui ? rs : rt;
-            int addend_reg = reg_states[rs].valid_lui ? rt : rs;
+            int valid_lui_reg = regs[rs].valid_lui ? rs : rt;
+            int addend_reg = regs[rs].valid_lui ? rt : rs;
 
             // Copy the lui reg's state into the destination reg, then set the destination reg's addend to the other operand
-            temp = reg_states[valid_lui_reg];
-            temp.valid_addend = true;
-            temp.prev_addend_reg = addend_reg;
-            temp.prev_addu_vram = instr.getVram();
+            work_state = regs[valid_lui_reg];
+            work_state.valid_addend = true;
+            work_state.prev_addend_reg = addend_reg;
+            work_state.prev_addu_vram = instr.getVram();
         } else {
             // Check if this is a move
             check_move();
         }
-        reg_states[rd] = temp;
+        regs[rd] = work_state;
         break;
     case InstrId::cpu_daddu:
     case InstrId::cpu_or:
@@ -194,12 +199,12 @@ bool analyze_instruction(const rabbitizer::InstructionCpu& instr, const N64Recom
             if (stack_offset >= stack_states.size()) {
                 stack_states.resize(stack_offset + 1);
             }
-            stack_states[stack_offset] = reg_states[rt];
+            stack_states[stack_offset] = regs[rt];
         }
         break;
     case InstrId::cpu_lw:
         // rt has been completely overwritten, so invalidate it
-        temp.invalidate();
+        work_state.invalidate();
         // If this is a load from the stack, copy the state of the stack at the given offset to rt
         if (base == (int)RegId::GPR_O32_sp) {
             if ((imm & 0b11) != 0) {
@@ -214,46 +219,46 @@ bool analyze_instruction(const rabbitizer::InstructionCpu& instr, const N64Recom
             if (stack_offset >= stack_states.size()) {
                 stack_states.resize(stack_offset + 1);
             }
-            temp = stack_states[stack_offset];
+            work_state = stack_states[stack_offset];
         }
         // If the base register has a valid lui state and a valid addend before this, then this may be a load from a jump table
-        else if (reg_states[base].valid_lui && reg_states[base].valid_addend) {
+        else if (regs[base].valid_lui && regs[base].valid_addend) {
             // Exactly one of the lw and the base reg should have a valid lo16 value. However, the lo16 may end up just being zero by pure luck,
             // so allow the case where the lo16 immediate is zero and the register state doesn't have a valid addiu immediate.
             // This means the only invalid case is where they're both true.
             bool nonzero_immediate = imm != 0;
-            if (!(nonzero_immediate && reg_states[base].valid_addiu)) {
+            if (!(nonzero_immediate && regs[base].valid_addiu)) {
                 uint32_t lo16;
                 if (nonzero_immediate) {
                     lo16 = (int16_t)imm;
                 } else {
-                    lo16 = reg_states[base].prev_addiu_vram;
+                    lo16 = regs[base].prev_addiu_vram;
                 }
 
-                uint32_t address = reg_states[base].prev_lui + lo16;
-                temp.valid_loaded = true;
-                temp.loaded_lw_vram = instr.getVram();
-                temp.loaded_address = address;
-                temp.loaded_addend_reg = reg_states[base].prev_addend_reg;
-                temp.loaded_addu_vram = reg_states[base].prev_addu_vram;
+                uint32_t address = regs[base].prev_lui + lo16;
+                work_state.valid_loaded = true;
+                work_state.loaded_lw_vram = instr.getVram();
+                work_state.loaded_address = address;
+                work_state.loaded_addend_reg = regs[base].prev_addend_reg;
+                work_state.loaded_addu_vram = regs[base].prev_addu_vram;
             }
         }
         // If the base register has a valid GOT offset and a valid addend before this, then this may be a load from a position independent jump table
-        else if (reg_states[base].valid_got_offset && reg_states[base].valid_addend) {
+        else if (regs[base].valid_got_offset && regs[base].valid_addend) {
             // At this point, we will have the offset from the value of the previously read GOT entry to the address being
             // loaded here as well as the GOT entry offset itself
-            temp.valid_got_loaded = true;
-            temp.loaded_lw_vram = instr.getVram();
-            temp.loaded_address = imm; // This address is relative for now, we'll calculate the absolute address later
-            temp.loaded_addend_reg = reg_states[base].prev_addend_reg;
-            temp.loaded_addu_vram = reg_states[base].prev_addu_vram;
-            temp.prev_got_offset = reg_states[base].prev_got_offset;
+            work_state.valid_got_loaded = true;
+            work_state.loaded_lw_vram = instr.getVram();
+            work_state.loaded_address = imm; // This address is relative for now, we'll calculate the absolute address later
+            work_state.loaded_addend_reg = regs[base].prev_addend_reg;
+            work_state.loaded_addu_vram = regs[base].prev_addu_vram;
+            work_state.prev_got_offset = regs[base].prev_got_offset;
         } else if (base == (int)RegId::GPR_O32_gp && is_got_addr_defined) {
             // lw from the $gp register implies a read from the global offset table
-            temp.prev_got_offset = imm;
-            temp.valid_got_offset = true;
+            work_state.prev_got_offset = imm;
+            work_state.valid_got_offset = true;
         }
-        reg_states[rt] = temp;
+        regs[rt] = work_state;
         break;
     case InstrId::cpu_jr:
         // Ignore jr $ra
@@ -261,28 +266,28 @@ bool analyze_instruction(const rabbitizer::InstructionCpu& instr, const N64Recom
             break;
         }
         // Check if the source reg has a valid loaded state and if so record that as a jump table
-        if (reg_states[rs].valid_loaded) {
+        if (regs[rs].valid_loaded) {
             stats.jump_tables.emplace_back(
-                reg_states[rs].loaded_address,
-                reg_states[rs].loaded_addend_reg,
+                regs[rs].loaded_address,
+                regs[rs].loaded_addend_reg,
                 0,
-                reg_states[rs].loaded_lw_vram,
-                reg_states[rs].loaded_addu_vram,
+                regs[rs].loaded_lw_vram,
+                regs[rs].loaded_addu_vram,
                 instr.getVram(),
                 0, // section index gets filled in later
                 std::nullopt,
                 std::vector<uint32_t>{}
             );
-        } else if (reg_states[rs].valid_got_loaded) {
+        } else if (regs[rs].valid_got_loaded) {
             stats.jump_tables.emplace_back(
-                reg_states[rs].loaded_address,
-                reg_states[rs].loaded_addend_reg,
+                regs[rs].loaded_address,
+                regs[rs].loaded_addend_reg,
                 0,
-                reg_states[rs].loaded_lw_vram,
-                reg_states[rs].loaded_addu_vram,
+                regs[rs].loaded_lw_vram,
+                regs[rs].loaded_addu_vram,
                 instr.getVram(),
                 0, // section index gets filled in later
-                reg_states[rs].prev_got_offset,
+                regs[rs].prev_got_offset,
                 std::vector<uint32_t>{}
             );
         }
@@ -290,10 +295,10 @@ bool analyze_instruction(const rabbitizer::InstructionCpu& instr, const N64Recom
         break;
     default:
         if (instr.modifiesRd()) {
-            reg_states[rd].invalidate();
+            regs[rd].invalidate();
         }
         if (instr.modifiesRt()) {
-            reg_states[rt].invalidate();
+            regs[rt].invalidate();
         }
         break;
     }
@@ -306,13 +311,13 @@ bool N64Recomp::analyze_function(const N64Recomp::Context& context, const N64Rec
     std::optional<uint32_t> got_ram_addr = section->got_ram_addr;
 
     // Create a state to track each register (r0 won't be used)
-    RegState reg_states[32] {};
+    RegState regs[32] {};
     std::vector<RegState> stack_states{};
 
     // Look for jump tables
     // A linear search through the func won't be accurate due to not taking control flow into account, but it'll work for finding jtables
     for (const auto& instr : instructions) {
-        if (!analyze_instruction(instr, func, stats, reg_states, stack_states, got_ram_addr.has_value())) {
+        if (!analyze_instruction(instr, func, stats, regs, stack_states, got_ram_addr.has_value())) {
             return false;
         }
     }
@@ -464,7 +469,7 @@ bool N64Recomp::discover_function_bounds(
         // Per-block scan: walk linearly from off through the basic
         // block's terminator, simulating register state as we go.
         // Register state is local to this scan — fresh on entry.
-        RegState reg_states[32]{};
+        RegState regs[32]{};
         std::vector<RegState> stack_states{};
         // Fake Function for analyze_instruction's signature. We only
         // need it for fields the analyzer itself reads; section_index
@@ -501,7 +506,7 @@ bool N64Recomp::discover_function_bounds(
             // problems (e.g. negative stack offsets) — that's a real
             // bug we shouldn't paper over.
             if (!analyze_instruction(instr, fake_func, local_stats,
-                                     reg_states, stack_states,
+                                     regs, stack_states,
                                      /*is_got_addr_defined=*/false)) {
                 error_out = fmt::format(
                     "analyze_instruction rejected insn 0x{:08X} at "
