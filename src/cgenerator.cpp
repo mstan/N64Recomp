@@ -1,142 +1,232 @@
+#include <array>
 #include <cassert>
 #include <fstream>
+#include <stdexcept>
+#include <string_view>
+#include <utility>
 
 #include "fmt/format.h"
 #include "fmt/ostream.h"
 
 #include "recompiler/generator.h"
 
-struct BinaryOpFields { std::string func_string; std::string infix_string; };
+// C backend for the recompiler. Each method turns a decoded operation (or a
+// control-flow event) into the equivalent C source. The emitted text is the
+// contract with the runtime: macro names like ADD32 / MEM_W / RECOMP_FUNC, the
+// recomp_context field names, and the function-call/tailcall protocol are all
+// defined on the runtime side, so this file reproduces them verbatim. Only the
+// surrounding generation logic is ours to shape.
 
-static std::vector<BinaryOpFields> c_op_fields = []() {
-    std::vector<BinaryOpFields> ret{};
-    ret.resize(static_cast<size_t>(N64Recomp::BinaryOpType::COUNT));
-    std::vector<char> ops_setup{};
-    ops_setup.resize(static_cast<size_t>(N64Recomp::BinaryOpType::COUNT));
+namespace {
+    using N64Recomp::BinaryOpType;
+    using N64Recomp::UnaryOpType;
 
-    auto setup_op = [&ret, &ops_setup](N64Recomp::BinaryOpType op_type, const std::string& func_string, const std::string& infix_string) {
-        size_t index = static_cast<size_t>(op_type);
-        // Prevent setting up an operation twice.
-        assert(ops_setup[index] == false && "Operation already setup!");
-        ops_setup[index] = true;
-        ret[index] = { func_string, infix_string };
+    // How a binary operation is spelled in C. An entry can be a call form
+    // (func set: "func(a, b)"), an infix operator (infix set: "a op b"), both
+    // (func wrapping an infix expression: "func(a op b)"), or neither -- the
+    // latter (True/False) is special-cased by the caller.
+    struct OpNotation {
+        const char* func;
+        const char* infix;
     };
 
-    setup_op(N64Recomp::BinaryOpType::Add32,     "ADD32",  "");
-    setup_op(N64Recomp::BinaryOpType::Sub32,     "SUB32",  "");
-    setup_op(N64Recomp::BinaryOpType::Add64,     "",       "+");
-    setup_op(N64Recomp::BinaryOpType::Sub64,     "",       "-");
-    setup_op(N64Recomp::BinaryOpType::And64,     "",       "&");
-    setup_op(N64Recomp::BinaryOpType::AddFloat,  "",       "+");
-    setup_op(N64Recomp::BinaryOpType::AddDouble, "",       "+");
-    setup_op(N64Recomp::BinaryOpType::SubFloat,  "",       "-");
-    setup_op(N64Recomp::BinaryOpType::SubDouble, "",       "-");
-    setup_op(N64Recomp::BinaryOpType::MulFloat,  "MUL_S",  "");
-    setup_op(N64Recomp::BinaryOpType::MulDouble, "MUL_D",  "");
-    setup_op(N64Recomp::BinaryOpType::DivFloat,  "DIV_S",  "");
-    setup_op(N64Recomp::BinaryOpType::DivDouble, "DIV_D",  "");
-    setup_op(N64Recomp::BinaryOpType::Or64,      "",       "|");
-    setup_op(N64Recomp::BinaryOpType::Nor64,     "~",      "|");
-    setup_op(N64Recomp::BinaryOpType::Xor64,     "",       "^");
-    setup_op(N64Recomp::BinaryOpType::Sll32,     "S32",    "<<");
-    setup_op(N64Recomp::BinaryOpType::Sll64,     "",       "<<");
-    setup_op(N64Recomp::BinaryOpType::Srl32,     "S32",    ">>");
-    setup_op(N64Recomp::BinaryOpType::Srl64,     "",       ">>");
-    setup_op(N64Recomp::BinaryOpType::Sra32,     "S32",    ">>"); // Arithmetic aspect will be taken care of by unary op for first operand.
-    setup_op(N64Recomp::BinaryOpType::Sra64,     "",       ">>"); // Arithmetic aspect will be taken care of by unary op for first operand.
-    setup_op(N64Recomp::BinaryOpType::Equal,     "",       "==");
-    setup_op(N64Recomp::BinaryOpType::EqualFloat,"",       "==");
-    setup_op(N64Recomp::BinaryOpType::EqualDouble,"",      "==");
-    setup_op(N64Recomp::BinaryOpType::NotEqual,  "",       "!=");
-    setup_op(N64Recomp::BinaryOpType::Less,      "",       "<");
-    setup_op(N64Recomp::BinaryOpType::LessFloat, "",       "<");
-    setup_op(N64Recomp::BinaryOpType::LessDouble,"",       "<");
-    setup_op(N64Recomp::BinaryOpType::LessEq,    "",       "<=");
-    setup_op(N64Recomp::BinaryOpType::LessEqFloat,"",      "<=");
-    setup_op(N64Recomp::BinaryOpType::LessEqDouble,"",     "<=");
-    setup_op(N64Recomp::BinaryOpType::Greater,   "",       ">");
-    setup_op(N64Recomp::BinaryOpType::GreaterEq, "",       ">=");
-    setup_op(N64Recomp::BinaryOpType::LD,        "LD",     "");
-    setup_op(N64Recomp::BinaryOpType::LW,        "MEM_W",  "");
-    setup_op(N64Recomp::BinaryOpType::LWU,       "MEM_WU", "");
-    setup_op(N64Recomp::BinaryOpType::LH,        "MEM_H",  "");
-    setup_op(N64Recomp::BinaryOpType::LHU,       "MEM_HU", "");
-    setup_op(N64Recomp::BinaryOpType::LB,        "MEM_B",  "");
-    setup_op(N64Recomp::BinaryOpType::LBU,       "MEM_BU", "");
-    setup_op(N64Recomp::BinaryOpType::LDL,       "do_ldl", "");
-    setup_op(N64Recomp::BinaryOpType::LDR,       "do_ldr", "");
-    setup_op(N64Recomp::BinaryOpType::LWL,       "do_lwl", "");
-    setup_op(N64Recomp::BinaryOpType::LWR,       "do_lwr", "");
-    setup_op(N64Recomp::BinaryOpType::True,      "", "");
-    setup_op(N64Recomp::BinaryOpType::False,     "", "");
-
-    // Ensure every operation has been setup.
-    for (char is_set : ops_setup) {
-        assert(is_set && "Operation has not been setup!");
+    const std::array<OpNotation, static_cast<size_t>(BinaryOpType::COUNT)>& binary_op_notation() {
+        static const std::array<OpNotation, static_cast<size_t>(BinaryOpType::COUNT)> table = [] {
+            std::array<OpNotation, static_cast<size_t>(BinaryOpType::COUNT)> t{};
+            t.fill(OpNotation{ "", "" });
+            auto set = [&t](BinaryOpType op, const char* func, const char* infix) {
+                t[static_cast<size_t>(op)] = OpNotation{ func, infix };
+            };
+            // Integer add/subtract. The 32-bit forms go through helper macros
+            // that truncate-and-sign-extend; the 64-bit forms are plain infix.
+            set(BinaryOpType::Add32,        "ADD32", "");
+            set(BinaryOpType::Sub32,        "SUB32", "");
+            set(BinaryOpType::Add64,        "",      "+");
+            set(BinaryOpType::Sub64,        "",      "-");
+            // Floating-point arithmetic.
+            set(BinaryOpType::AddFloat,     "",      "+");
+            set(BinaryOpType::AddDouble,    "",      "+");
+            set(BinaryOpType::SubFloat,     "",      "-");
+            set(BinaryOpType::SubDouble,    "",      "-");
+            set(BinaryOpType::MulFloat,     "MUL_S", "");
+            set(BinaryOpType::MulDouble,    "MUL_D", "");
+            set(BinaryOpType::DivFloat,     "DIV_S", "");
+            set(BinaryOpType::DivDouble,    "DIV_D", "");
+            // Bitwise. nor is the only one needing an outer wrap (~).
+            set(BinaryOpType::And64,        "",      "&");
+            set(BinaryOpType::Or64,         "",      "|");
+            set(BinaryOpType::Nor64,        "~",     "|");
+            set(BinaryOpType::Xor64,        "",      "^");
+            // Shifts. The 32-bit forms wrap the result in S32 to truncate and
+            // sign-extend; the arithmetic part of sra is handled by the operand
+            // pre-op, so srl/sra share the same spelling here.
+            set(BinaryOpType::Sll32,        "S32",   "<<");
+            set(BinaryOpType::Sll64,        "",      "<<");
+            set(BinaryOpType::Srl32,        "S32",   ">>");
+            set(BinaryOpType::Srl64,        "",      ">>");
+            set(BinaryOpType::Sra32,        "S32",   ">>");
+            set(BinaryOpType::Sra64,        "",      ">>");
+            // Comparisons (integer and float share the same operators).
+            set(BinaryOpType::Equal,        "",      "==");
+            set(BinaryOpType::NotEqual,     "",      "!=");
+            set(BinaryOpType::Less,         "",      "<");
+            set(BinaryOpType::LessEq,       "",      "<=");
+            set(BinaryOpType::Greater,      "",      ">");
+            set(BinaryOpType::GreaterEq,    "",      ">=");
+            set(BinaryOpType::EqualFloat,   "",      "==");
+            set(BinaryOpType::LessFloat,    "",      "<");
+            set(BinaryOpType::LessEqFloat,  "",      "<=");
+            set(BinaryOpType::EqualDouble,  "",      "==");
+            set(BinaryOpType::LessDouble,   "",      "<");
+            set(BinaryOpType::LessEqDouble, "",      "<=");
+            // Loads spelled as macros / helper calls.
+            set(BinaryOpType::LD,           "LD",     "");
+            set(BinaryOpType::LW,           "MEM_W",  "");
+            set(BinaryOpType::LWU,          "MEM_WU", "");
+            set(BinaryOpType::LH,           "MEM_H",  "");
+            set(BinaryOpType::LHU,          "MEM_HU", "");
+            set(BinaryOpType::LB,           "MEM_B",  "");
+            set(BinaryOpType::LBU,          "MEM_BU", "");
+            set(BinaryOpType::LDL,          "do_ldl", "");
+            set(BinaryOpType::LDR,          "do_ldr", "");
+            set(BinaryOpType::LWL,          "do_lwl", "");
+            set(BinaryOpType::LWR,          "do_lwr", "");
+            // True/False carry no notation; left as the {"",""} default.
+            return t;
+        }();
+        return table;
     }
 
-    return ret;
-}();
-
-static std::string gpr_to_string(int gpr_index) {
-    if (gpr_index == 0) {
-        return "0";
+    // The prefix/suffix that a unary pre-op wraps around an operand. Applying
+    // both uniformly (prefix + operand + suffix) reproduces every case; None
+    // and ToU64 are no-ops with empty affixes.
+    std::pair<std::string_view, std::string_view> unary_affixes(UnaryOpType op) {
+        switch (op) {
+            case UnaryOpType::None:           return { "", "" };
+            case UnaryOpType::ToS32:          return { "S32(", ")" };
+            case UnaryOpType::ToU32:          return { "U32(", ")" };
+            case UnaryOpType::ToS64:          return { "SIGNED(", ")" };
+            case UnaryOpType::ToU64:          return { "", "" }; // already U64
+            case UnaryOpType::Lui:            return { "S32(U32(", ") << 16)" };
+            case UnaryOpType::Mask5:          return { "(", " & 31)" };
+            case UnaryOpType::Mask6:          return { "(", " & 63)" };
+            case UnaryOpType::ToInt32:        return { "(int32_t)", "" };
+            case UnaryOpType::NegateFloat:    return { "-", "" };
+            case UnaryOpType::NegateDouble:   return { "-", "" };
+            case UnaryOpType::AbsFloat:       return { "fabsf(", ")" };
+            case UnaryOpType::AbsDouble:      return { "fabs(", ")" };
+            case UnaryOpType::SqrtFloat:      return { "sqrtf(", ")" };
+            case UnaryOpType::SqrtDouble:     return { "sqrt(", ")" };
+            case UnaryOpType::ConvertSFromW:  return { "CVT_S_W(", ")" };
+            case UnaryOpType::ConvertWFromS:  return { "CVT_W_S(", ")" };
+            case UnaryOpType::ConvertDFromW:  return { "CVT_D_W(", ")" };
+            case UnaryOpType::ConvertWFromD:  return { "CVT_W_D(", ")" };
+            case UnaryOpType::ConvertDFromS:  return { "CVT_D_S(", ")" };
+            case UnaryOpType::ConvertSFromD:  return { "CVT_S_D(", ")" };
+            case UnaryOpType::ConvertDFromL:  return { "CVT_D_L(", ")" };
+            case UnaryOpType::ConvertLFromD:  return { "CVT_L_D(", ")" };
+            case UnaryOpType::ConvertSFromL:  return { "CVT_S_L(", ")" };
+            case UnaryOpType::ConvertLFromS:  return { "CVT_L_S(", ")" };
+            case UnaryOpType::TruncateWFromS: return { "TRUNC_W_S(", ")" };
+            case UnaryOpType::TruncateWFromD: return { "TRUNC_W_D(", ")" };
+            case UnaryOpType::TruncateLFromS: return { "TRUNC_L_S(", ")" };
+            case UnaryOpType::TruncateLFromD: return { "TRUNC_L_D(", ")" };
+            // TODO these four should use banker's rounding, but roundeven is C23 and unavailable here.
+            case UnaryOpType::RoundWFromS:    return { "lroundf(", ")" };
+            case UnaryOpType::RoundWFromD:    return { "lround(", ")" };
+            case UnaryOpType::RoundLFromS:    return { "llroundf(", ")" };
+            case UnaryOpType::RoundLFromD:    return { "llround(", ")" };
+            case UnaryOpType::CeilWFromS:     return { "S32(ceilf(", "))" };
+            case UnaryOpType::CeilWFromD:     return { "S32(ceil(", "))" };
+            case UnaryOpType::CeilLFromS:     return { "S64(ceilf(", "))" };
+            case UnaryOpType::CeilLFromD:     return { "S64(ceil(", "))" };
+            case UnaryOpType::FloorWFromS:    return { "S32(floorf(", "))" };
+            case UnaryOpType::FloorWFromD:    return { "S32(floor(", "))" };
+            case UnaryOpType::FloorLFromS:    return { "S64(floorf(", "))" };
+            case UnaryOpType::FloorLFromD:    return { "S64(floor(", "))" };
+        }
+        return { "", "" };
     }
-    return fmt::format("ctx->r{}", gpr_index);
-}
 
-static bool is_zero_gpr_operand(N64Recomp::Operand operand, const N64Recomp::InstructionContext& ctx) {
-    switch (operand) {
-        case N64Recomp::Operand::Rd:
-            return ctx.rd == 0;
-        case N64Recomp::Operand::Rs:
-            return ctx.rs == 0;
-        case N64Recomp::Operand::Rt:
-            return ctx.rt == 0;
-        default:
-            return false;
+    // A GPR reads as the literal 0 when it is $zero, otherwise as the context field.
+    std::string gpr_to_string(int gpr_index) {
+        if (gpr_index == 0) {
+            return "0";
+        }
+        return fmt::format("ctx->r{}", gpr_index);
     }
-}
 
-static std::string fpr_to_string(int fpr_index) {
-    return fmt::format("ctx->f{}.fl", fpr_index);
-}
-
-static std::string fpr_double_to_string(int fpr_index) {
-    return fmt::format("ctx->f{}.d", fpr_index);
-}
-
-static std::string fpr_u32l_to_string(int fpr_index) {
-    if (fpr_index & 1) {
-        return fmt::format("ctx->f_odd[({} - 1) * 2]", fpr_index);
+    std::string fpr_to_string(int fpr_index) {
+        return fmt::format("ctx->f{}.fl", fpr_index);
     }
-    else {
+
+    std::string fpr_double_to_string(int fpr_index) {
+        return fmt::format("ctx->f{}.d", fpr_index);
+    }
+
+    // Odd single-precision registers live in the f_odd overlay under mips3
+    // float mode; even ones are the low word of the paired double.
+    std::string fpr_u32l_to_string(int fpr_index) {
+        if (fpr_index & 1) {
+            return fmt::format("ctx->f_odd[({} - 1) * 2]", fpr_index);
+        }
         return fmt::format("ctx->f{}.u32l", fpr_index);
     }
-}
 
-static std::string fpr_u64_to_string(int fpr_index) {
-    return fmt::format("ctx->f{}.u64", fpr_index);
-}
-
-static std::string unsigned_reloc(const N64Recomp::InstructionContext& context) {
-    switch (context.reloc_type) {
-        case N64Recomp::RelocType::R_MIPS_HI16:
-            return fmt::format("{}RELOC_HI16({}, {:#X})",
-                context.reloc_tag_as_reference ? "REF_" : "", context.reloc_section_index, context.reloc_target_section_offset);
-        case N64Recomp::RelocType::R_MIPS_LO16:
-            return fmt::format("{}RELOC_LO16({}, {:#X})",
-                context.reloc_tag_as_reference ? "REF_" : "", context.reloc_section_index, context.reloc_target_section_offset);
-        default:
-            throw std::runtime_error(fmt::format("Unexpected reloc type {}\n", static_cast<int>(context.reloc_type)));
+    std::string fpr_u64_to_string(int fpr_index) {
+        return fmt::format("ctx->f{}.u64", fpr_index);
     }
-}
 
-static std::string signed_reloc(const N64Recomp::InstructionContext& context) {
-    return "(int16_t)" + unsigned_reloc(context);
+    bool is_zero_gpr_operand(N64Recomp::Operand operand, const N64Recomp::InstructionContext& ctx) {
+        switch (operand) {
+            case N64Recomp::Operand::Rd: return ctx.rd == 0;
+            case N64Recomp::Operand::Rs: return ctx.rs == 0;
+            case N64Recomp::Operand::Rt: return ctx.rt == 0;
+            default: return false;
+        }
+    }
+
+    // A HI16/LO16 relocation renders as a RELOC_xI16 macro the runtime resolves
+    // once the target section's load address is known; the REF_ prefix selects
+    // the reference-symbol variant.
+    std::string unsigned_reloc(const N64Recomp::InstructionContext& context) {
+        const char* ref_prefix = context.reloc_tag_as_reference ? "REF_" : "";
+        switch (context.reloc_type) {
+            case N64Recomp::RelocType::R_MIPS_HI16:
+                return fmt::format("{}RELOC_HI16({}, {:#X})",
+                    ref_prefix, context.reloc_section_index, context.reloc_target_section_offset);
+            case N64Recomp::RelocType::R_MIPS_LO16:
+                return fmt::format("{}RELOC_LO16({}, {:#X})",
+                    ref_prefix, context.reloc_section_index, context.reloc_target_section_offset);
+            default:
+                throw std::runtime_error(fmt::format("Unexpected reloc type {}\n", static_cast<int>(context.reloc_type)));
+        }
+    }
+
+    std::string signed_reloc(const N64Recomp::InstructionContext& context) {
+        return "(int16_t)" + unsigned_reloc(context);
+    }
+
+    // Shared open/close of a function-call frame. Every call site captures the
+    // stack pointer and host return target, performs the call, runs tailcall
+    // handling, then restores and checks that the callee left $sp intact.
+    void emit_call_prologue(std::ostream& output_file) {
+        fmt::print(output_file, "{{\n");
+        fmt::print(output_file, "    gpr recomp_call_sp = ctx->r29;\n");
+        fmt::print(output_file, "    uint32_t recomp_prev_host_return = ctx->host_return_target;\n");
+        fmt::print(output_file, "    uint32_t recomp_call_host_return = (uint32_t)ctx->r31;\n");
+        fmt::print(output_file, "    ctx->host_return_target = recomp_call_host_return;\n");
+    }
+
+    void emit_call_epilogue(std::ostream& output_file) {
+        fmt::print(output_file, "    ctx->host_return_target = recomp_prev_host_return;\n");
+        fmt::print(output_file, "    if (ctx->r29 != recomp_call_sp) {{ recomp_cf_note(\"call-sp-mismatch\", (uint32_t)recomp_call_sp, recomp_prev_host_return, recomp_call_host_return, ctx); return; }}\n");
+        fmt::print(output_file, "}}\n");
+    }
 }
 
 void N64Recomp::CGenerator::get_operand_string(Operand operand, UnaryOpType operation, const InstructionContext& context, std::string& operand_string) const {
+    // First resolve the operand to its C lvalue/expression...
     switch (operand) {
         case Operand::Rd:
             operand_string = gpr_to_string(context.rd);
@@ -215,7 +305,7 @@ void N64Recomp::CGenerator::get_operand_string(Operand operand, UnaryOpType oper
             operand_string = fmt::format("({} + 32)", context.sa);
             break;
         case Operand::Cop1cs:
-            operand_string = fmt::format("c1cs");
+            operand_string = "c1cs";
             break;
         case Operand::Hi:
             operand_string = "hi";
@@ -227,136 +317,17 @@ void N64Recomp::CGenerator::get_operand_string(Operand operand, UnaryOpType oper
             operand_string = "0";
             break;
     }
-    switch (operation) {
-        case UnaryOpType::None:
-            break;
-        case UnaryOpType::ToS32:
-            operand_string = "S32(" + operand_string + ")"; 
-            break;
-        case UnaryOpType::ToU32:
-            operand_string = "U32(" + operand_string + ")"; 
-            break;
-        case UnaryOpType::ToS64:
-            operand_string = "SIGNED(" + operand_string + ")"; 
-            break;
-        case UnaryOpType::ToU64:
-            // Nothing to do here, they're already U64
-            break;
-        case UnaryOpType::Lui:
-            operand_string = "S32(U32(" + operand_string + ") << 16)"; 
-            break;
-        case UnaryOpType::Mask5:
-            operand_string = "(" + operand_string + " & 31)";
-            break;
-        case UnaryOpType::Mask6:
-            operand_string = "(" + operand_string + " & 63)";
-            break;
-        case UnaryOpType::ToInt32:
-            operand_string = "(int32_t)" + operand_string; 
-            break;
-        case UnaryOpType::NegateFloat:
-            operand_string = "-" + operand_string;
-            break;
-        case UnaryOpType::NegateDouble:
-            operand_string = "-" + operand_string;
-            break;
-        case UnaryOpType::AbsFloat:
-            operand_string = "fabsf(" + operand_string + ")";
-            break;
-        case UnaryOpType::AbsDouble:
-            operand_string = "fabs(" + operand_string + ")";
-            break;
-        case UnaryOpType::SqrtFloat:
-            operand_string = "sqrtf(" + operand_string + ")";
-            break;
-        case UnaryOpType::SqrtDouble:
-            operand_string = "sqrt(" + operand_string + ")";
-            break;
-        case UnaryOpType::ConvertSFromW:
-            operand_string = "CVT_S_W(" + operand_string + ")";
-            break;
-        case UnaryOpType::ConvertWFromS:
-            operand_string = "CVT_W_S(" + operand_string + ")";
-            break;
-        case UnaryOpType::ConvertDFromW:
-            operand_string = "CVT_D_W(" + operand_string + ")";
-            break;
-        case UnaryOpType::ConvertWFromD:
-            operand_string = "CVT_W_D(" + operand_string + ")";
-            break;
-        case UnaryOpType::ConvertDFromS:
-            operand_string = "CVT_D_S(" + operand_string + ")";
-            break;
-        case UnaryOpType::ConvertSFromD:
-            operand_string = "CVT_S_D(" + operand_string + ")";
-            break;
-        case UnaryOpType::ConvertDFromL:
-            operand_string = "CVT_D_L(" + operand_string + ")";
-            break;
-        case UnaryOpType::ConvertLFromD:
-            operand_string = "CVT_L_D(" + operand_string + ")";
-            break;
-        case UnaryOpType::ConvertSFromL:
-            operand_string = "CVT_S_L(" + operand_string + ")";
-            break;
-        case UnaryOpType::ConvertLFromS:
-            operand_string = "CVT_L_S(" + operand_string + ")";
-            break;
-        case UnaryOpType::TruncateWFromS:
-            operand_string = "TRUNC_W_S(" + operand_string + ")";
-            break;
-        case UnaryOpType::TruncateWFromD:
-            operand_string = "TRUNC_W_D(" + operand_string + ")";
-            break;
-        case UnaryOpType::TruncateLFromS:
-            operand_string = "TRUNC_L_S(" + operand_string + ")";
-            break;
-        case UnaryOpType::TruncateLFromD:
-            operand_string = "TRUNC_L_D(" + operand_string + ")";
-            break;
-        // TODO these four operations should use banker's rounding, but roundeven is C23 so it's unavailable here.
-        case UnaryOpType::RoundWFromS:
-            operand_string = "lroundf(" + operand_string + ")";
-            break;
-        case UnaryOpType::RoundWFromD:
-            operand_string = "lround(" + operand_string + ")";
-            break;
-        case UnaryOpType::RoundLFromS:
-            operand_string = "llroundf(" + operand_string + ")";
-            break;
-        case UnaryOpType::RoundLFromD:
-            operand_string = "llround(" + operand_string + ")";
-            break;
-        case UnaryOpType::CeilWFromS:
-            operand_string = "S32(ceilf(" + operand_string + "))";
-            break;
-        case UnaryOpType::CeilWFromD:
-            operand_string = "S32(ceil(" + operand_string + "))";
-            break;
-        case UnaryOpType::CeilLFromS:
-            operand_string = "S64(ceilf(" + operand_string + "))";
-            break;
-        case UnaryOpType::CeilLFromD:
-            operand_string = "S64(ceil(" + operand_string + "))";
-            break;
-        case UnaryOpType::FloorWFromS:
-            operand_string = "S32(floorf(" + operand_string + "))";
-            break;
-        case UnaryOpType::FloorWFromD:
-            operand_string = "S32(floor(" + operand_string + "))";
-            break;
-        case UnaryOpType::FloorLFromS:
-            operand_string = "S64(floorf(" + operand_string + "))";
-            break;
-        case UnaryOpType::FloorLFromD:
-            operand_string = "S64(floor(" + operand_string + "))";
-            break;
+    // ...then wrap it in the pre-op's prefix/suffix.
+    auto [prefix, suffix] = unary_affixes(operation);
+    if (!prefix.empty() || !suffix.empty()) {
+        operand_string = std::string(prefix) + operand_string + std::string(suffix);
     }
 }
 
 void N64Recomp::CGenerator::get_notation(BinaryOpType op_type, std::string& func_string, std::string& infix_string) const {
-    func_string = c_op_fields[static_cast<size_t>(op_type)].func_string;
-    infix_string = c_op_fields[static_cast<size_t>(op_type)].infix_string;
+    const OpNotation& notation = binary_op_notation()[static_cast<size_t>(op_type)];
+    func_string = notation.func;
+    infix_string = notation.infix;
 }
 
 void N64Recomp::CGenerator::get_binary_expr_string(BinaryOpType type, const BinaryOperands& operands, const InstructionContext& ctx, const std::string& output, std::string& expr_string) const {
@@ -367,20 +338,24 @@ void N64Recomp::CGenerator::get_binary_expr_string(BinaryOpType type, const Bina
     get_operand_string(operands.operands[0], operands.operand_operations[0], ctx, input_a);
     get_operand_string(operands.operands[1], operands.operand_operations[1], ctx, input_b);
     get_notation(type, func_string, infix_string);
-    
-    // These cases aren't strictly necessary and are just here for parity with the old recompiler output.
-    if (type == BinaryOpType::Less && !((operands.operands[1] == Operand::Zero && operands.operand_operations[1] == UnaryOpType::None) || (operands.operands[0] == Operand::Fs || operands.operands[0] == Operand::FsDouble))) {
+
+    const bool second_is_plain_zero = operands.operands[1] == Operand::Zero && operands.operand_operations[1] == UnaryOpType::None;
+
+    // These first three cases aren't strictly necessary; they exist to match
+    // the old recompiler's output (a bare comparison-to-zero / boolean form).
+    if (type == BinaryOpType::Less && !(second_is_plain_zero || (operands.operands[0] == Operand::Fs || operands.operands[0] == Operand::FsDouble))) {
         expr_string = fmt::format("{} {} {} ? 1 : 0", input_a, infix_string, input_b);
     }
-    else if (type == BinaryOpType::Equal && operands.operands[1] == Operand::Zero && operands.operand_operations[1] == UnaryOpType::None) {
+    else if (type == BinaryOpType::Equal && second_is_plain_zero) {
         expr_string = "!" + input_a;
     }
-    else if (type == BinaryOpType::NotEqual && operands.operands[1] == Operand::Zero && operands.operand_operations[1] == UnaryOpType::None) {
+    else if (type == BinaryOpType::NotEqual && second_is_plain_zero) {
         expr_string = input_a;
     }
-    // End unnecessary cases.
+    // End parity cases.
 
-    // TODO encode these ops to avoid needing special handling.
+    // TODO encode these ops so they don't need special handling. The unaligned
+    // word/doubleword loads take rdram and the destination as extra arguments.
     else if (type == BinaryOpType::LWL || type == BinaryOpType::LWR || type == BinaryOpType::LDL || type == BinaryOpType::LDR) {
         expr_string = fmt::format("{}(rdram, {}, {}, {})", func_string, output, input_a, input_b);
     }
@@ -394,7 +369,7 @@ void N64Recomp::CGenerator::get_binary_expr_string(BinaryOpType type, const Bina
         expr_string = fmt::format("{} {} {}", input_a, infix_string, input_b);
     }
     else {
-        // Handle special cases
+        // The only notation-less ops are the constant results.
         if (type == BinaryOpType::True) {
             expr_string = "1";
         }
@@ -472,70 +447,40 @@ void N64Recomp::CGenerator::emit_tailcall_handling(const std::set<uint32_t>& loc
 }
 
 void N64Recomp::CGenerator::emit_function_call_lookup(uint32_t addr, const std::set<uint32_t>& local_labels, uint32_t return_vram) const {
-    fmt::print(output_file, "{{\n");
-    fmt::print(output_file, "    gpr recomp_call_sp = ctx->r29;\n");
-    fmt::print(output_file, "    uint32_t recomp_prev_host_return = ctx->host_return_target;\n");
-    fmt::print(output_file, "    uint32_t recomp_call_host_return = (uint32_t)ctx->r31;\n");
-    fmt::print(output_file, "    ctx->host_return_target = recomp_call_host_return;\n");
+    emit_call_prologue(output_file);
     fmt::print(output_file, "    LOOKUP_FUNC(0x{:08X})(rdram, ctx);\n", addr);
     emit_tailcall_handling(local_labels, return_vram);
-    fmt::print(output_file, "    ctx->host_return_target = recomp_prev_host_return;\n");
-    fmt::print(output_file, "    if (ctx->r29 != recomp_call_sp) {{ recomp_cf_note(\"call-sp-mismatch\", (uint32_t)recomp_call_sp, recomp_prev_host_return, recomp_call_host_return, ctx); return; }}\n");
-    fmt::print(output_file, "}}\n");
+    emit_call_epilogue(output_file);
 }
 
 void N64Recomp::CGenerator::emit_function_call_by_register(int reg, const std::set<uint32_t>& local_labels, uint32_t return_vram) const {
-    fmt::print(output_file, "{{\n");
-    fmt::print(output_file, "    gpr recomp_call_sp = ctx->r29;\n");
-    fmt::print(output_file, "    uint32_t recomp_prev_host_return = ctx->host_return_target;\n");
-    fmt::print(output_file, "    uint32_t recomp_call_host_return = (uint32_t)ctx->r31;\n");
-    fmt::print(output_file, "    ctx->host_return_target = recomp_call_host_return;\n");
+    emit_call_prologue(output_file);
     fmt::print(output_file, "    LOOKUP_FUNC({})(rdram, ctx);\n", gpr_to_string(reg));
     emit_tailcall_handling(local_labels, return_vram);
-    fmt::print(output_file, "    ctx->host_return_target = recomp_prev_host_return;\n");
-    fmt::print(output_file, "    if (ctx->r29 != recomp_call_sp) {{ recomp_cf_note(\"call-sp-mismatch\", (uint32_t)recomp_call_sp, recomp_prev_host_return, recomp_call_host_return, ctx); return; }}\n");
-    fmt::print(output_file, "}}\n");
+    emit_call_epilogue(output_file);
 }
 
 void N64Recomp::CGenerator::emit_function_call_reference_symbol(const Context& context, uint16_t section_index, size_t symbol_index, uint32_t target_section_offset, const std::set<uint32_t>& local_labels, uint32_t return_vram) const {
     (void)target_section_offset;
     const N64Recomp::ReferenceSymbol& sym = context.get_reference_symbol(section_index, symbol_index);
-    fmt::print(output_file, "{{\n");
-    fmt::print(output_file, "    gpr recomp_call_sp = ctx->r29;\n");
-    fmt::print(output_file, "    uint32_t recomp_prev_host_return = ctx->host_return_target;\n");
-    fmt::print(output_file, "    uint32_t recomp_call_host_return = (uint32_t)ctx->r31;\n");
-    fmt::print(output_file, "    ctx->host_return_target = recomp_call_host_return;\n");
+    emit_call_prologue(output_file);
     fmt::print(output_file, "    {}(rdram, ctx);\n", sym.name);
     emit_tailcall_handling(local_labels, return_vram);
-    fmt::print(output_file, "    ctx->host_return_target = recomp_prev_host_return;\n");
-    fmt::print(output_file, "    if (ctx->r29 != recomp_call_sp) {{ recomp_cf_note(\"call-sp-mismatch\", (uint32_t)recomp_call_sp, recomp_prev_host_return, recomp_call_host_return, ctx); return; }}\n");
-    fmt::print(output_file, "}}\n");
+    emit_call_epilogue(output_file);
 }
 
 void N64Recomp::CGenerator::emit_function_call(const Context& context, size_t function_index, const std::set<uint32_t>& local_labels, uint32_t return_vram) const {
-    fmt::print(output_file, "{{\n");
-    fmt::print(output_file, "    gpr recomp_call_sp = ctx->r29;\n");
-    fmt::print(output_file, "    uint32_t recomp_prev_host_return = ctx->host_return_target;\n");
-    fmt::print(output_file, "    uint32_t recomp_call_host_return = (uint32_t)ctx->r31;\n");
-    fmt::print(output_file, "    ctx->host_return_target = recomp_call_host_return;\n");
+    emit_call_prologue(output_file);
     fmt::print(output_file, "    {}(rdram, ctx);\n", context.functions[function_index].name);
     emit_tailcall_handling(local_labels, return_vram);
-    fmt::print(output_file, "    ctx->host_return_target = recomp_prev_host_return;\n");
-    fmt::print(output_file, "    if (ctx->r29 != recomp_call_sp) {{ recomp_cf_note(\"call-sp-mismatch\", (uint32_t)recomp_call_sp, recomp_prev_host_return, recomp_call_host_return, ctx); return; }}\n");
-    fmt::print(output_file, "}}\n");
+    emit_call_epilogue(output_file);
 }
 
 void N64Recomp::CGenerator::emit_named_function_call(const std::string& function_name, const std::set<uint32_t>& local_labels, uint32_t return_vram) const {
-    fmt::print(output_file, "{{\n");
-    fmt::print(output_file, "    gpr recomp_call_sp = ctx->r29;\n");
-    fmt::print(output_file, "    uint32_t recomp_prev_host_return = ctx->host_return_target;\n");
-    fmt::print(output_file, "    uint32_t recomp_call_host_return = (uint32_t)ctx->r31;\n");
-    fmt::print(output_file, "    ctx->host_return_target = recomp_call_host_return;\n");
+    emit_call_prologue(output_file);
     fmt::print(output_file, "    {}(rdram, ctx);\n", function_name);
     emit_tailcall_handling(local_labels, return_vram);
-    fmt::print(output_file, "    ctx->host_return_target = recomp_prev_host_return;\n");
-    fmt::print(output_file, "    if (ctx->r29 != recomp_call_sp) {{ recomp_cf_note(\"call-sp-mismatch\", (uint32_t)recomp_call_sp, recomp_prev_host_return, recomp_call_host_return, ctx); return; }}\n");
-    fmt::print(output_file, "}}\n");
+    emit_call_epilogue(output_file);
 }
 
 void N64Recomp::CGenerator::emit_goto(const std::string& target) const {
@@ -708,6 +653,8 @@ void N64Recomp::CGenerator::process_store_op(const StoreOp& op, const Instructio
     get_operand_string(Operand::ImmS16, UnaryOpType::None, ctx, imm_str);
     get_operand_string(op.value_input, UnaryOpType::None, ctx, value_input);
 
+    // How the store is spelled: a plain function call, a call that also takes
+    // rdram (the unaligned stores), or an assignment through an addressing macro.
     enum class StoreSyntax {
         Func,
         FuncWithRdram,
