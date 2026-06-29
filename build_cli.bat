@@ -17,6 +17,10 @@ echo === CONFIGURE ===
 "%CMAKE%" -S "%SRC%" -B "%SRC%\build_cli" -G Ninja -DCMAKE_C_COMPILER=clang-cl -DCMAKE_CXX_COMPILER=clang-cl -DCMAKE_BUILD_TYPE=Release > "%SRC%\_cfg_cli.log" 2>&1
 echo cfg rc=%errorlevel%
 echo === BUILD ===
-"%CMAKE%" --build "%SRC%\build_cli" --target N64RecompCLI > "%SRC%\_build_cli.log" 2>&1
+:: Throttle: cap parallelism and run below-normal so the machine stays usable.
+:: Redirection must live inside the cmd /c that start launches, else it
+:: targets start itself and the child output is lost.
+if "%N64R_BUILD_JOBS%"=="" set "N64R_BUILD_JOBS=6"
+start "" /belownormal /b /wait cmd /c ""%CMAKE%" --build "%SRC%\build_cli" --target N64RecompCLI -- -j %N64R_BUILD_JOBS% > "%SRC%\_build_cli.log" 2>&1"
 echo build rc=%errorlevel%
 exit /b %errorlevel%
