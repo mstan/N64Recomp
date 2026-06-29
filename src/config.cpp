@@ -1,3 +1,16 @@
+// config.cpp
+//
+// TOML-driven configuration loading for the static recompiler. This file is
+// responsible for turning the project's `.toml` files into the in-memory
+// structures the rest of the recompiler consumes: the top-level Config object
+// (input/output options, patches, decompressed-section descriptions, reference
+// symbol file references) and the symbol-file / data-symbol-file readers that
+// populate a Context with sections, functions and relocations.
+//
+// A handful of section-repair passes (truncated-range extension, late
+// function-start recovery and small-gap function synthesis) run after a symbol
+// file has been parsed; they live in the anonymous namespace below.
+
 #include <algorithm>
 #include <iostream>
 
@@ -8,11 +21,13 @@
 #include "recompiler/context.h"
 #include "analysis.h"
 
+// Joins `child` onto `parent`, but leaves an empty `child` untouched so that an
+// unset path stays empty rather than collapsing to the base directory.
 std::filesystem::path concat_if_not_empty(const std::filesystem::path& parent, const std::filesystem::path& child) {
-    if (!child.empty()) {
-        return parent / child;
+    if (child.empty()) {
+        return child;
     }
-    return child;
+    return parent / child;
 }
 
 namespace {
@@ -456,30 +471,31 @@ namespace {
     }
 }
 
+// Parses a [[input.manual_funcs]] array. Each entry must spell out a function's
+// name, owning section, vram and byte size; any missing field is a config error.
 std::vector<N64Recomp::ManualFunction> get_manual_funcs(const toml::array* manual_funcs_array) {
-    std::vector<N64Recomp::ManualFunction> ret;
+    std::vector<N64Recomp::ManualFunction> manual_funcs;
+    manual_funcs.reserve(manual_funcs_array->size());
 
-    // Reserve room for all the funcs in the map.
-    ret.reserve(manual_funcs_array->size());
-    manual_funcs_array->for_each([&ret](auto&& el) {
-        if constexpr (toml::is_table<decltype(el)>) {
-            std::optional<std::string> func_name = el["name"].template value<std::string>();
-            std::optional<std::string> section_name = el["section"].template value<std::string>();
-            std::optional<uint32_t> vram_in = el["vram"].template value<uint32_t>();
-            std::optional<uint32_t> size = el["size"].template value<uint32_t>();
+    manual_funcs_array->for_each([&manual_funcs](auto&& entry) {
+        if constexpr (toml::is_table<decltype(entry)>) {
+            std::optional<std::string> func_name = entry["name"].template value<std::string>();
+            std::optional<std::string> section_name = entry["section"].template value<std::string>();
+            std::optional<uint32_t> vram = entry["vram"].template value<uint32_t>();
+            std::optional<uint32_t> size = entry["size"].template value<uint32_t>();
 
-            if (func_name.has_value() && section_name.has_value() && vram_in.has_value() && size.has_value()) {
-                ret.emplace_back(func_name.value(), section_name.value(), vram_in.value(), size.value());
+            if (func_name.has_value() && section_name.has_value() && vram.has_value() && size.has_value()) {
+                manual_funcs.emplace_back(func_name.value(), section_name.value(), vram.value(), size.value());
             } else {
-                throw toml::parse_error("Missing required value in manual_funcs array", el.source());
+                throw toml::parse_error("Missing required value in manual_funcs array", entry.source());
             }
         }
         else {
-            throw toml::parse_error("Missing required value in manual_funcs array", el.source());
+            throw toml::parse_error("Missing required value in manual_funcs array", entry.source());
         }
     });
 
-    return ret;
+    return manual_funcs;
 }
 
 std::vector<N64Recomp::DecompressedSectionPattern> get_decompressed_section_patterns(const toml::array* arr) {
@@ -589,224 +605,194 @@ std::vector<N64Recomp::DecompressedSectionPatch> get_decompressed_section_patche
     return ret;
 }
 
+// Resolves an array of data-reference-symbol file paths relative to the config's
+// base directory. Each element is expected to be a plain string.
 std::vector<std::filesystem::path> get_data_syms_paths(const toml::array* data_syms_paths_array, const std::filesystem::path& basedir) {
-    std::vector<std::filesystem::path> ret;
+    std::vector<std::filesystem::path> paths;
+    paths.reserve(data_syms_paths_array->size());
 
-    // Reserve room for all the funcs in the map.
-    ret.reserve(data_syms_paths_array->size());
-    data_syms_paths_array->for_each([&ret, &basedir](auto&& el) {
-        if constexpr (toml::is_string<decltype(el)>) {
-            ret.emplace_back(concat_if_not_empty(basedir, el.template value_exact<std::string>().value()));
+    data_syms_paths_array->for_each([&paths, &basedir](auto&& entry) {
+        if constexpr (toml::is_string<decltype(entry)>) {
+            paths.emplace_back(concat_if_not_empty(basedir, entry.template value_exact<std::string>().value()));
         }
         else {
-            throw toml::parse_error("Invalid type for data reference symbol file entry", el.source());
+            throw toml::parse_error("Invalid type for data reference symbol file entry", entry.source());
         }
     });
 
-    return ret;
+    return paths;
+}
+
+namespace {
+    // Collects a named array of function-name strings out of the [patches] table.
+    // When `strict` is set, a non-string element is rejected with a parse error;
+    // otherwise non-string elements are simply skipped. Returns an empty vector
+    // when the key is absent or not an array.
+    std::vector<std::string> collect_func_name_list(const toml::table* patches_data, std::string_view key, bool strict) {
+        std::vector<std::string> names{};
+
+        const toml::node_view list_data = (*patches_data)[key];
+        if (list_data.is_array()) {
+            const toml::array* list_array = list_data.as_array();
+            names.reserve(list_array->size());
+
+            list_array->for_each([&names, strict](auto&& entry) {
+                if constexpr (toml::is_string<decltype(entry)>) {
+                    names.push_back(*entry);
+                }
+                else if (strict) {
+                    throw toml::parse_error("Invalid stubbed function", entry.source());
+                }
+            });
+        }
+
+        return names;
+    }
 }
 
 std::vector<std::string> get_stubbed_funcs(const toml::table* patches_data) {
-    std::vector<std::string> stubbed_funcs{};
-
-    // Check if the stubs array exists.
-    const toml::node_view stubs_data = (*patches_data)["stubs"];
-
-    if (stubs_data.is_array()) {
-        const toml::array* stubs_array = stubs_data.as_array();
-
-        // Make room for all the stubs in the array.
-        stubbed_funcs.reserve(stubs_array->size());
-
-        // Gather the stubs and place them into the array.
-        stubs_array->for_each([&stubbed_funcs](auto&& el) {
-            if constexpr (toml::is_string<decltype(el)>) {
-                stubbed_funcs.push_back(*el);
-            }
-            else {
-                throw toml::parse_error("Invalid stubbed function", el.source());
-            }
-        });
-    }
-
-    return stubbed_funcs;
+    return collect_func_name_list(patches_data, "stubs", /*strict=*/true);
 }
 
 std::vector<std::string> get_ignored_funcs(const toml::table* patches_data) {
-    std::vector<std::string> ignored_funcs{};
-
-    // Check if the ignored funcs array exists.
-    const toml::node_view ignored_funcs_data = (*patches_data)["ignored"];
-
-    if (ignored_funcs_data.is_array()) {
-        const toml::array* ignored_funcs_array = ignored_funcs_data.as_array();
-
-        // Make room for all the ignored funcs in the array.
-        ignored_funcs.reserve(ignored_funcs_array->size());
-
-        // Gather the ignored and place them into the array.
-        ignored_funcs_array->for_each([&ignored_funcs](auto&& el) {
-            if constexpr (toml::is_string<decltype(el)>) {
-                ignored_funcs.push_back(*el);
-            }
-        });
-    }
-
-    return ignored_funcs;
+    return collect_func_name_list(patches_data, "ignored", /*strict=*/false);
 }
 
 std::vector<std::string> get_renamed_funcs(const toml::table* patches_data) {
-    std::vector<std::string> renamed_funcs{};
-
-    // Check if the renamed funcs array exists.
-    const toml::node_view renamed_funcs_data = (*patches_data)["renamed"];
-
-    if (renamed_funcs_data.is_array()) {
-        const toml::array* renamed_funcs_array = renamed_funcs_data.as_array();
-
-        // Make room for all the renamed funcs in the array.
-        renamed_funcs.reserve(renamed_funcs_array->size());
-
-        // Gather the renamed and place them into the array.
-        renamed_funcs_array->for_each([&renamed_funcs](auto&& el) {
-            if constexpr (toml::is_string<decltype(el)>) {
-                renamed_funcs.push_back(*el);
-            }
-        });
-    }
-
-    return renamed_funcs;
+    return collect_func_name_list(patches_data, "renamed", /*strict=*/false);
 }
 
+// Parses a [[input.function_sizes]] array of manual {name, size} overrides.
+// Sizes must be a whole number of 4-byte instructions.
 std::vector<N64Recomp::FunctionSize> get_func_sizes(const toml::array* func_sizes_array) {
     std::vector<N64Recomp::FunctionSize> func_sizes{};
-
-    // Reserve room for all the funcs in the map.
     func_sizes.reserve(func_sizes_array->size());
-    func_sizes_array->for_each([&func_sizes](auto&& el) {
-        if constexpr (toml::is_table<decltype(el)>) {
-            std::optional<std::string> func_name = el["name"].template value<std::string>();
-            std::optional<uint32_t> func_size = el["size"].template value<uint32_t>();
+
+    func_sizes_array->for_each([&func_sizes](auto&& entry) {
+        if constexpr (toml::is_table<decltype(entry)>) {
+            std::optional<std::string> func_name = entry["name"].template value<std::string>();
+            std::optional<uint32_t> func_size = entry["size"].template value<uint32_t>();
 
             if (func_name.has_value() && func_size.has_value()) {
-                // Make sure the size is divisible by 4
+                // Reject sizes that aren't a multiple of the 4-byte word size,
+                // surfacing it as an ordinary toml parse error.
                 if (func_size.value() & (4 - 1)) {
-                    // It's not, so throw an error (and make it look like a normal toml one).
-                    throw toml::parse_error("Function size is not divisible by 4", el.source());
+                    throw toml::parse_error("Function size is not divisible by 4", entry.source());
                 }
                 func_sizes.emplace_back(func_name.value(), func_size.value());
             }
             else {
-                throw toml::parse_error("Manually sized function is missing required value(s)", el.source());
+                throw toml::parse_error("Manually sized function is missing required value(s)", entry.source());
             }
         }
         else {
-            throw toml::parse_error("Missing required value in function_sizes array", el.source());
+            throw toml::parse_error("Missing required value in function_sizes array", entry.source());
         }
     });
 
     return func_sizes;
 }
 
+// Parses [[patches.instruction]] entries: each one overwrites the word at a
+// word-aligned vram inside a named function with a literal replacement value.
 std::vector<N64Recomp::InstructionPatch> get_instruction_patches(const toml::table* patches_data) {
-    std::vector<N64Recomp::InstructionPatch> ret;
+    std::vector<N64Recomp::InstructionPatch> patches;
 
-    // Check if the instruction patch array exists.
     const toml::node_view insn_patch_data = (*patches_data)["instruction"];
 
     if (insn_patch_data.is_array()) {
         const toml::array* insn_patch_array = insn_patch_data.as_array();
-        ret.reserve(insn_patch_array->size());
+        patches.reserve(insn_patch_array->size());
 
-        // Copy all the patches into the output vector.
-        insn_patch_array->for_each([&ret](auto&& el) {
-            if constexpr (toml::is_table<decltype(el)>) {
-                const toml::table& cur_patch = *el.as_table();
+        insn_patch_array->for_each([&patches](auto&& entry) {
+            if constexpr (toml::is_table<decltype(entry)>) {
+                const toml::table& patch_table = *entry.as_table();
 
-                // Get the vram and make sure it's 4-byte aligned.
-                std::optional<uint32_t> vram = cur_patch["vram"].value<uint32_t>();
-                std::optional<std::string> func_name = cur_patch["func"].value<std::string>();
-                std::optional<uint32_t> value = cur_patch["value"].value<uint32_t>();
+                std::optional<uint32_t> vram = patch_table["vram"].value<uint32_t>();
+                std::optional<std::string> func_name = patch_table["func"].value<std::string>();
+                std::optional<uint32_t> value = patch_table["value"].value<uint32_t>();
 
                 if (!vram.has_value() || !func_name.has_value() || !value.has_value()) {
-                    throw toml::parse_error("Instruction patch is missing required value(s)", el.source());
+                    throw toml::parse_error("Instruction patch is missing required value(s)", entry.source());
                 }
 
+                // The target address must land on a word boundary.
                 if (vram.value() & 0b11) {
-                    // Not properly aligned, so throw an error (and make it look like a normal toml one).
-                    throw toml::parse_error("Instruction patch is not word-aligned", el.source());
+                    throw toml::parse_error("Instruction patch is not word-aligned", entry.source());
                 }
 
-                ret.push_back(N64Recomp::InstructionPatch{
+                patches.push_back(N64Recomp::InstructionPatch{
                     .func_name = func_name.value(),
                     .vram = (int32_t)vram.value(),
                     .value = value.value(),
                 });
             }
             else {
-                throw toml::parse_error("Invalid instruction patch entry", el.source());
+                throw toml::parse_error("Invalid instruction patch entry", entry.source());
             }
         });
     }
 
-    return ret;
+    return patches;
 }
 
+// Parses [[patches.hook]] entries: snippets of literal C text to be injected
+// into a function, optionally anchored before a specific (word-aligned) vram.
+// Omitting before_vram places the hook at the function's entry (vram 0).
 std::vector<N64Recomp::FunctionTextHook> get_function_hooks(const toml::table* patches_data) {
-    std::vector<N64Recomp::FunctionTextHook> ret;
+    std::vector<N64Recomp::FunctionTextHook> hooks;
 
-    // Check if the function hook array exists.
     const toml::node_view func_hook_data = (*patches_data)["hook"];
 
     if (func_hook_data.is_array()) {
         const toml::array* func_hook_array = func_hook_data.as_array();
-        ret.reserve(func_hook_array->size());
+        hooks.reserve(func_hook_array->size());
 
-        // Copy all the hooks into the output vector.
-        func_hook_array->for_each([&ret](auto&& el) {
-            if constexpr (toml::is_table<decltype(el)>) {
-                const toml::table& cur_hook = *el.as_table();
+        func_hook_array->for_each([&hooks](auto&& entry) {
+            if constexpr (toml::is_table<decltype(entry)>) {
+                const toml::table& hook_table = *entry.as_table();
 
-                // Get the vram and make sure it's 4-byte aligned.
-                std::optional<uint32_t> before_vram = cur_hook["before_vram"].value<uint32_t>();
-                std::optional<std::string> func_name = cur_hook["func"].value<std::string>();
-                std::optional<std::string> text = cur_hook["text"].value<std::string>();
+                std::optional<uint32_t> before_vram = hook_table["before_vram"].value<uint32_t>();
+                std::optional<std::string> func_name = hook_table["func"].value<std::string>();
+                std::optional<std::string> text = hook_table["text"].value<std::string>();
 
                 if (!func_name.has_value() || !text.has_value()) {
-                    throw toml::parse_error("Function hook is missing required value(s)", el.source());
+                    throw toml::parse_error("Function hook is missing required value(s)", entry.source());
                 }
 
+                // If an anchor address was given it must be word-aligned.
                 if (before_vram.has_value() && before_vram.value() & 0b11) {
-                    // Not properly aligned, so throw an error (and make it look like a normal toml one).
-                    throw toml::parse_error("before_vram is not word-aligned", el.source());
+                    throw toml::parse_error("before_vram is not word-aligned", entry.source());
                 }
 
-                ret.push_back(N64Recomp::FunctionTextHook{
+                hooks.push_back(N64Recomp::FunctionTextHook{
                     .func_name = func_name.value(),
                     .before_vram = before_vram.has_value() ? (int32_t)before_vram.value() : 0,
                     .text = text.value(),
                 });
             }
             else {
-                throw toml::parse_error("Invalid function hook entry", el.source());
+                throw toml::parse_error("Invalid function hook entry", entry.source());
             }
         });
     }
 
-    return ret;
+    return hooks;
 }
 
 N64Recomp::Config::Config(const char* path) {
-    // Start this config out as bad so that it has to finish parsing without errors to be good.
+    // Assume failure until the whole file parses cleanly; `bad` is only cleared
+    // at the very end, so any thrown parse error leaves the config invalid.
     entrypoint = 0;
     bad = true;
     toml::table config_data{};
 
     try {
         config_data = toml::parse_file(path);
+        // Paths in the config are resolved relative to the config file itself.
         std::filesystem::path basedir = std::filesystem::path{ path }.parent_path();
 
-        // Input section (required)
+        // [input] table (required) and its entrypoint address (optional).
         const auto input_data = config_data["input"];
         const auto entrypoint_data = input_data["entrypoint"];
 
@@ -1006,28 +992,20 @@ N64Recomp::Config::Config(const char* path) {
             functions_per_output_file = 50;
         }
 
-        // Patches section (optional)
+        // [patches] table (optional). Each reader tolerates a missing sub-array.
         toml::node_view patches_data = config_data["patches"];
         if (patches_data.is_table()) {
             const toml::table* table = patches_data.as_table();
 
-            // Stubs array (optional)
-            stubbed_funcs = get_stubbed_funcs(table);
-
-            // Ignored funcs array (optional)
-            ignored_funcs = get_ignored_funcs(table);
-
-            // Renamed funcs array (optional)
-            renamed_funcs = get_renamed_funcs(table);
-
-            // Single-instruction patches (optional)
-            instruction_patches = get_instruction_patches(table);
-
-            // Function hooks (optional)
-            function_hooks = get_function_hooks(table);
+            stubbed_funcs = get_stubbed_funcs(table);        // stubs
+            ignored_funcs = get_ignored_funcs(table);        // ignored
+            renamed_funcs = get_renamed_funcs(table);        // renamed
+            instruction_patches = get_instruction_patches(table); // per-word instruction overrides
+            function_hooks = get_function_hooks(table);      // injected C text hooks
         }
 
-        // Use trace mode if enabled (optional)
+        // trace_mode (optional). When on, pull in the tracing header alongside
+        // the normal recomp include so generated code can emit trace calls.
         std::optional<bool> trace_mode_opt = input_data["trace_mode"].value<bool>();
         if (trace_mode_opt.has_value()) {
             trace_mode = trace_mode_opt.value();
@@ -1085,7 +1063,7 @@ N64Recomp::Config::Config(const char* path) {
         return;
     }
 
-    // No errors occured, so mark this config file as good.
+    // Reaching here means every field validated; promote the config to good.
     bad = false;
 }
 
@@ -1100,6 +1078,8 @@ const std::unordered_map<std::string, N64Recomp::RelocType> reloc_type_name_map 
     { "R_MIPS_GPREL16", N64Recomp::RelocType::R_MIPS_GPREL16 },
 };
 
+// Looks up a textual ELF reloc name (e.g. "R_MIPS_HI16") from a symbol file and
+// maps it to the recompiler's enum, defaulting to R_MIPS_NONE when unrecognized.
 N64Recomp::RelocType reloc_type_from_name(const std::string& reloc_type_name) {
     auto find_it = reloc_type_name_map.find(reloc_type_name);
     if (find_it != reloc_type_name_map.end()) {
@@ -1108,6 +1088,11 @@ N64Recomp::RelocType reloc_type_from_name(const std::string& reloc_type_name) {
     return N64Recomp::RelocType::R_MIPS_NONE;
 }
 
+// Builds a Context from a symbol-file TOML (the [[section]] / per-section
+// [[functions]] / [[relocs]] schema), optionally slicing each function's
+// instruction words out of the supplied rom. Relocations are only read when
+// `with_relocs` is set; sections that carry a relocs array are still flagged
+// relocatable regardless. On success the populated context is moved into `out`.
 bool N64Recomp::Context::from_symbol_file(const std::filesystem::path& symbol_file_path, std::vector<uint8_t>&& rom, N64Recomp::Context& out, bool with_relocs) {
     N64Recomp::Context ret{};
 
@@ -1208,14 +1193,13 @@ bool N64Recomp::Context::from_symbol_file(const std::filesystem::path& symbol_fi
                     }
                 });
 
-                // Check if relocs exist for the section and read them if so.
+                // A relocs array (even an unread one) means the section is relocatable.
                 const toml::node_view relocs_value = el["relocs"];
                 if (relocs_value.is_array()) {
-                    // Mark the section as relocatable, since it has relocs.
                     section.relocatable = true;
 
                     if (with_relocs) {
-                        // Read relocs for the section.
+                        // Decode each reloc entry into the section's reloc list.
                         const toml::array* relocs_array = relocs_value.as_array();
                         relocs_array->for_each([&ret, &rom, &section, section_index](auto&& reloc_el) {
                             if constexpr (toml::is_table<decltype(reloc_el)>) {
@@ -1261,6 +1245,8 @@ bool N64Recomp::Context::from_symbol_file(const std::filesystem::path& symbol_fi
         return false;
     }
 
+    // Post-parse recovery passes that lean on the rom bytes to tidy up function
+    // ranges the symbol file got slightly wrong (Stadium-specific heuristics).
     repair_truncated_symbol_function_ranges(ret, rom);
     repair_late_symbol_function_starts(ret, rom);
     synthesize_small_symbol_gap_functions(ret, rom);
@@ -1274,7 +1260,7 @@ bool N64Recomp::Context::import_reference_context(const N64Recomp::Context& refe
     reference_sections.resize(reference_context.sections.size());
     reference_symbols.reserve(reference_context.functions.size());
 
-    // Copy the reference context's sections into the real context's reference sections. 
+    // Mirror each of the reference context's sections into our reference-section list.
     for (size_t section_index = 0; section_index < reference_context.sections.size(); section_index++) {
         const N64Recomp::Section& section_in = reference_context.sections[section_index];
         N64Recomp::ReferenceSection& section_out = reference_sections[section_index];
@@ -1285,13 +1271,13 @@ bool N64Recomp::Context::import_reference_context(const N64Recomp::Context& refe
         section_out.relocatable = section_in.relocatable;
     }
 
-    // Copy the functions from the reference context into the reference context's function map.
+    // Register every reference function as a reference symbol (is_function = true).
     for (const N64Recomp::Function& func_in: reference_context.functions) {
         if (!add_reference_symbol(func_in.name, func_in.section_index, func_in.vram, true)) {
             return false;
         }
     }
-    
+
     return true;
 }
 
