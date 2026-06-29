@@ -60,14 +60,18 @@ static uint32_t infer_recomp_section_encoded_vram_base(
 }
 
 JalResolutionResult resolve_jal(const N64Recomp::Context& context, size_t cur_section_index, uint32_t target_func_vram, size_t& matched_function_index, size_t& static_section_index) {
-    // Skip resolution if all function calls should use lookup and just return Ambiguous.
+    // When the caller has opted every call into runtime lookup, there is
+    // nothing to resolve statically — report it as ambiguous straight away.
     if (context.use_lookup_for_all_function_calls) {
         return JalResolutionResult::Ambiguous;
     }
 
-    // Look for symbols with the target vram address
+    // Collect every function symbol that sits at the target address.
     const N64Recomp::Section& cur_section = context.sections[cur_section_index];
     const auto matching_funcs_find = context.functions_by_vram.find(target_func_vram);
+    // A section can be present at two address windows: the encoded (link-time)
+    // base inferred from its functions, and the canonical ram_addr base. The
+    // target counts as "in this section" if it lands in either window.
     uint32_t section_vram_start =
         infer_recomp_section_encoded_vram_base(context, cur_section_index);
     uint32_t section_vram_end = section_vram_start + cur_section.size;
@@ -81,23 +85,25 @@ JalResolutionResult resolve_jal(const N64Recomp::Context& context, size_t cur_se
     bool exact_match_found = false;
     static_section_index = cur_section_index;
 
-    // Use a thread local to prevent reallocation across runs and to allow multi-threading in the future.
+    // Thread-local scratch so the candidate buffer survives between calls
+    // without reallocating, and so this stays safe to parallelize later.
     thread_local std::vector<size_t> matched_funcs{};
     matched_funcs.clear();
 
-    // Evaluate any functions with the target address to see if they're potential candidates for JAL resolution.
+    // Walk the symbols at this address and keep the viable JAL candidates.
     if (matching_funcs_find != context.functions_by_vram.end()) {
         for (size_t target_func_index : matching_funcs_find->second) {
             const auto& target_func = context.functions[target_func_index];
 
-            // Zero-sized symbol handling. unless there's only one matching target.
+            // A zero-word symbol is only usable here if it's a manual patch.
             if (target_func.words.empty()) {
                 if (!N64Recomp::is_manual_patch_symbol(target_func.vram)) {
                     continue;
                 }
             }
 
-            // Immediately accept a function in the same section as this one, since it must also be loaded if the current function is.
+            // A target in our own section is guaranteed loaded whenever we
+            // are, so take it outright and stop searching.
             if (target_func.section_index == cur_section_index) {
                 exact_match_found = true;
                 matched_funcs.clear();
@@ -105,7 +111,8 @@ JalResolutionResult resolve_jal(const N64Recomp::Context& context, size_t cur_se
                 break;
             }
 
-            // If the function's section isn't relocatable, add the function as a candidate.
+            // Non-relocatable sections live at a fixed address, so their
+            // functions are always safe to name directly — keep as candidate.
             const auto& target_func_section = context.sections[target_func.section_index];
             if (!target_func_section.relocatable) {
                 matched_funcs.push_back(target_func_index);
@@ -113,24 +120,23 @@ JalResolutionResult resolve_jal(const N64Recomp::Context& context, size_t cur_se
         }
     }
 
-    // If the target vram is in the current section, only allow exact matches.
+    // A target inside our own section may only resolve to an exact symbol.
     if (in_current_section) {
-        // If an exact match was found, use it.
         if (exact_match_found) {
             matched_function_index = matched_funcs[0];
             return JalResolutionResult::Match;
         }
-        // Otherwise, create a static function at the target address.
+        // No symbol there — synthesize a static function at that address.
         else {
             return JalResolutionResult::CreateStatic;
         }
     }
-    // Otherwise, disambiguate based on the matches found.
+    // Target lives elsewhere: pick a winner from the candidate set.
     else {
-        // If there were no symbol matches, try to create a static function
-        // in the unique section that contains the target. This catches direct
-        // JALs from overlays into code that only has linker-script symbols,
-        // such as libultra helpers that live outside the caller's section.
+        // Nothing matched by symbol. Try to pin the target to the one section
+        // whose address range contains it and emit a static function there.
+        // This covers direct JALs from overlays into code that only carries
+        // linker-script symbols — e.g. libultra helpers outside the caller.
         if (matched_funcs.size() == 0) {
             size_t containing_section = (size_t)-1;
             for (size_t section_index = 0; section_index < context.sections.size(); section_index++) {
@@ -173,18 +179,18 @@ JalResolutionResult resolve_jal(const N64Recomp::Context& context, size_t cur_se
 
             return JalResolutionResult::NoMatch;
         }
-        // If there was an exact match, use it.
+        // Exactly one candidate — name it directly.
         else if (matched_funcs.size() == 1) {
             matched_function_index = matched_funcs[0];
             return JalResolutionResult::Match;
         }
-        // If there's more than one match, use an indirect jump to resolve the function at runtime.
+        // Several candidates — defer to a runtime indirect lookup.
         else {
             return JalResolutionResult::Ambiguous;
         }
     }
 
-    // This should never be hit, so return an error.
+    // Unreachable; present so every path returns a value.
     return JalResolutionResult::Error;
 }
 
@@ -353,7 +359,7 @@ bool process_instruction(GeneratorType& generator, const N64Recomp::Context& con
     }
 #endif
 
-    auto print_indent = [&]() {
+    auto indent_line = [&]() {
         fmt::print(output_file, "    ");
     };
 
@@ -361,12 +367,14 @@ bool process_instruction(GeneratorType& generator, const N64Recomp::Context& con
     if (hook_find != func.function_hooks.end()) {
         fmt::print(output_file, "    {}\n", hook_find->second);
         if (indent) {
-            print_indent();
+            indent_line();
         }
     }
 
-    // Output a comment with the original instruction
-    print_indent();
+    // Prefix the translated code with a comment showing the source instruction.
+    // Branch/jump targets are rendered symbolically so the comment matches the
+    // emitted label names.
+    indent_line();
     if (instr.isBranch() || instr_id == InstrId::cpu_j) {
         generator.emit_comment(fmt::format("0x{:08X}: {}", instr_vram, instr.disassemble(0, fmt::format("L_{:08X}", (uint32_t)instr.getBranchVramGeneric()))));
     } else if (instr_id == InstrId::cpu_jal) {
@@ -375,8 +383,9 @@ bool process_instruction(GeneratorType& generator, const N64Recomp::Context& con
         generator.emit_comment(fmt::format("0x{:08X}: {}", instr_vram, instr.disassemble(0)));
     }
 
-    // Replace loads for jump table entries into addiu. This leaves the jump table entry's address in the output register
-    // instead of the entry's value, which can then be used to determine the offset from the start of the jump table.
+    // For a load that reads a jump-table entry, rewrite it as an addiu so the
+    // output register ends up holding the ENTRY's address rather than its
+    // value. That address later yields the offset into the jump table.
     if (jtbl_lw_instructions.contains(instr_vram)) {
         assert(instr_id == InstrId::cpu_lw);
         instr_id = InstrId::cpu_addiu;
@@ -405,10 +414,9 @@ bool process_instruction(GeneratorType& generator, const N64Recomp::Context& con
     };
     uint16_t imm = instr.Get_immediate();
 
-    // Check if this instruction has a reloc.
+    // Pull in relocation data if a reloc is attached to this instruction.
     if (section.relocs.size() > 0 && section.relocs[reloc_index].address == instr_vram) {
         has_reloc = true;
-        // Get the reloc data for this instruction
         const auto& reloc = section.relocs[reloc_index];
         reloc_section = reloc.target_section;
 
@@ -491,7 +499,7 @@ bool process_instruction(GeneratorType& generator, const N64Recomp::Context& con
             }
         }
 
-        // Check if the relocation references a relocatable section.
+        // Determine whether the reloc points into a relocatable section.
         bool target_relocatable = false;
         if (!reloc.reference_symbol && reloc_section != N64Recomp::SectionAbsolute) {
             const auto& target_section = context.sections[reloc_section];
@@ -529,22 +537,25 @@ bool process_instruction(GeneratorType& generator, const N64Recomp::Context& con
             }
         }
 
-        // Only process this relocation if the target section is relocatable or if this relocation targets a reference symbol.
+        // Act on the reloc only when it lands in a relocatable section or names
+        // a reference symbol; otherwise leave it as a baked-in literal.
         if (target_relocatable || reloc.reference_symbol) {
-            // Record the reloc's data.
+            // Capture the reloc fields we will act on.
             reloc_type = reloc.type;
             reloc_target_section_offset = reloc.target_section_offset + bss_remap_offset_adjustment;
-            // Ignore all relocs that aren't MIPS_HI16, MIPS_LO16 or MIPS_26.
+            // We only handle MIPS_HI16, MIPS_LO16 and MIPS_26; skip the rest.
             if (reloc_type == N64Recomp::RelocType::R_MIPS_HI16 || reloc_type == N64Recomp::RelocType::R_MIPS_LO16 || reloc_type == N64Recomp::RelocType::R_MIPS_26) {
                 if (reloc.reference_symbol) {
                     reloc_reference_symbol = reloc.symbol_index;
-                    // Don't try to relocate special section symbols.
+                    // Special section symbols must not be relocated.
                     if (context.is_regular_reference_section(reloc.target_section) || reloc_section == N64Recomp::SectionAbsolute) {
                         // TODO this may not be needed anymore as HI16/LO16 relocs to non-relocatable sections is handled directly in elf parsing.
                         bool ref_section_relocatable = context.is_reference_section_relocatable(reloc.target_section);
-                        // Resolve HI16 and LO16 reference symbol relocs to non-relocatable sections by patching the instruction immediate.
+                        // For HI16/LO16 references into a non-relocatable section, fold the
+                        // address straight into the instruction immediate instead.
                         if (!ref_section_relocatable && (reloc_type == N64Recomp::RelocType::R_MIPS_HI16 || reloc_type == N64Recomp::RelocType::R_MIPS_LO16)) {
-                            // The reloc has been processed, so set it to none to prevent it getting processed a second time during instruction code generation.
+                            // Clear the reloc now that it's handled so code generation
+                            // doesn't apply it a second time.
                             reloc_type = N64Recomp::RelocType::R_MIPS_NONE;
                             reloc_reference_symbol = (size_t)-1;
                         }
@@ -557,7 +568,7 @@ bool process_instruction(GeneratorType& generator, const N64Recomp::Context& con
         }
     }
 
-    auto process_delay_slot = [&](bool use_indent) {
+    auto emit_delay_slot = [&](bool use_indent) {
         if (instr_index >= instructions.size() - 1) {
             // The branch/jump at the FINAL word of the function has its delay
             // slot outside the function's word range. Emitting the branch
@@ -591,100 +602,100 @@ bool process_instruction(GeneratorType& generator, const N64Recomp::Context& con
         return true;
     };
 
-    auto print_link_branch = [&]() {
+    auto emit_link_continuation = [&]() {
         if (needs_link_branch) {
-            print_indent();
+            indent_line();
             generator.emit_goto(fmt::format("after_{}", link_branch_index));
         }
     };
 
-    auto print_return_with_delay_slot = [&]() {
+    auto emit_jr_ra_return = [&]() {
         const std::string jr_target_var = fmt::format("jr_target_{:08X}", instr_vram);
-        print_indent();
+        indent_line();
         fmt::print(output_file, "{{\n");
-        print_indent();
+        indent_line();
         fmt::print(output_file, "gpr {} = ctx->r31;\n", jr_target_var);
-        if (!process_delay_slot(false)) {
+        if (!emit_delay_slot(false)) {
             return false;
         }
         bool emitted_local_dispatch = false;
         const std::string jr_target_vram_var = fmt::format("jr_target_vram_{:08X}", instr_vram);
-        print_indent();
+        indent_line();
         fmt::print(output_file, "uint32_t {} = U32({});\n", jr_target_vram_var, jr_target_var);
-        print_indent();
+        indent_line();
         fmt::print(output_file, "{{\n");
-        print_indent();
+        indent_line();
         fmt::print(output_file, "uint32_t jr_section_base = (uint32_t)section_addresses[{}];\n", func.section_index);
-        print_indent();
+        indent_line();
         fmt::print(output_file,
             "uint32_t jr_section_offset = {} - jr_section_base;\n",
             jr_target_vram_var);
-        print_indent();
+        indent_line();
         fmt::print(output_file,
             "if (jr_section_base != 0x{:08X}u && jr_section_offset < 0x{:08X}u) {{\n",
             section.ram_addr, section.size);
-        print_indent();
+        indent_line();
         fmt::print(output_file,
             "{} = 0x{:08X}u + jr_section_offset;\n",
             jr_target_vram_var, section.ram_addr);
-        print_indent();
+        indent_line();
         fmt::print(output_file, "}}\n");
-        print_indent();
+        indent_line();
         fmt::print(output_file, "}}\n");
         for (uint32_t label_vram : branch_labels) {
             if (label_vram >= func.vram && label_vram < func_vram_end) {
                 if (!emitted_local_dispatch) {
-                    print_indent();
+                    indent_line();
                     fmt::print(output_file, "switch ({}) {{\n", jr_target_vram_var);
                     emitted_local_dispatch = true;
                 }
-                print_indent();
+                indent_line();
                 fmt::print(output_file, "case 0x{:08X}u: goto L_{:08X};\n", label_vram, label_vram);
             }
         }
         if (emitted_local_dispatch) {
-            print_indent();
+            indent_line();
             fmt::print(output_file, "default: break;\n");
-            print_indent();
+            indent_line();
             fmt::print(output_file, "}}\n");
         }
-        print_indent();
+        indent_line();
         fmt::print(output_file, "if ({} != ctx->host_return_target) {{\n", jr_target_vram_var);
-        print_indent();
+        indent_line();
         fmt::print(output_file, "    recomp_request_tailcall(ctx, (gpr)(int32_t){});\n", jr_target_vram_var);
         if (context.trace_mode) {
-            print_indent();
+            indent_line();
             fmt::print(output_file, "    TRACE_RETURN()\n");
         }
-        print_indent();
+        indent_line();
         fmt::print(output_file, "    return;\n");
-        print_indent();
+        indent_line();
         fmt::print(output_file, "}}\n");
-        print_indent();
+        indent_line();
         generator.emit_return(context, func_index);
-        print_indent();
+        indent_line();
         fmt::print(output_file, "}}\n");
-        print_link_branch();
+        emit_link_continuation();
         return true;
     };
 
-    auto print_goto_with_delay_slot = [&](const std::string& target) {
-        if (!process_delay_slot(false)) {
+    auto emit_goto_with_slot = [&](const std::string& target) {
+        if (!emit_delay_slot(false)) {
             return false;
         }
-        print_indent();
+        indent_line();
         generator.emit_goto(target);
-        print_link_branch();
+        emit_link_continuation();
         return true;
     };
 
-    auto print_func_call_by_register = [&](int reg) {
-        if (!process_delay_slot(false)) {
+    auto emit_call_by_register = [&](int reg) {
+        if (!emit_delay_slot(false)) {
             return false;
         }
-        print_indent();
+        indent_line();
         generator.emit_function_call_by_register(reg, get_local_tailcall_labels(), get_call_return_label());
-        print_link_branch();
+        emit_link_continuation();
         return true;
     };
 
@@ -692,70 +703,70 @@ bool process_instruction(GeneratorType& generator, const N64Recomp::Context& con
         return reg == 0 ? std::string{"0"} : fmt::format("ctx->r{}", reg);
     };
 
-    auto print_trace_return = [&]() {
+    auto emit_trace_return = [&]() {
         if (context.trace_mode) {
-            print_indent();
+            indent_line();
             fmt::print(output_file, "TRACE_RETURN()\n");
         }
     };
 
-    auto print_tailcall_by_register = [&](int reg) {
-        if (!process_delay_slot(false)) {
+    auto emit_tailcall_by_register = [&](int reg) {
+        if (!emit_delay_slot(false)) {
             return false;
         }
-        print_indent();
+        indent_line();
         fmt::print(output_file, "recomp_request_tailcall(ctx, (gpr)(int32_t){});\n", gpr_expr(reg));
-        print_trace_return();
-        print_indent();
+        emit_trace_return();
+        indent_line();
         fmt::print(output_file, "return;\n");
         return true;
     };
 
-    auto print_tailcall_by_address = [&](uint32_t target_vram) {
-        if (!process_delay_slot(false)) {
+    auto emit_tailcall_by_address = [&](uint32_t target_vram) {
+        if (!emit_delay_slot(false)) {
             return false;
         }
-        print_indent();
+        indent_line();
         fmt::print(output_file, "if (0x{:08X}u == ctx->host_return_target) {{\n", target_vram);
         if (context.trace_mode) {
-            print_indent();
+            indent_line();
             fmt::print(output_file, "    TRACE_RETURN()\n");
         }
-        print_indent();
+        indent_line();
         fmt::print(output_file, "    return;\n");
-        print_indent();
+        indent_line();
         fmt::print(output_file, "}}\n");
-        print_indent();
+        indent_line();
         fmt::print(output_file, "recomp_request_tailcall(ctx, (gpr)(int32_t)0x{:08X}u);\n", target_vram);
-        print_trace_return();
-        print_indent();
+        emit_trace_return();
+        indent_line();
         fmt::print(output_file, "return;\n");
         return true;
     };
 
-    auto print_tailcall_by_function = [&](const std::string& target_name, uint32_t target_vram) {
-        if (!process_delay_slot(false)) {
+    auto emit_tailcall_by_function = [&](const std::string& target_name, uint32_t target_vram) {
+        if (!emit_delay_slot(false)) {
             return false;
         }
-        print_indent();
+        indent_line();
         fmt::print(output_file, "if (0x{:08X}u == ctx->host_return_target) {{\n", target_vram);
         if (context.trace_mode) {
-            print_indent();
+            indent_line();
             fmt::print(output_file, "    TRACE_RETURN()\n");
         }
-        print_indent();
+        indent_line();
         fmt::print(output_file, "    return;\n");
-        print_indent();
+        indent_line();
         fmt::print(output_file, "}}\n");
-        print_indent();
+        indent_line();
         fmt::print(output_file, "recomp_request_tailcall_func_target(ctx, {}, 0x{:08X}u);\n", target_name, target_vram);
-        print_trace_return();
-        print_indent();
+        emit_trace_return();
+        indent_line();
         fmt::print(output_file, "return;\n");
         return true;
     };
 
-    auto print_func_call_by_address = [&generator, reloc_target_section_offset, has_reloc, reloc_section, reloc_reference_symbol, reloc_type, &context, &func, &static_funcs_out, &needs_link_branch, &print_indent, &process_delay_slot, &print_link_branch, &output_file, instr_vram, &get_local_tailcall_labels, &get_call_return_label]
+    auto emit_call_by_address = [&generator, reloc_target_section_offset, has_reloc, reloc_section, reloc_reference_symbol, reloc_type, &context, &func, &static_funcs_out, &needs_link_branch, &indent_line, &emit_delay_slot, &emit_link_continuation, &output_file, instr_vram, &get_local_tailcall_labels, &get_call_return_label]
         (uint32_t target_func_vram, bool tail_call = false, bool indent = false)
     {
         bool call_by_lookup = false;
@@ -764,14 +775,14 @@ bool process_instruction(GeneratorType& generator, const N64Recomp::Context& con
         if (reloc_section == N64Recomp::SectionEvent) {
             needs_link_branch = !tail_call;
             if (indent) {
-                print_indent();
+                indent_line();
             }
-            if (!process_delay_slot(false)) {
+            if (!emit_delay_slot(false)) {
                 return false;
             }
-            print_indent();
+            indent_line();
             generator.emit_trigger_event((uint32_t)reloc_reference_symbol);
-            print_link_branch();
+            emit_link_continuation();
         }
         // Normal symbol or reference symbol, 
         else {
@@ -849,12 +860,12 @@ bool process_instruction(GeneratorType& generator, const N64Recomp::Context& con
             }
             needs_link_branch = !tail_call;
             if (indent) {
-                print_indent();
+                indent_line();
             }
-            if (!process_delay_slot(false)) {
+            if (!emit_delay_slot(false)) {
                 return false;
             }
-            print_indent();
+            indent_line();
             if (reloc_reference_symbol != (size_t)-1) {
                 generator.emit_function_call_reference_symbol(context, reloc_section, reloc_reference_symbol, reloc_target_section_offset, get_local_tailcall_labels(), get_call_return_label());
             }
@@ -867,12 +878,12 @@ bool process_instruction(GeneratorType& generator, const N64Recomp::Context& con
             else {
                 generator.emit_function_call(context, matched_func_index, get_local_tailcall_labels(), get_call_return_label());
             }
-            print_link_branch();
+            emit_link_continuation();
         }
         return true;
     };
 
-    auto print_branch = [&](uint32_t branch_target) {
+    auto emit_branch_tree = [&](uint32_t branch_target) {
         // If the branch target is outside the current function, check if it can be treated as a tail call.
         if (branch_target < func.vram || branch_target >= func_vram_end) {
             size_t matched_func_index = (size_t)-1;
@@ -915,19 +926,19 @@ bool process_instruction(GeneratorType& generator, const N64Recomp::Context& con
                     branch_target,
                     resolution_name);
                 if (branch_result == JalResolutionResult::Match) {
-                    if (!print_tailcall_by_function(context.functions[matched_func_index].name, branch_target)) {
+                    if (!emit_tailcall_by_function(context.functions[matched_func_index].name, branch_target)) {
                         return false;
                     }
                 }
                 else if (can_create_static_branch) {
                     std::string static_target_name = fmt::format("static_{}_{:08X}", static_section_index, branch_target);
                     static_funcs_out[static_section_index].push_back(branch_target);
-                    if (!print_tailcall_by_function(static_target_name, branch_target)) {
+                    if (!emit_tailcall_by_function(static_target_name, branch_target)) {
                         return false;
                     }
                 }
                 else {
-                    if (!print_tailcall_by_address(branch_target)) {
+                    if (!emit_tailcall_by_address(branch_target)) {
                         return false;
                     }
                 }
@@ -939,19 +950,19 @@ bool process_instruction(GeneratorType& generator, const N64Recomp::Context& con
             // never exists. No stub — an unimplementable hole surfaced
             // loudly at runtime.
             fmt::print(stderr, "[Warn] Function {} is branching outside of the function (to 0x{:08X}) — emitting runtime abort\n", func.name, branch_target);
-            if (!process_delay_slot(true)) {
+            if (!emit_delay_slot(true)) {
                 return false;
             }
-            print_indent();
-            print_indent();
+            indent_line();
+            indent_line();
             fmt::print(output_file, "recomp_unhandled_branch(rdram, ctx, 0x{:08X}u, 0x{:08X}u);\n", instr_vram, branch_target);
-            print_indent();
-            print_indent();
+            indent_line();
+            indent_line();
             generator.emit_return(context, func_index);
             return true;
         }
 
-        if (!process_delay_slot(true)) {
+        if (!emit_delay_slot(true)) {
             return false;
         }
 
@@ -975,25 +986,25 @@ bool process_instruction(GeneratorType& generator, const N64Recomp::Context& con
         // consumers may redefine it, but it must remain a real yield
         // point.
         if (branch_target <= instr_vram) {
-            print_indent();
-            print_indent();
+            indent_line();
+            indent_line();
             fmt::print(output_file, "RECOMP_LOOP_CHECKPOINT_VRAM(0x{:08X}u)\n", instr_vram);
         }
 
-        print_indent();
-        print_indent();
+        indent_line();
+        indent_line();
         generator.emit_goto(fmt::format("L_{:08X}", branch_target));
         // TODO check if this link branch ever exists.
         if (needs_link_branch) {
-            print_indent();
-            print_indent();
+            indent_line();
+            indent_line();
             generator.emit_goto(fmt::format("after_{}", link_branch_index));
         }
         return true;
     };
 
     if (indent) {
-        print_indent();
+        indent_line();
     }
 
     int rd = (int)instr.GetO32_rd();
@@ -1013,54 +1024,51 @@ bool process_instruction(GeneratorType& generator, const N64Recomp::Context& con
     case InstrId::cpu_nop:
         fmt::print(output_file, "\n");
         break;
-    // CPU cache management op (`cache op, offset(base)`). Semantically
-    // a no-op in the recompiled environment: there is no CPU cache
-    // hierarchy to flush/invalidate, and the instruction has no
-    // observable side effect on register state or memory contents.
-    // Surfaces in libultra (osInvalDCache / osWritebackDCache /
-    // osInvalICache) and game code that prepares DMA-source buffers
-    // for cache coherency. Treating as nop is the architecturally-
-    // correct HLE model for the same reason cop0 status/cause storage
-    // is HLE-correct: we don't simulate the subsystem the instruction
-    // talks to.
+    // `cache op, offset(base)` — collapses to nothing here. The recompiled
+    // target has no CPU cache to flush or invalidate, and the instruction
+    // touches neither registers nor memory, so it has no observable effect.
+    // It shows up in libultra cache routines (osInvalDCache /
+    // osWritebackDCache / osInvalICache) and in game code priming DMA source
+    // buffers. Emitting a nop is the correct HLE choice for the same reason
+    // the cop0 status/cause storage path is: we don't model the hardware
+    // subsystem the instruction is addressing.
     case InstrId::cpu_cache:
         fmt::print(output_file, "\n");
         break;
-    // COP0 dispatch.
+    // COP0 register access.
     //
-    // Each register is handled deliberately, not by a default fallback:
-    //   - Status (12)          → dedicated helper (FR + interrupt enable)
-    //   - Reserved (21..25, 31) → loud abort (genuinely-undefined access)
-    //   - Everything else      → ctx->cop0_regs[reg] storage
+    // The register is routed explicitly rather than through a catch-all:
+    //   - Status (12)           -> a dedicated helper (FR + interrupt enable)
+    //   - Reserved (21..25, 31) -> a loud abort (genuinely undefined access)
+    //   - all others            -> plain ctx->cop0_regs[reg] storage
     //
-    // The storage path is the architecturally-correct HLE model for
-    // every register whose hardware semantics depend on subsystems we
-    // don't simulate (TLB, cache, exception entry, debug watchpoints).
-    // See the cop0_regs[32] doc-comment in include/recomp.h for the
-    // per-register reasoning.
+    // Backing the remaining registers with storage is the right HLE model:
+    // their real semantics hang off subsystems we never simulate (TLB,
+    // cache, exception entry, debug watchpoints). The per-register rationale
+    // lives next to the cop0_regs[32] declaration in include/recomp.h.
     //
-    // When a game surfaces a register whose HLE semantics need a side
-    // effect (read of Count for elapsed time, read of Cause for pending
-    // IRQs, write of Compare with timer ack), add a dedicated helper
-    // for THAT register here — don't widen the storage path silently.
+    // If a title ever needs a register with an actual side effect (reading
+    // Count for elapsed time, reading Cause for pending IRQs, writing
+    // Compare to ack a timer), give THAT register its own helper here rather
+    // than quietly broadening the storage path.
     case InstrId::cpu_mfc0:
         {
             Cop0Reg reg = instr.Get_cop0d();
             int reg_index = (int)reg;
             if (reg == Cop0Reg::COP0_Status) {
-                print_indent();
+                indent_line();
                 generator.emit_cop0_status_read(rt);
             } else if ((reg_index >= 21 && reg_index <= 25) || reg_index == 31) {
-                // Reserved on real hardware — genuine "shouldn't happen"
-                // case. Stay loud.
+                // These indices are reserved on hardware — a true
+                // "can't happen" read. Surface it loudly.
                 fmt::print(stderr, "[Warn] mfc0 from reserved cop0 register {} — emitting runtime abort\n", reg_index);
-                print_indent();
+                indent_line();
                 fmt::print(output_file, "ctx->r{} = recomp_unhandled_cop0_read(rdram, ctx, 0x{:08X}u, {});\n",
                     (int)rt, instr_vram, reg_index);
             } else {
-                // HLE-correct storage. sign-extend to 64-bit gpr like
-                // the existing default path did for non-Status reads.
-                print_indent();
+                // Plain storage read, sign-extended into the 64-bit gpr
+                // exactly as the former default path did for non-Status regs.
+                indent_line();
                 fmt::print(output_file, "ctx->r{} = (int32_t)ctx->cop0_regs[{}];\n",
                     (int)rt, reg_index);
             }
@@ -1071,15 +1079,15 @@ bool process_instruction(GeneratorType& generator, const N64Recomp::Context& con
             Cop0Reg reg = instr.Get_cop0d();
             int reg_index = (int)reg;
             if (reg == Cop0Reg::COP0_Status) {
-                print_indent();
+                indent_line();
                 generator.emit_cop0_status_write(rt);
             } else if ((reg_index >= 21 && reg_index <= 25) || reg_index == 31) {
                 fmt::print(stderr, "[Warn] mtc0 to reserved cop0 register {} — emitting runtime abort\n", reg_index);
-                print_indent();
+                indent_line();
                 fmt::print(output_file, "recomp_unhandled_cop0_write(rdram, ctx, 0x{:08X}u, {}, ctx->r{});\n",
                     instr_vram, reg_index, (int)rt);
             } else {
-                print_indent();
+                indent_line();
                 fmt::print(output_file, "ctx->cop0_regs[{}] = (uint32_t)ctx->r{};\n",
                     reg_index, (int)rt);
             }
@@ -1089,15 +1097,15 @@ bool process_instruction(GeneratorType& generator, const N64Recomp::Context& con
     case InstrId::cpu_add:
     case InstrId::cpu_addu:
         {
-            // Check if this addu belongs to a jump table load
+            // Does this addu form part of a jump-table address computation?
             auto find_result = std::find_if(stats.jump_tables.begin(), stats.jump_tables.end(),
                 [instr_vram](const N64Recomp::JumpTable& jtbl) {
                 return jtbl.addu_vram == instr_vram;
             });
-            // If so, create a temp to preserve the addend register's value
+            // If so, stash the addend register's value in a temporary first.
             if (find_result != stats.jump_tables.end()) {
                 const N64Recomp::JumpTable& cur_jtbl = *find_result;
-                print_indent();
+                indent_line();
                 generator.emit_jtbl_addend_declaration(cur_jtbl, cur_jtbl.addend_reg);
             }
         }
@@ -1110,16 +1118,16 @@ bool process_instruction(GeneratorType& generator, const N64Recomp::Context& con
     case InstrId::cpu_ddiv:
     case InstrId::cpu_divu:
     case InstrId::cpu_ddivu:
-        print_indent();
+        indent_line();
         generator.emit_muldiv(instr_id, rs, rt);
         break;
     // Branches
     case InstrId::cpu_jal:
-        // MIPS link side-effect: $ra := PC+8, written before the delay slot
-        // executes. Required for handwritten code that computes addresses
-        // from $ra (e.g. Stadium audio synth's `addiu $t3, $ra, OFFSET`
-        // PC-arithmetic trick).
-        print_indent();
+        // The MIPS link write ($ra := PC+8) is committed before the delay
+        // slot runs. Handwritten code that derives addresses from $ra relies
+        // on this ordering (e.g. Stadium's audio synth doing
+        // `addiu $t3, $ra, OFFSET` as a PC-arithmetic trick).
+        indent_line();
         {
             uint32_t link_target = instr_vram + 8;
             fmt::print(output_file, "ctx->r31 = 0x{:08X}u;\n", link_target);
@@ -1133,11 +1141,11 @@ bool process_instruction(GeneratorType& generator, const N64Recomp::Context& con
         {
             const uint32_t branch_target = instr.getBranchVramGeneric();
             if (branch_target >= func.vram && branch_target < func_vram_end) {
-                if (!print_goto_with_delay_slot(fmt::format("L_{:08X}", branch_target))) {
+                if (!emit_goto_with_slot(fmt::format("L_{:08X}", branch_target))) {
                     return false;
                 }
             }
-            else if (!print_func_call_by_address(branch_target)) {
+            else if (!emit_call_by_address(branch_target)) {
                 return false;
             }
         }
@@ -1147,7 +1155,7 @@ bool process_instruction(GeneratorType& generator, const N64Recomp::Context& con
             uint32_t link_target = instr_vram + 8;
 
             if (rd != 0) {
-                print_indent();
+                indent_line();
                 fmt::print(output_file, "ctx->r{} = 0x{:08X}u;\n", rd, link_target);
 
                 uint64_t section_start = section.ram_addr;
@@ -1157,13 +1165,13 @@ bool process_instruction(GeneratorType& generator, const N64Recomp::Context& con
                 }
             }
 
-            if (!print_tailcall_by_register(rs)) {
+            if (!emit_tailcall_by_register(rs)) {
                 return false;
             }
             break;
         }
         // MIPS link side-effect: $ra := PC+8 (see cpu_jal comment).
-        print_indent();
+        indent_line();
         {
             uint32_t link_target = instr_vram + 8;
             fmt::print(output_file, "ctx->r31 = 0x{:08X}u;\n", link_target);
@@ -1176,7 +1184,7 @@ bool process_instruction(GeneratorType& generator, const N64Recomp::Context& con
         }
         needs_link_branch = true;
         // Propagate failure (delay-slot-out-of-bounds guard) — see cpu_jr.
-        if (!print_func_call_by_register(rs)) {
+        if (!emit_call_by_register(rs)) {
             return false;
         }
         break;
@@ -1185,11 +1193,11 @@ bool process_instruction(GeneratorType& generator, const N64Recomp::Context& con
         {
             uint32_t branch_target = instr.getBranchVramGeneric();
             if (branch_target == instr_vram) {
-                print_indent();
+                indent_line();
                 generator.emit_pause_self();
             }
             else {
-                if (!print_branch(branch_target)) {
+                if (!emit_branch_tree(branch_target)) {
                     return false;
                 }
             }
@@ -1197,12 +1205,12 @@ bool process_instruction(GeneratorType& generator, const N64Recomp::Context& con
         break;
     case InstrId::cpu_jr:
         if (rs == (int)rabbitizer::Registers::Cpu::GprO32::GPR_O32_ra) {
-            // Propagate failure (e.g. the delay-slot-out-of-bounds guard in
-            // process_delay_slot). Ignoring it silently dropped the jr-ra
-            // delay slot for every function whose symbols-file size excluded
-            // it — often a meaningful instruction (sp restore, return-value
-            // set), i.e. a silent miscompile.
-            if (!print_return_with_delay_slot()) {
+            // Bubble the failure up (e.g. emit_delay_slot's
+            // delay-slot-out-of-bounds guard). Swallowing it used to drop the
+            // jr-ra delay slot for any function whose symbols-file size cut it
+            // off — frequently a load-bearing instruction (sp restore, return
+            // value), which is a silent miscompile.
+            if (!emit_jr_ra_return()) {
                 return false;
             }
         } else {
@@ -1213,20 +1221,20 @@ bool process_instruction(GeneratorType& generator, const N64Recomp::Context& con
 
             if (jtbl_find_result != stats.jump_tables.end()) {
                 const N64Recomp::JumpTable& cur_jtbl = *jtbl_find_result;
-                if (!process_delay_slot(false)) {
+                if (!emit_delay_slot(false)) {
                     return false;
                 }
-                print_indent();
+                indent_line();
                 generator.emit_switch(context, cur_jtbl, rs);
                 for (size_t entry_index = 0; entry_index < cur_jtbl.entries.size(); entry_index++) {
-                    print_indent();
-                    print_indent();
+                    indent_line();
+                    indent_line();
                     generator.emit_case(entry_index, fmt::format("L_{:08X}", cur_jtbl.entries[entry_index]));
                 }
-                print_indent();
-                print_indent();
+                indent_line();
+                indent_line();
                 generator.emit_switch_error(instr_vram, cur_jtbl.vram);
-                print_indent();
+                indent_line();
                 generator.emit_switch_close();
                 break;
             }
@@ -1239,19 +1247,19 @@ bool process_instruction(GeneratorType& generator, const N64Recomp::Context& con
                     static_funcs_out[func.section_index].push_back(fallthrough_target);
                 }
             }
-            print_tailcall_by_register(rs);
+            emit_tailcall_by_register(rs);
             break;
         }
         break;
     case InstrId::cpu_syscall:
-        print_indent();
+        indent_line();
         generator.emit_syscall(instr_vram);
-        // syscalls don't link, so treat it like a tail call
-        print_indent();
+        // A syscall doesn't set a link register, so wind up like a tail call.
+        indent_line();
         generator.emit_return(context, func_index);
         break;
     case InstrId::cpu_break:
-        print_indent();
+        indent_line();
         generator.emit_do_break(instr_vram);
         break;
 
@@ -1261,7 +1269,7 @@ bool process_instruction(GeneratorType& generator, const N64Recomp::Context& con
             fmt::print(stderr, "Invalid FP control register for ctc1: {}\n", cop1_cs);
             return false;
         }
-        print_indent();
+        indent_line();
         generator.emit_cop1_cs_write(rt);
         break;
     case InstrId::cpu_cfc1:
@@ -1269,7 +1277,7 @@ bool process_instruction(GeneratorType& generator, const N64Recomp::Context& con
             fmt::print(stderr, "Invalid FP control register for cfc1: {}\n", cop1_cs);
             return false;
         }
-        print_indent();
+        indent_line();
         generator.emit_cop1_cs_read(rt);
         break;
     default:
@@ -1316,7 +1324,7 @@ bool process_instruction(GeneratorType& generator, const N64Recomp::Context& con
                 generator.emit_check_fr(ctx.ft);
                 break;
             default:
-                // No MIPS3 float check needed for non-float operands.
+                // Integer operands carry no MIPS3 FR check.
                 break;
         }
     };
@@ -1342,14 +1350,14 @@ bool process_instruction(GeneratorType& generator, const N64Recomp::Context& con
                 generator.emit_check_nan(ctx.ft, true);
                 break;
             default:
-                // No NaN checks needed for non-float operands.
+                // Integer operands need no NaN check.
                 break;
         }
     };
 
     auto find_binary_it = binary_ops.find(instr_id);
     if (find_binary_it != binary_ops.end()) {
-        print_indent();
+        indent_line();
         const BinaryOp& op = find_binary_it->second;
         
         if (op.check_fr) {
@@ -1362,7 +1370,7 @@ bool process_instruction(GeneratorType& generator, const N64Recomp::Context& con
             do_check_nan(generator, instruction_context, op.operands.operands[0]);
             do_check_nan(generator, instruction_context, op.operands.operands[1]);
             fmt::print(output_file, "\n");
-            print_indent();
+            indent_line();
         }
 
         generator.process_binary_op(op, instruction_context);
@@ -1371,7 +1379,7 @@ bool process_instruction(GeneratorType& generator, const N64Recomp::Context& con
 
     auto find_unary_it = unary_ops.find(instr_id);
     if (find_unary_it != unary_ops.end()) {
-        print_indent();
+        indent_line();
         const UnaryOp& op = find_unary_it->second;
         
         if (op.check_fr) {
@@ -1382,7 +1390,7 @@ bool process_instruction(GeneratorType& generator, const N64Recomp::Context& con
         if (op.check_nan) {
             do_check_nan(generator, instruction_context, op.input);
             fmt::print(output_file, "\n");
-            print_indent();
+            indent_line();
         }
 
         generator.process_unary_op(op, instruction_context);
@@ -1391,16 +1399,16 @@ bool process_instruction(GeneratorType& generator, const N64Recomp::Context& con
 
     auto find_conditional_branch_it = conditional_branch_ops.find(instr_id);
     if (find_conditional_branch_it != conditional_branch_ops.end()) {
-        // MIPS link side-effect for bltzal/bgezal/bltzall/bgezall: $ra := PC+8
-        // is committed unconditionally, regardless of whether the branch is
-        // taken. Emit the write BEFORE the if-block so it runs in both
-        // branch-taken and branch-not-taken paths. Required for handwritten
-        // code (e.g. Stadium audio synth) that uses bltzal $zero,X as a
-        // PC-arithmetic primitive: the branch is always-not-taken (since
-        // $zero is never < 0), but $ra still gets loaded so that the
-        // following `addiu $t3, $ra, OFFSET` can compute a function pointer.
+        // For the linking conditional branches (bltzal/bgezal/bltzall/
+        // bgezall) the $ra := PC+8 write happens unconditionally, whether or
+        // not the branch is taken. Emit it ahead of the if-block so it lands
+        // on both paths. Handwritten code leans on this — e.g. Stadium's audio
+        // synth uses `bltzal $zero, X` as a PC-arithmetic primitive: the
+        // branch can never be taken ($zero is never negative), yet $ra is
+        // still loaded so the following `addiu $t3, $ra, OFFSET` can form a
+        // function pointer.
         if (find_conditional_branch_it->second.link) {
-            print_indent();
+            indent_line();
             {
                 uint32_t link_target = instr_vram + 8;
                 fmt::print(output_file, "ctx->r31 = 0x{:08X}u;\n", link_target);
@@ -1412,30 +1420,30 @@ bool process_instruction(GeneratorType& generator, const N64Recomp::Context& con
                 }
             }
         }
-        print_indent();
+        indent_line();
         // TODO combining the branch condition and branch target into one generator call would allow better optimization in the runtime's JIT generator.
         // This would require splitting into a conditional jump method and conditional function call method.
         generator.emit_branch_condition(find_conditional_branch_it->second, instruction_context);
 
-        print_indent();
+        indent_line();
         if (find_conditional_branch_it->second.link) {
             const uint32_t branch_target = instr.getBranchVramGeneric();
             if (branch_target >= func.vram && branch_target < func_vram_end) {
-                if (!print_branch(branch_target)) {
+                if (!emit_branch_tree(branch_target)) {
                     return false;
                 }
             }
-            else if (!print_func_call_by_address(branch_target)) {
+            else if (!emit_call_by_address(branch_target)) {
                 return false;
             }
         }
         else {
-            if (!print_branch((uint32_t)instr.getBranchVramGeneric())) {
+            if (!emit_branch_tree((uint32_t)instr.getBranchVramGeneric())) {
                 return false;
             }
         }
 
-        print_indent();
+        indent_line();
         generator.emit_branch_close();
         
         is_branch_likely = find_conditional_branch_it->second.likely;
@@ -1444,7 +1452,7 @@ bool process_instruction(GeneratorType& generator, const N64Recomp::Context& con
 
     auto find_store_it = store_ops.find(instr_id);
     if (find_store_it != store_ops.end()) {
-        print_indent();
+        indent_line();
         const StoreOp& op = find_store_it->second;
 
         if (op.type == StoreOpType::SDC1) {
@@ -1456,19 +1464,19 @@ bool process_instruction(GeneratorType& generator, const N64Recomp::Context& con
     }
 
     if (!handled) {
-        // Engine doesn't have a decoder for this opcode. Emit a runtime
-        // call instead of failing — function still compiles; if execution
-        // reaches the unhandled instruction, it aborts loudly with the
-        // opcode name. Not a stub — an unimplementable hole surfaced
-        // at runtime with full context.
+        // No decoder matched this opcode. Rather than abort the whole
+        // recompile, emit a runtime call: the function still builds, and if
+        // control ever reaches this instruction it fails loudly with the
+        // opcode name. This is not a stub — it's an unimplementable hole that
+        // announces itself at runtime with full context.
         fmt::print(stderr, "[Warn] Unhandled instruction '{}' in {} at 0x{:08X} — emitting runtime abort\n", instr.getOpcodeName(), func.name, instr_vram);
-        print_indent();
+        indent_line();
         fmt::print(output_file, "recomp_unhandled_instruction(rdram, ctx, 0x{:08X}u, \"{}\");\n", instr_vram, instr.getOpcodeName());
     }
 
     // TODO is this used?
     if (emit_link_branch) {
-        print_indent();
+        indent_line();
         generator.emit_label(fmt::format("after_{}", link_branch_index));
     }
 
@@ -1489,9 +1497,9 @@ bool recompile_function_impl(GeneratorType& generator, const N64Recomp::Context&
             func.name);
     }
 
-    // Skip analysis and recompilation of this function is stubbed.
+    // A stubbed function has no body to analyze or translate.
     if (!func.stubbed) {
-        // Use a set to sort and deduplicate labels
+        // std::set keeps the label vrams sorted and unique.
         std::set<uint32_t> branch_labels;
         std::set<uint32_t> local_tailcall_labels;
         instructions.reserve(func.words.size());
@@ -1551,7 +1559,7 @@ bool recompile_function_impl(GeneratorType& generator, const N64Recomp::Context&
         }
         generator.emit_label(fmt::format("L_{:08X}", func.vram));
 
-        // First pass, disassemble each instruction and collect branch labels
+        // Pass one: decode every word and gather the local branch labels.
         uint32_t vram = func.vram;
         for (uint32_t word : func.words) {
             const auto& instr = instructions.emplace_back(byteswap(word), vram);
@@ -1564,7 +1572,7 @@ bool recompile_function_impl(GeneratorType& generator, const N64Recomp::Context&
                 }
             };
 
-            // If this is a branch or a direct jump, add it to the local label list
+            // Branches and direct jumps contribute their target as a label.
             if (instr.isBranch() || instr_id == rabbitizer::InstrId::UniqueId::cpu_j) {
                 branch_labels.insert(branch_target);
             }
@@ -1590,11 +1598,11 @@ bool recompile_function_impl(GeneratorType& generator, const N64Recomp::Context&
                 add_link_return_label();
             }
 
-            // Advance the vram address by the size of one instruction
+            // Step to the next instruction address.
             vram += 4;
         }
 
-        // Analyze function
+        // Run the per-function analysis pass.
         N64Recomp::FunctionStats stats{};
         if (!N64Recomp::analyze_function(context, func, instructions, stats)) {
             fmt::print(stderr, "Failed to analyze {}\n", func.name);
@@ -1603,7 +1611,7 @@ bool recompile_function_impl(GeneratorType& generator, const N64Recomp::Context&
 
         std::unordered_set<uint32_t> jtbl_lw_instructions{};
 
-        // Add jump table labels into function
+        // Fold every jump-table destination into the label set.
         for (const auto& jtbl : stats.jump_tables) {
             jtbl_lw_instructions.insert(jtbl.lw_vram);
             for (uint32_t jtbl_entry : jtbl.entries) {
@@ -1647,7 +1655,7 @@ bool recompile_function_impl(GeneratorType& generator, const N64Recomp::Context&
         }
         branch_labels.erase(func.vram);
 
-        // Second pass, emit code for each instruction and emit labels
+        // Pass two: walk the instructions, dropping labels and translated code.
         auto cur_label = branch_labels.cbegin();
         vram = func.vram;
         int num_link_branches = 0;
@@ -1659,38 +1667,41 @@ bool recompile_function_impl(GeneratorType& generator, const N64Recomp::Context&
         for (size_t instr_index = 0; instr_index < instructions.size(); ++instr_index) {
             bool had_link_branch = needs_link_branch;
             bool is_branch_likely = false;
-            // If we're in the delay slot of a likely instruction, emit a goto to skip the instruction before any labels
+            // While sitting in a likely branch's delay slot, jump past the
+            // duplicated instruction before any label can be emitted.
             if (in_likely_delay_slot) {
                 generator.emit_goto(fmt::format("skip_{}", num_likely_branches));
             }
-            // If there are any other branch labels to insert and we're at the next one, insert it
+            // Drop the next pending label once this address reaches it.
             if (cur_label != branch_labels.end() && vram >= *cur_label) {
                 generator.emit_label(fmt::format("L_{:08X}", *cur_label));
                 ++cur_label;
             }
 
-            // Advance the reloc index until we reach the last one or until we get to/pass the current instruction
+            // Move the reloc cursor forward until it lines up with (or just
+            // before) the current instruction, without running off the end.
             while ((reloc_index + 1) < section.relocs.size() && section.relocs[reloc_index].address < vram) {
                 reloc_index++;
             }
-            // Process the current instruction and check for errors
+            // Translate the current instruction, bailing on any error.
             if (process_instruction(generator, context, func, func_index, stats, jtbl_lw_instructions, branch_labels, local_tailcall_labels, instr_index, instructions, output_file, false, needs_link_branch, num_link_branches, reloc_index, needs_link_branch, is_branch_likely, tag_reference_relocs, static_funcs_out) == false) {
                 fmt::print(stderr, "Error in recompiling {} at instr {}\n", func.name, instr_index);
                 return false;
             }
-            // If a link return branch was generated, advance the number of link return branches
+            // Count the link-return branch that was just emitted, if any.
             if (had_link_branch) {
                 num_link_branches++;
             }
-            // Now that the instruction has been processed, emit a skip label for the likely branch if needed
+            // With the instruction emitted, close out the likely branch by
+            // dropping its skip label.
             if (in_likely_delay_slot) {
                 fmt::print(output_file, "    ");
                 generator.emit_label(fmt::format("skip_{}", num_likely_branches));
                 num_likely_branches++;
             }
-            // Mark the next instruction as being in a likely delay slot if the 
+            // Remember whether the upcoming instruction is a likely delay slot.
             in_likely_delay_slot = is_branch_likely;
-            // Advance the vram address by the size of one instruction
+            // Step to the next instruction address.
             vram += 4;
         }
 
@@ -1745,14 +1756,14 @@ bool recompile_function_impl(GeneratorType& generator, const N64Recomp::Context&
     return true;
 }
 
-// Wrap the templated function with CGenerator as the template parameter.
+// Public entry point specialized on CGenerator.
 //
-// Buffer the function's emission into a temporary ostringstream and only
-// commit to the real output_file on success. Fixes the "clearing output
-// file" bug where output_file.clear() inside recompile_function_impl was
-// resetting stream flags rather than truncating buffered text — leaving a
-// partial function (signature + open braces, no body) in shared multi-
-// function output files.
+// Emission is staged into a scratch ostringstream and flushed to the real
+// output_file only when translation succeeds. This sidesteps the old
+// "clearing output file" defect, where an output_file.clear() inside
+// recompile_function_impl merely reset stream flags instead of discarding
+// buffered text — leaving a half-written function (signature plus open
+// braces, no body) inside shared multi-function output files.
 bool N64Recomp::recompile_function(const N64Recomp::Context& context, size_t function_index, std::ostream& output_file, std::span<std::vector<uint32_t>> static_funcs_out, bool tag_reference_relocs) {
     std::ostringstream buffer;
     CGenerator generator{buffer};
