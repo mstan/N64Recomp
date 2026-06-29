@@ -23,7 +23,8 @@ void add_manual_functions(N64Recomp::Context& context, const std::vector<N64Reco
         std::exit(EXIT_FAILURE);
     };
 
-    // Build a lookup from section name to section index.
+    // Map each section's name to its index so manual functions can resolve
+    // their requested section by name.
     std::unordered_map<std::string, size_t> section_indices_by_name{};
     section_indices_by_name.reserve(context.sections.size());
 
@@ -91,28 +92,32 @@ bool read_list_file(const std::filesystem::path& filename, std::vector<std::stri
     return true;
 }
 
-bool compare_files(const std::filesystem::path& file1_path, const std::filesystem::path& file2_path) {
-    static std::vector<char> file1_buf(65536);
-    static std::vector<char> file2_buf(65536);
+bool compare_files(const std::filesystem::path& lhs_path, const std::filesystem::path& rhs_path) {
+    static std::vector<char> lhs_stream_buf(65536);
+    static std::vector<char> rhs_stream_buf(65536);
 
-    std::ifstream file1(file1_path, std::ifstream::ate | std::ifstream::binary); //open file at the end
-    std::ifstream file2(file2_path, std::ifstream::ate | std::ifstream::binary); //open file at the end
-    const std::ifstream::pos_type fileSize = file1.tellg();
+    // Opening with 'ate' seeks straight to the end so tellg() yields the size.
+    std::ifstream lhs_file(lhs_path, std::ifstream::ate | std::ifstream::binary);
+    std::ifstream rhs_file(rhs_path, std::ifstream::ate | std::ifstream::binary);
+    const std::ifstream::pos_type lhs_size = lhs_file.tellg();
 
-    file1.rdbuf()->pubsetbuf(file1_buf.data(), file1_buf.size());
-    file2.rdbuf()->pubsetbuf(file2_buf.data(), file2_buf.size());
+    lhs_file.rdbuf()->pubsetbuf(lhs_stream_buf.data(), lhs_stream_buf.size());
+    rhs_file.rdbuf()->pubsetbuf(rhs_stream_buf.data(), rhs_stream_buf.size());
 
-    if (fileSize != file2.tellg()) {
-        return false; //different file size
+    // Sizes differ -> can't be identical, bail early.
+    if (lhs_size != rhs_file.tellg()) {
+        return false;
     }
 
-    file1.seekg(0); //rewind
-    file2.seekg(0); //rewind
+    // Seek both back to the start before the byte-by-byte comparison.
+    lhs_file.seekg(0);
+    rhs_file.seekg(0);
 
-    std::istreambuf_iterator<char> begin1(file1);
-    std::istreambuf_iterator<char> begin2(file2);
+    std::istreambuf_iterator<char> lhs_cursor(lhs_file);
+    std::istreambuf_iterator<char> rhs_cursor(rhs_file);
 
-    return std::equal(begin1, std::istreambuf_iterator<char>(), begin2); //Second argument is end-of-range iterator
+    // The default-constructed iterator marks end-of-stream for the first range.
+    return std::equal(lhs_cursor, std::istreambuf_iterator<char>(), rhs_cursor);
 }
 
 size_t find_exact_function_in_section(const N64Recomp::Context& context, uint32_t vram, size_t section_index) {
@@ -1401,7 +1406,8 @@ static void register_interior_dispatch_aliases(N64Recomp::Context& context) {
 }
 
 bool recompile_single_function(const N64Recomp::Context& context, size_t func_index, const std::string& recomp_include, const std::filesystem::path& output_path, std::span<std::vector<uint32_t>> static_funcs_out) {
-    // Open the temporary output file
+    // Generate into a sibling ".tmp" file first; we only promote it to the
+    // real name below once the contents are known to differ.
     std::filesystem::path temp_path = output_path;
     temp_path.replace_extension(".tmp");
     std::ofstream output_file{ temp_path };
@@ -1410,7 +1416,7 @@ bool recompile_single_function(const N64Recomp::Context& context, size_t func_in
         return false;
     }
 
-    // Write the file header
+    // Emit the per-file preamble.
     fmt::print(output_file,
         "{}\n"
         "#include \"funcs.h\"\n"
@@ -1423,12 +1429,13 @@ bool recompile_single_function(const N64Recomp::Context& context, size_t func_in
     
     output_file.close();
 
-    // If a file of the target name exists and it's identical to the output file, delete the output file.
-    // This prevents updating the existing file so that it doesn't need to be rebuilt.
+    // When an identical file is already present, discard the temp file and
+    // leave the original untouched so its timestamp (and thus its build
+    // staleness) doesn't change.
     if (std::filesystem::exists(output_path) && compare_files(output_path, temp_path)) {
         std::filesystem::remove(temp_path);
     }
-    // Otherwise, rename the new file to the target path.
+    // The contents changed (or the file is new): promote the temp file.
     else {
         std::filesystem::rename(temp_path, output_path);
     }
@@ -1482,13 +1489,13 @@ void dump_context(const N64Recomp::Context& context, const std::unordered_map<ui
         if (!section_funcs.empty()) {
             print_section(func_context_file, section.name, section.rom_addr, section.ram_addr, section.size);
 
-            // Dump relocs into the function context file.
+            // Emit this section's relocations into the function context file.
             if (!section.relocs.empty()) {
                 fmt::print(func_context_file, "relocs = [\n");
 
                 for (const N64Recomp::Reloc& reloc : section.relocs) {
                     if (reloc.target_section == section_index || reloc.target_section == section.bss_section_index) {
-                        // TODO allow emitting MIPS32 relocs for specific sections via a toml option for TLB mapping support.
+                        // TODO: a future toml option could opt specific sections into MIPS32 reloc emission for TLB-mapped layouts.
                         if (reloc.type == N64Recomp::RelocType::R_MIPS_HI16 || reloc.type == N64Recomp::RelocType::R_MIPS_LO16 || reloc.type == N64Recomp::RelocType::R_MIPS_26) {
                             fmt::print(func_context_file, "    {{ type = \"{}\", vram = 0x{:08X}, target_vram = 0x{:08X} }},\n",
                                 reloc_names[static_cast<int>(reloc.type)], reloc.address, reloc.target_section_offset + section.ram_addr);
@@ -1499,7 +1506,7 @@ void dump_context(const N64Recomp::Context& context, const std::unordered_map<ui
                 fmt::print(func_context_file, "]\n\n");
             }
 
-            // Dump functions into the function context file.
+            // Emit this section's function list into the function context file.
             fmt::print(func_context_file, "functions = [\n");
 
             for (const size_t& function_index : section_funcs) {
@@ -1515,7 +1522,7 @@ void dump_context(const N64Recomp::Context& context, const std::unordered_map<ui
         if (find_syms_it != data_syms.end() && !find_syms_it->second.empty()) {
             print_section(data_context_file, section.name, section.rom_addr, section.ram_addr, section.size);
 
-            // Dump other symbols into the data context file.
+            // Emit this section's data symbols into the data context file.
             fmt::print(data_context_file, "symbols = [\n");
 
             for (const N64Recomp::DataSymbol& cur_sym : find_syms_it->second) {
@@ -1528,7 +1535,7 @@ void dump_context(const N64Recomp::Context& context, const std::unordered_map<ui
 
     const auto find_abs_syms_it = data_syms.find(N64Recomp::SectionAbsolute);
     if (find_abs_syms_it != data_syms.end() && !find_abs_syms_it->second.empty()) {
-        // Dump absolute symbols into the data context file.
+        // Emit the absolute (section-less) symbols into the data context file.
         print_section(data_context_file, "ABSOLUTE_SYMS", (uint32_t)-1, 0, 0);
         fmt::print(data_context_file, "symbols = [\n");
 
@@ -1626,22 +1633,25 @@ int main(int argc, char** argv) {
         exit_failure("Config file cannot provide both an elf and a symbols file\n");
     }
 
-    // Build a context from the provided elf file.
+    // Path 1: derive the context directly from an ELF file.
     if (!config.elf_path.empty()) {
-        // Lists of data symbols organized by section, only used if dumping context.
+        // Per-section data symbol lists; populated and consumed only on the
+        // context-dump path.
         std::unordered_map<uint16_t, std::vector<N64Recomp::DataSymbol>> data_syms;
 
-        // Import symbols from any reference symbols files that were provided.
+        // Pull in symbols from any reference symbol files the config names.
         if (!config.func_reference_syms_file_path.empty()) {
             {
-                // Create a new temporary context to read the function reference symbol file into, since it's the same format as the recompilation symbol file.
+                // The function reference symbol file shares the symbol-file
+                // format, so load it into a throwaway context (no ROM needed).
                 std::vector<uint8_t> dummy_rom{};
                 N64Recomp::Context reference_context{};
                 if (!N64Recomp::Context::from_symbol_file(config.func_reference_syms_file_path, std::move(dummy_rom), reference_context, false)) {
                     exit_failure("Failed to load provided function reference symbol file\n");
                 }
 
-                // Use the reference context to build a reference symbol list for the actual context.
+                // Fold that temporary context's symbols into the real context
+                // as reference symbols.
                 if (!context.import_reference_context(reference_context)) {
                     exit_failure("Internal error: Failed to import reference context. Please report this issue.\n");
                 }
@@ -1695,7 +1705,7 @@ int main(int argc, char** argv) {
             exit_failure("Failed to synthesize decompressed patterns\n");
         }
 
-        // Add any manual functions
+        // Register the config-declared manual functions.
         add_manual_functions(context, config.manual_functions);
 
         if (config.has_entrypoint && !found_entrypoint_func) {
@@ -1704,7 +1714,7 @@ int main(int argc, char** argv) {
         
         if (dumping_context) {
             fmt::print("Dumping context\n");
-            // Sort the data syms by address so the output is nicer.
+            // Order each section's data symbols by address for tidier output.
             for (auto& [section_index, section_syms] : data_syms) {
                 std::sort(section_syms.begin(), section_syms.end(),
                     [](const N64Recomp::DataSymbol& a, const N64Recomp::DataSymbol& b) {
@@ -1717,7 +1727,7 @@ int main(int argc, char** argv) {
             return 0;
         }
     }
-    // Build a context from the provided symbols file.
+    // Path 2: derive the context from a symbols file plus a raw ROM.
     else if (!config.symbols_file_path.empty()) {
         if (config.rom_file_path.empty()) {
             exit_failure("A ROM file must be provided when using a symbols file\n");
@@ -1907,99 +1917,90 @@ int main(int argc, char** argv) {
 
     fmt::print("Working dir: {}\n", std::filesystem::current_path().string());
 
-    // Stub out any functions specified in the config file.
+    // Stub out every function the config requested.
     for (const std::string& stubbed_func : config.stubbed_funcs) {
-        // Check if the specified function exists.
+        // A missing target is almost always a typo or a stale name from an
+        // older game version, so surface it loudly rather than no-op.
         auto func_find = context.functions_by_name.find(stubbed_func);
         if (func_find == context.functions_by_name.end()) {
-            // Function doesn't exist, present an error to the user instead of silently failing to stub it out.
-            // This helps prevent typos in the config file or functions renamed between versions from causing issues.
             exit_failure(fmt::format("Function {} is stubbed out in the config file but does not exist!", stubbed_func));
         }
-        // Mark the function as stubbed.
+        // Flag it for stub emission.
         context.functions[func_find->second].stubbed = true;
     }
 
-    // Ignore any functions specified in the config file.
+    // Mark every config-requested function as ignored.
     for (const std::string& ignored_func : config.ignored_funcs) {
-        // Check if the specified function exists.
+        // As above, an unknown name is a config error worth reporting.
         auto func_find = context.functions_by_name.find(ignored_func);
         if (func_find == context.functions_by_name.end()) {
-            // Function doesn't exist, present an error to the user instead of silently failing to mark it as ignored.
-            // This helps prevent typos in the config file or functions renamed between versions from causing issues.
             exit_failure(fmt::format("Function {} is set as ignored in the config file but does not exist!", ignored_func));
         }
-        // Mark the function as ignored.
+        // Flag it as ignored.
         context.functions[func_find->second].ignored = true;
     }
 
-    // Rename any functions specified in the config file.
+    // Apply the config's rename requests.
     for (const std::string& renamed_func : config.renamed_funcs) {
-        // Check if the specified function exists.
+        // Reject unknown names so config mistakes don't pass silently.
         auto func_find = context.functions_by_name.find(renamed_func);
         if (func_find == context.functions_by_name.end()) {
-            // Function doesn't exist, present an error to the user instead of silently failing to rename it.
-            // This helps prevent typos in the config file or functions renamed between versions from causing issues.
             exit_failure(fmt::format("Function {} is set as renamed in the config file but does not exist!", renamed_func));
         }
-        // Rename the function.
+        // Suffix the existing name with "_recomp".
         N64Recomp::Function* func = &context.functions[func_find->second];
         func->name = func->name + "_recomp";
     }
 
-    // Propogate the trace mode parameter.
+    // Carry the trace-mode flag through to the context.
     context.trace_mode = config.trace_mode;
 
-    // Apply any single-instruction patches.
+    // Apply each single-instruction patch from the config.
     for (const N64Recomp::InstructionPatch& patch : config.instruction_patches) {
-        // Check if the specified function exists.
+        // The named function has to exist for the patch to mean anything.
         auto func_find = context.functions_by_name.find(patch.func_name);
         if (func_find == context.functions_by_name.end()) {
-            // Function doesn't exist, present an error to the user instead of silently failing to stub it out.
-            // This helps prevent typos in the config file or functions renamed between versions from causing issues.
             exit_failure(fmt::format("Function {} has an instruction patch but does not exist!", patch.func_name));
         }
 
         N64Recomp::Function& func = context.functions[func_find->second];
         int32_t func_vram = func.vram;
 
-        // Check that the function actually contains this vram address.
+        // And the patch address must fall within the function's range.
         if (patch.vram < func_vram || patch.vram >= func_vram + func.words.size() * sizeof(func.words[0])) {
             exit_failure(fmt::format("Function {} has an instruction patch for vram 0x{:08X} but doesn't contain that vram address!", patch.func_name, (uint32_t)patch.vram));
         }
 
-        // Calculate the instruction index and modify the instruction.
+        // Translate the vram into a word index and overwrite the instruction.
         size_t instruction_index = (static_cast<size_t>(patch.vram) - func_vram) / sizeof(uint32_t);
         func.words[instruction_index] = byteswap(patch.value);
     }
 
-    // Apply any function hooks.
+    // Apply each function text hook from the config.
     for (const N64Recomp::FunctionTextHook& patch : config.function_hooks) {
-        // Check if the specified function exists.
+        // The hooked function must exist.
         auto func_find = context.functions_by_name.find(patch.func_name);
         if (func_find == context.functions_by_name.end()) {
-            // Function doesn't exist, present an error to the user instead of silently failing to stub it out.
-            // This helps prevent typos in the config file or functions renamed between versions from causing issues.
             exit_failure(fmt::format("Function {} has a function hook but does not exist!", patch.func_name));
         }
 
         N64Recomp::Function& func = context.functions[func_find->second];
         int32_t func_vram = func.vram;
 
-        // Check that the function actually contains this vram address.
+        // The hook's anchor vram must lie inside the function.
         if (patch.before_vram < func_vram || patch.before_vram >= func_vram + func.words.size() * sizeof(func.words[0])) {
             exit_failure(fmt::format("Function {} has a function hook for vram 0x{:08X} but doesn't contain that vram address!", patch.func_name, (uint32_t)patch.before_vram));
         }
 
-        // No after_vram means this will be placed at the start of the function
+        // An anchor of 0 (no before_vram) drops the hook at the prologue.
         size_t instruction_index = -1;
 
-        // Calculate the instruction index.
+        // Otherwise convert the anchor vram to a word index.
         if (patch.before_vram != 0) {
           instruction_index = (static_cast<size_t>(patch.before_vram) - func_vram) / sizeof(uint32_t);
         }
 
-        // Check if a function hook already exits for that instruction index.
+        // Refuse to stack two hooks on the same instruction slot.
         auto hook_find = func.function_hooks.find(instruction_index);
         if (hook_find != func.function_hooks.end()) {
             exit_failure(fmt::format("Function {} already has a function hook for vram 0x{:08X}!", patch.func_name, (uint32_t)patch.before_vram));
@@ -2014,14 +2015,15 @@ int main(int argc, char** argv) {
     
     auto open_new_output_file = [&config, &current_output_file, &output_file_count, &cur_file_function_count]() {
         current_output_file = std::ofstream{config.output_func_path / fmt::format("funcs_{}.c", output_file_count)};
-        // Write the file header
+        // Emit the per-file preamble.
         fmt::print(current_output_file,
             "{}\n"
             "#include \"funcs.h\"\n"
             "\n",
             config.recomp_include);
 
-        // Print the extern for the base event index and the define to rename it if exports are allowed.
+        // When exports are on, alias the per-mod base event index onto the
+        // builtin one via an extern + #define.
         if (config.allow_exports) {
             fmt::print(current_output_file,
                 "extern uint32_t builtin_base_event_index;\n"
@@ -2036,14 +2038,15 @@ int main(int argc, char** argv) {
 
     if (config.single_file_output) {
         current_output_file.open(config.output_func_path / config.elf_path.stem().replace_extension(".c"));
-        // Write the file header
+        // Emit the per-file preamble.
         fmt::print(current_output_file,
             "{}\n"
             "#include \"funcs.h\"\n"
             "\n",
             config.recomp_include);
 
-        // Print the extern for the base event index and the define to rename it if exports are allowed.
+        // When exports are on, alias the per-mod base event index onto the
+        // builtin one via an extern + #define.
         if (config.allow_exports) {
             fmt::print(current_output_file,
                 "extern uint32_t builtin_base_event_index;\n"
@@ -2058,9 +2061,10 @@ int main(int argc, char** argv) {
 
     std::unordered_map<size_t, size_t> function_index_to_event_index{};
 
-    // If exports are enabled, scan all the relocs and modify ones that point to an event function.
+    // With exports enabled, rewrite every reloc that targets an event function
+    // so it references the event symbol table instead.
     if (config.allow_exports) {
-        // First, find the event section by scanning for a section with the special name.
+        // Locate the event section by its reserved name.
         bool event_section_found = false;
         size_t event_section_index = 0;
         uint32_t event_section_vram = 0;
@@ -2074,33 +2078,35 @@ int main(int argc, char** argv) {
             }
         }
 
-        // If an event section was found, proceed with the reloc scanning.
+        // Only worth scanning relocs if that section actually exists.
         if (event_section_found) {
             for (auto& section : context.sections) {
                 for (auto& reloc : section.relocs) {
-                    // Event symbols aren't reference symbols, since they come from the elf itself.
-                    // Therefore, skip reference symbol relocs.
+                    // Events originate in the elf itself, so a reference-symbol
+                    // reloc can never be one — skip those outright.
                     if (reloc.reference_symbol) {
                         continue;
                     }
 
-                    // Check if the reloc points to the event section.
+                    // We only care about relocs aimed at the event section.
                     if (reloc.target_section == event_section_index) {
-                        // It does, so find the function it's pointing at.
+                        // Resolve the event function the reloc points at.
                         size_t func_index = context.find_function_by_vram_section(reloc.target_section_offset + event_section_vram, event_section_index);
 
                         if (func_index == (size_t)-1) {
                             exit_failure(fmt::format("Failed to find event function with vram {}.\n", reloc.target_section_offset + event_section_vram));
                         }
 
-                        // Ensure the reloc is a MIPS_R_26 one before modifying it, since those are the only type allowed to reference
+                        // Only R_MIPS_26 (jal) relocs may reference an event; any
+                        // other type means someone tried to take the address.
                         if (reloc.type != N64Recomp::RelocType::R_MIPS_26) {
                             const auto& function = context.functions[func_index];
                             exit_failure(fmt::format("Function {} is an import and cannot have its address taken.\n",
                                 function.name));
                         }
 
-                        // Check if this function has been assigned an event index already, and assign it if not.
+                        // Reuse this function's event index if it already has one,
+                        // otherwise allocate the next sequential index.
                         size_t event_index;
                         auto find_event_it = function_index_to_event_index.find(func_index);
                         if (find_event_it != function_index_to_event_index.end()) {
@@ -2111,7 +2117,7 @@ int main(int argc, char** argv) {
                             function_index_to_event_index.emplace(func_index, event_index);
                         }
 
-                        // Modify the reloc's fields accordingly.
+                        // Repoint the reloc at the event symbol table.
                         reloc.target_section_offset = 0;
                         reloc.symbol_index = event_index;
                         reloc.target_section = N64Recomp::SectionEvent;
@@ -2170,7 +2176,8 @@ int main(int argc, char** argv) {
                 "void {}(uint8_t* rdram, recomp_context* ctx);\n", func.name);
             bool result;
             const auto& func_section = context.sections[func.section_index];
-            // Apply strict patch mode validation if enabled.
+            // In strict patch mode, a patch-section function and a reference
+            // symbol of the same name must imply one another exactly.
             if (config.strict_patch_mode) {
                 bool in_normal_patch_section = func_section.name == N64Recomp::PatchSectionName;
                 bool in_force_patch_section = func_section.name == N64Recomp::ForcedPatchSectionName;
@@ -2178,25 +2185,25 @@ int main(int argc, char** argv) {
                 N64Recomp::SymbolReference dummy_ref;
                 bool reference_symbol_found = context.reference_symbol_exists(func.name);
 
-                // This is a patch function, but no corresponding symbol was found in the original symbol list.
+                // Lives in a patch section yet replaces nothing in the references.
                 if (in_patch_section && !reference_symbol_found) {
                     fmt::print(stderr, "Function {} is marked as a replacement, but no function with the same name was found in the reference symbols!\n", func.name);
                     failed_strict_mode = true;
                     continue;
                 }
-                // This is not a patch function, but it has the same name as a function in the original symbol list.
+                // Not a patch, yet collides with a name in the references.
                 else if (!in_patch_section && reference_symbol_found) {
                     fmt::print(stderr, "Function {} is not marked as a replacement, but a function with the same name was found in the reference symbols!\n", func.name);
                     failed_strict_mode = true;
                     continue;
                 }
             }
-            // Check if this is an export and add it to the list if exports are enabled.
+            // Track exported functions when exports are enabled.
             if (config.allow_exports && func_section.name == N64Recomp::ExportSectionName) {
                 export_function_indices.push_back(i);
             }
 
-            // Recompile the function.
+            // Emit the recompiled body for this function.
             if (config.single_file_output || config.functions_per_output_file > 1) {
                 recompile_or_stub(i);   // never fatal: stubs on failure
                 result = true;
@@ -2242,9 +2249,9 @@ int main(int argc, char** argv) {
             return section.ram_addr;
         };
 
-        // Sort the section's functions
+        // Put the section's functions in address order.
         std::sort(section_funcs.begin(), section_funcs.end());
-        // Sort and deduplicate the static functions via a set
+        // Funnel the static funcs through a set to sort and dedupe them.
         std::set<uint32_t> statics_set{ static_funcs_by_section[section_index].begin(), static_funcs_by_section[section_index].end() };
         std::vector<uint32_t> section_statics{};
         section_statics.assign(statics_set.begin(), statics_set.end());
@@ -2286,7 +2293,7 @@ int main(int argc, char** argv) {
                 continue;
             }
 
-            // Determine the code span for this static function.
+            // Work out the byte range this static function occupies.
             const uint32_t static_decode_base =
                 section_base_for_vram(static_func_addr);
             uint32_t code_func_start = static_func_addr;
@@ -2392,7 +2399,7 @@ int main(int argc, char** argv) {
             std::vector<uint32_t> insn_words((cur_func_end - code_func_start) / sizeof(uint32_t));
             insn_words.assign(func_rom_start, func_rom_start + insn_words.size());
 
-            // Create the new function and add it to the context.
+            // Build the synthetic static function and append it to the context.
             size_t new_func_index = context.functions.size();
             context.functions.emplace_back(
                 code_func_start,
@@ -2428,7 +2435,8 @@ int main(int argc, char** argv) {
                 result = recompile_single_function(context, new_func_index, config.recomp_include, config.output_func_path / (new_func.name + ".c"), static_funcs_by_section);
             }
 
-            // Add any new static functions that were found while recompiling this one.
+            // Recompiling may have uncovered further static funcs; fold the
+            // newly appended ones into this section's work list.
             size_t cur_num_statics = static_funcs_by_section[new_func.section_index].size();
             if (cur_num_statics != prev_num_statics) {
                 for (size_t new_static_index = prev_num_statics; new_static_index < cur_num_statics; new_static_index++) {
@@ -2538,13 +2546,13 @@ int main(int argc, char** argv) {
                 std::string section_relocs_array_name = section_relocs.empty() ? "nullptr" : fmt::format("section_{}_{}_relocs", section_index, section_name_trimmed);
                 std::string section_relocs_array_size = section_relocs.empty() ? "0" : fmt::format("ARRLEN({})", section_relocs_array_name);
 
-                // Write the section's table entry.
+                // Append this section's row to the section load table.
                 section_load_table += fmt::format("    {{ .rom_addr = 0x{0:08X}, .ram_addr = 0x{1:08X}, .size = 0x{2:08X}, .funcs = {3}, .num_funcs = ARRLEN({3}), .relocs = {4}, .num_relocs = {5}, .index = {6}, .content_hash = 0x{7:016X}ull, .original_pattern_id = 0x{8:08X}u }},\n",
                                                   section.rom_addr, section.ram_addr, section.size, section_funcs_array_name,
                                                   section_relocs_array_name, section_relocs_array_size, section_index,
                                                   section.content_hash, section.original_pattern_id);
 
-                // Write the section's functions.
+                // Emit this section's FuncEntry array.
                 fmt::print(overlay_file, "static FuncEntry {}[] = {{\n", section_funcs_array_name);
 
                 for (size_t func_index : section_funcs) {
@@ -2569,9 +2577,10 @@ int main(int argc, char** argv) {
 
                 fmt::print(overlay_file, "}};\n");
 
-                // Write the section's relocations.
+                // Emit this section's RelocEntry array.
                 if (!section_relocs.empty()) {
-                    // Determine if reference symbols are being used.
+                    // Reference-symbol mode is active when a func reference
+                    // symbol file was supplied.
                     bool reference_symbol_mode = !config.func_reference_syms_file_path.empty();
 
                     fmt::print(overlay_file, "static RelocEntry {}[] = {{\n", section_relocs_array_name);
@@ -2591,14 +2600,15 @@ int main(int argc, char** argv) {
                         if (type_idx >= reloc_names.size()) {
                             continue;
                         }
-                        // In reference symbol mode, only emit relocations into the table that point to
-                        // non-absolute reference symbols, events, or manual patch symbols.
+                        // Under reference-symbol mode the table only keeps relocs
+                        // to non-absolute reference symbols, events, or manual
+                        // patch symbols.
                         if (reference_symbol_mode) {
                             bool manual_patch_symbol = N64Recomp::is_manual_patch_symbol(reloc.target_section_offset);
                             bool is_absolute = reloc.target_section == N64Recomp::SectionAbsolute;
                             emit_reloc = (reloc.reference_symbol && !is_absolute) || target_section == N64Recomp::SectionEvent || manual_patch_symbol;
                         }
-                        // Otherwise, emit all relocs.
+                        // Without reference symbols, every reloc is emitted.
                         else {
                             emit_reloc = true;
                         }
@@ -2633,7 +2643,7 @@ int main(int argc, char** argv) {
             fmt::print(overlay_file, "    -1,\n");
         } else {
             for (const std::string& section : relocatable_sections_ordered) {
-                // Check if this is an empty overlay
+                // "*" marks a placeholder slot with no backing overlay.
                 if (section == "*") {
                     fmt::print(overlay_file, "    -1,\n");
                 }
@@ -2650,8 +2660,8 @@ int main(int argc, char** argv) {
         fmt::print(overlay_file, "}};\n");
 
         if (config.allow_exports) {
-            // Emit the exported function table.
-            fmt::print(overlay_file, 
+            // Write the table of exported functions.
+            fmt::print(overlay_file,
                 "\n"
                 "static FunctionExport export_table[] = {{\n"
             );
@@ -2659,11 +2669,11 @@ int main(int argc, char** argv) {
                 const auto& func = context.functions[func_index];
                 fmt::print(overlay_file, "    {{ \"{}\", 0x{:08X} }},\n", func.name, func.entry_vram != 0 ? func.entry_vram : func.vram);
             }
-            // Add a dummy element at the end to ensure the array has a valid length because C doesn't allow zero-size arrays.
+            // C forbids zero-length arrays, so cap it with a sentinel entry.
             fmt::print(overlay_file, "    {{ NULL, 0 }}\n");
             fmt::print(overlay_file, "}};\n");
 
-            // Emit the event table.
+            // Write the table of event names.
             std::vector<size_t> functions_by_event{};
             functions_by_event.resize(function_index_to_event_index.size());
             for (auto [func_index, event_index] : function_index_to_event_index) {
@@ -2678,11 +2688,11 @@ int main(int argc, char** argv) {
                 const auto& func = context.functions[func_index];
                 fmt::print(overlay_file, "    \"{}\",\n", func.name);
             }
-            // Add a dummy element at the end to ensure the array has a valid length because C doesn't allow zero-size arrays.
+            // Sentinel entry so the array is never zero-length (illegal in C).
             fmt::print(overlay_file, "    NULL\n");
             fmt::print(overlay_file, "}};\n");
 
-            // Collect manual patch symbols.
+            // Gather the manual patch symbols.
             std::vector<std::pair<uint32_t, std::string>> manual_patch_syms{};
 
             for (const auto& func : context.functions) {
@@ -2691,12 +2701,12 @@ int main(int argc, char** argv) {
                 }
             }            
 
-            // Sort the manual patch symbols by vram.
+            // Order them by vram.
             std::sort(manual_patch_syms.begin(), manual_patch_syms.end(), [](const auto& lhs, const auto& rhs) {
                 return lhs.first < rhs.first;
             });
 
-            // Emit the manual patch symbols.
+            // Write the manual patch symbol table.
             fmt::print(overlay_file,
                 "\n"
                 "static const ManualPatchSymbol manual_patch_symbols[] = {{\n"
@@ -2707,7 +2717,7 @@ int main(int argc, char** argv) {
                 fmt::print(func_header_file,
                     "void {}(uint8_t* rdram, recomp_context* ctx);\n", manual_patch_sym_entry.second);
             }
-            // Add a dummy element at the end to ensure the array has a valid length because C doesn't allow zero-size arrays.
+            // Terminating sentinel so the array always has a nonzero length.
             fmt::print(overlay_file, "    {{ 0, NULL }}\n");
             fmt::print(overlay_file, "}};\n");
         }
