@@ -1,14 +1,24 @@
-#ifndef __OPERATIONS_H__
-#define __OPERATIONS_H__
+#ifndef N64RECOMP_OPERATIONS_H
+#define N64RECOMP_OPERATIONS_H
 
 #include <unordered_map>
 
 #include "rabbitizer.hpp"
 
+// Intermediate representation for the MIPS instructions the recompiler knows
+// how to translate. Each decoded instruction is classified into one of four
+// shapes -- unary, binary, conditional branch, or store -- and described by a
+// small plain-data record. The code generator consumes those records; it never
+// looks at the raw instruction again. The lookup tables that map a decoded
+// instruction id to its record live in operations.cpp.
+
 namespace N64Recomp {
     using InstrId = rabbitizer::InstrId::UniqueId;
     using Cop0Reg = rabbitizer::Registers::Cpu::Cop0;
 
+    // Width/variant of a store instruction. Names mirror the MIPS mnemonics
+    // (store doubleword / word / halfword / byte, the unaligned LWL-style
+    // variants, and the two coprocessor-1 stores).
     enum class StoreOpType {
         SD,
         SDL,
@@ -22,6 +32,10 @@ namespace N64Recomp {
         SWC1
     };
 
+    // A transform applied to a single value. Covers the integer width/sign
+    // coercions, the immediate-shift helper (Lui), the shift-amount masks, and
+    // the full set of coprocessor-1 sign/abs/sqrt and convert/round/trunc/
+    // ceil/floor operations.
     enum class UnaryOpType {
         None,
         ToS32,
@@ -29,9 +43,9 @@ namespace N64Recomp {
         ToS64,
         ToU64,
         Lui,
-        Mask5, // Mask to 5 bits
-        Mask6, // Mask to 5 bits
-        ToInt32, // Functionally equivalent to ToS32, only exists for parity with old codegen
+        Mask5,   // Mask the value to its low 5 bits (32-bit shift amount).
+        Mask6,   // Mask the value to its low 6 bits (64-bit shift amount).
+        ToInt32, // Equivalent to ToS32; kept distinct only to match legacy codegen output.
         NegateFloat,
         NegateDouble,
         AbsFloat,
@@ -66,13 +80,16 @@ namespace N64Recomp {
         FloorLFromD
     };
 
+    // A two-input operation. Besides the obvious arithmetic/logic/compare cases
+    // this also encodes loads (the address is computed as base + immediate) and
+    // the two constant results True/False used by the float compare encodings.
     enum class BinaryOpType {
-        // Addition/subtraction
+        // Integer add/subtract, 32- and 64-bit.
         Add32,
         Sub32,
         Add64,
         Sub64,
-        // Float arithmetic
+        // Floating-point arithmetic.
         AddFloat,
         AddDouble,
         SubFloat,
@@ -81,7 +98,7 @@ namespace N64Recomp {
         MulDouble,
         DivFloat,
         DivDouble,
-        // Bitwise
+        // Bitwise and shifts.
         And64,
         Or64,
         Nor64,
@@ -92,7 +109,7 @@ namespace N64Recomp {
         Srl64,
         Sra32,
         Sra64,
-        // Comparisons
+        // Integer and floating-point comparisons.
         Equal,
         NotEqual,
         Less,
@@ -105,7 +122,7 @@ namespace N64Recomp {
         EqualDouble,
         LessDouble,
         LessEqDouble,
-        // Loads
+        // Loads (result = mem[base + imm]).
         LD,
         LW,
         LWU,
@@ -117,13 +134,17 @@ namespace N64Recomp {
         LDR,
         LWL,
         LWR,
-        // Fixed result
+        // Constant results.
         True,
         False,
 
         COUNT,
     };
 
+    // Where an operand comes from. GPRs (Rd/Rs/Rt), FPRs in their various
+    // interpretations (single, double, and the raw 32-/64-bit views that the
+    // mips3 float mode behavior cares about), the two immediate widths, shift
+    // amounts, the cop1 condition signal, hi/lo, and the hardwired zero.
     enum class Operand {
         Rd, // GPR
         Rs, // GPR
