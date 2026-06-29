@@ -1,12 +1,21 @@
-#ifndef __GENERATOR_H__
-#define __GENERATOR_H__
+#ifndef N64RECOMP_GENERATOR_H
+#define N64RECOMP_GENERATOR_H
 
 #include <set>
 
 #include "recompiler/context.h"
 #include "operations.h"
 
+// Backend interface for the recompiler. recompile_function walks a function's
+// instructions and drives a Generator, which turns each decoded operation and
+// control-flow event into target code. CGenerator emits C; the live recompiler
+// provides its own Generator that emits machine code directly. Both implement
+// the same virtual surface, so it is kept stable.
+
 namespace N64Recomp {
+    // Per-instruction operands resolved from the decoded instruction: the GPR/
+    // FPR indices, shift amount, cop1 condition slot, the 16-bit immediate, and
+    // any relocation attached to the immediate.
     struct InstructionContext {
         int rd;
         int rs;
@@ -27,6 +36,8 @@ namespace N64Recomp {
         uint32_t reloc_target_section_offset;
     };
 
+    // Abstract backend. Every method emits the target-code equivalent of one
+    // operation or control-flow construct.
     class Generator {
     public:
         virtual void process_binary_op(const BinaryOp& op, const InstructionContext& ctx) const = 0;
@@ -65,6 +76,7 @@ namespace N64Recomp {
         virtual void emit_comment(const std::string& comment) const = 0;
     };
 
+    // Concrete backend that writes C source to an output stream.
     class CGenerator final : Generator {
     public:
         CGenerator(std::ostream& output_file) : output_file(output_file) {};

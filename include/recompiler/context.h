@@ -1,5 +1,5 @@
-#ifndef __RECOMP_PORT__
-#define __RECOMP_PORT__
+#ifndef N64RECOMP_CONTEXT_H
+#define N64RECOMP_CONTEXT_H
 
 #include <span>
 #include <string_view>
@@ -12,6 +12,14 @@
 #include <optional>
 #include <set>
 
+// Core data model for the recompiler: the Context holds everything parsed out
+// of the input program (sections, functions, relocations, symbols) plus the
+// extra bookkeeping the mod/patch pipeline needs. The struct layouts and the
+// Context method surface are an ABI shared with the rest of the recompiler and
+// with consumers like the live recompiler, so they are kept stable.
+
+// Big-endian <-> host swap for a 32-bit word, used when reading the (big-endian
+// N64) ROM image on a little-endian host.
 #ifdef _MSC_VER
 inline uint32_t byteswap(uint32_t val) {
     return _byteswap_ulong(val);
@@ -23,6 +31,9 @@ constexpr uint32_t byteswap(uint32_t val) {
 #endif
 
 namespace N64Recomp {
+    // A recompilable function: its addresses, its instruction words, and the
+    // flags that decide whether/how it gets emitted. entry_vram defaults to
+    // vram unless an explicit interior entry point is given.
     struct Function {
         uint32_t vram;
         uint32_t rom;
@@ -41,6 +52,8 @@ namespace N64Recomp {
         Function() = default;
     };
 
+    // An alternate name/address that resolves to an existing function, used for
+    // interior computed-call entry points.
     struct DispatchAlias {
         uint16_t section_index;
         uint32_t vram;
@@ -48,7 +61,8 @@ namespace N64Recomp {
         std::string name;
         size_t target_function_index;
     };
-    
+
+    // A jr-based jump table and the instructions that build its index.
     struct JumpTable {
         uint32_t vram;
         uint32_t addend_reg;
@@ -64,6 +78,8 @@ namespace N64Recomp {
                 : vram(vram), addend_reg(addend_reg), rom(rom), lw_vram(lw_vram), addu_vram(addu_vram), jr_vram(jr_vram), section_index(section_index), got_offset(got_offset), entries(std::move(entries)) {}
     };
 
+    // The MIPS relocation types the recompiler recognizes (values match the ELF
+    // R_MIPS_* constants).
     enum class RelocType : uint8_t {
         R_MIPS_NONE = 0,
         R_MIPS_16,
@@ -136,6 +152,8 @@ namespace N64Recomp {
         uint32_t original_pattern_id = 0xFFFFFFFFu;
     };
 
+    // The three structs below describe symbols/sections pulled in from a
+    // *reference* context (a base recompilation that patches/mods link against).
     struct ReferenceSection {
         uint32_t rom_addr;
         uint32_t ram_addr;
@@ -162,7 +180,7 @@ namespace N64Recomp {
         bool unpaired_lo16_warnings;
         bool all_sections_relocatable;
     };
-    
+
     struct DataSymbol {
         uint32_t vram;
         std::string name;
@@ -176,6 +194,8 @@ namespace N64Recomp {
     extern const std::unordered_set<std::string> ignored_funcs;
     extern const std::unordered_set<std::string> renamed_funcs;
 
+    // Mod-pipeline symbol kinds: imports from a dependency, events a mod
+    // provides or subscribes to, and the callbacks that bind functions to them.
     struct ImportSymbol {
         ReferenceSymbol base;
         size_t dependency_index;
@@ -262,7 +282,7 @@ namespace N64Recomp {
         std::unordered_map<std::string, size_t> functions_by_name;
 
         //// Mod dependencies and their symbols
-        
+
         //// Imported values
         // Dependency names.
         std::vector<std::string> dependencies;
@@ -302,6 +322,7 @@ namespace N64Recomp {
 
         Context() = default;
 
+        // Register a single new dependency by id; fails if it already exists.
         bool add_dependency(const std::string& id) {
             if (dependencies_by_name.contains(id)) {
                 return false;
@@ -317,6 +338,8 @@ namespace N64Recomp {
             return true;
         }
 
+        // Register several dependencies at once; fails (adding none) if any
+        // already exists.
         bool add_dependencies(const std::vector<std::string>& new_dependencies) {
             dependencies_by_name.reserve(dependencies_by_name.size() + new_dependencies.size());
 
@@ -338,24 +361,27 @@ namespace N64Recomp {
             return true;
         }
 
+        // Look up a dependency index by id. The special self/base ids are
+        // created on demand if not already present.
         bool find_dependency(const std::string& mod_id, size_t& dependency_index) {
             auto find_it = dependencies_by_name.find(mod_id);
             if (find_it != dependencies_by_name.end()) {
                 dependency_index = find_it->second;
+                return true;
             }
-            else {
-                // Handle special dependency names.
-                if (mod_id == DependencySelf || mod_id == DependencyBaseRecomp) {
-                    add_dependency(mod_id);
-                    dependency_index = dependencies_by_name[mod_id];
-                }
-                else {
-                    return false;
-                }
+
+            // Handle special dependency names.
+            if (mod_id == DependencySelf || mod_id == DependencyBaseRecomp) {
+                add_dependency(mod_id);
+                dependency_index = dependencies_by_name[mod_id];
+                return true;
             }
-            return true;
+
+            return false;
         }
 
+        // Find the function at `vram` that belongs to `section_index`, or
+        // (size_t)-1 if there's no match.
         size_t find_function_by_vram_section(uint32_t vram, size_t section_index) const {
             auto find_it = functions_by_vram.find(vram);
             if (find_it == functions_by_vram.end()) {
@@ -375,14 +401,14 @@ namespace N64Recomp {
             return !reference_symbols.empty() || !import_symbols.empty() || !event_symbols.empty();
         }
 
+        // A "regular" reference section is an actual section, not the synthetic
+        // import/event ones.
         bool is_regular_reference_section(uint16_t section_index) const {
             return section_index != SectionImport && section_index != SectionEvent;
         }
 
         bool find_reference_symbol(const std::string& symbol_name, SymbolReference& ref_out) const {
             auto find_sym_it = reference_symbols_by_name.find(symbol_name);
-
-            // Check if the symbol was found.
             if (find_sym_it == reference_symbols_by_name.end()) {
                 return false;
             }
@@ -396,13 +422,14 @@ namespace N64Recomp {
             return find_reference_symbol(symbol_name, dummy_ref);
         }
 
+        // Like find_reference_symbol, but rejects matches that live in the
+        // special import/event sections.
         bool find_regular_reference_symbol(const std::string& symbol_name, SymbolReference& ref_out) const {
             SymbolReference ref_found;
             if (!find_reference_symbol(symbol_name, ref_found)) {
                 return false;
             }
 
-            // Ignore reference symbols in special sections.
             if (!is_regular_reference_section(ref_found.section_index)) {
                 return false;
             }
@@ -411,6 +438,8 @@ namespace N64Recomp {
             return true;
         }
 
+        // Resolve a reference symbol, dispatching to the import/event lists for
+        // the special section indices.
         const ReferenceSymbol& get_reference_symbol(uint16_t section_index, size_t symbol_index) const {
             if (section_index == SectionImport) {
                 return import_symbols[symbol_index].base;
@@ -433,6 +462,8 @@ namespace N64Recomp {
             return get_reference_symbol(ref.section_index, ref.symbol_index);
         }
 
+        // Import and event sections are always relocatable; absolute never is;
+        // otherwise consult the section's own flag (unless globally overridden).
         bool is_reference_section_relocatable(uint16_t section_index) const {
             if (all_reference_sections_relocatable) {
                 return true;
@@ -539,13 +570,14 @@ namespace N64Recomp {
             return true;
         }
 
+        // Register an event under a dependency. Re-registering the same event is
+        // not an error (multiple callbacks may target it); the existing index is
+        // returned.
         bool add_dependency_event(const std::string& event_name, size_t dependency_index, size_t& dependency_event_index) {
             if (dependency_index >= dependencies_by_name.size()) {
                 return false;
             }
 
-            // Prevent adding the same event to a dependency twice. This isn't an error, since a mod could register
-            // multiple callbacks to the same event.
             auto find_it = dependency_events_by_name[dependency_index].find(event_name);
             if (find_it != dependency_events_by_name[dependency_index].end()) {
                 dependency_event_index = find_it->second;
@@ -569,6 +601,7 @@ namespace N64Recomp {
             return true;
         }
 
+        // VRAM of a reference section (0 for absolute / non-regular sections).
         uint32_t get_reference_section_vram(uint16_t section_index) const {
             if (section_index == N64Recomp::SectionAbsolute) {
                 return 0;
@@ -581,6 +614,8 @@ namespace N64Recomp {
             }
         }
 
+        // ROM address of a reference section ((uint32_t)-1 for absolute /
+        // non-regular sections).
         uint32_t get_reference_section_rom(uint16_t section_index) const {
             if (section_index == N64Recomp::SectionAbsolute) {
                 return (uint32_t)-1;
@@ -617,7 +652,7 @@ namespace N64Recomp {
 
     ModSymbolsError parse_mod_symbols(std::span<const char> data, std::span<const uint8_t> binary, const std::unordered_map<uint32_t, uint16_t>& sections_by_vrom, Context& context_out);
     std::vector<uint8_t> symbols_to_bin_v1(const Context& mod_context);
-    
+
     inline bool is_manual_patch_symbol(uint32_t vram) {
         // Zero-sized symbols between 0x8F000000 and 0x90000000 are manually specified symbols for use with patches.
         // TODO make this configurable or come up with a more sensible solution for dealing with manual symbols for patches.
@@ -628,32 +663,28 @@ namespace N64Recomp {
     inline bool isalpha_nolocale(char c) {
         return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z');
     }
-    
+
     // Locale-independent ASCII-only version of isalnum.
     inline bool isalnum_nolocale(char c) {
         return isalpha_nolocale(c) || (c >= '0' && c <= '9');
     }
 
+    // A valid mod id is the special self/base id, or a C-identifier-like string
+    // (leading alpha/underscore, then alphanumeric/underscore). The rule exists
+    // mainly to keep ids free of separators like ':'.
     inline bool validate_mod_id(std::string_view str) {
-        // Disallow empty ids.
         if (str.size() == 0) {
             return false;
         }
 
-        // Allow special dependency ids.
         if (str == N64Recomp::DependencySelf || str == N64Recomp::DependencyBaseRecomp) {
             return true;
         }
 
-        // These following rules basically describe C identifiers. There's no specific reason to enforce them besides colon (currently),
-        // so this is just to prevent "weird" mod ids.
-
-        // Check the first character, which must be alphabetical or an underscore.
         if (!isalpha_nolocale(str[0]) && str[0] != '_') {
             return false;
         }
 
-        // Check the remaining characters, which can be alphanumeric or underscore.
         for (char c : str.substr(1)) {
             if (!isalnum_nolocale(c) && c != '_') {
                 return false;
