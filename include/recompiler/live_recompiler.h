@@ -1,5 +1,10 @@
-#ifndef __LIVE_RECOMPILER_H__
-#define __LIVE_RECOMPILER_H__
+// live_recompiler.h — interface for the live (in-process JIT) recompiler:
+// the sljit-backed Generator subclass that turns recompiler IR into runnable
+// host code at runtime, the structure describing its output, and the inputs
+// it needs wired up from the host runtime.
+
+#ifndef N64RECOMP_LIVE_RECOMPILER_H
+#define N64RECOMP_LIVE_RECOMPILER_H
 
 #include <unordered_map>
 #include "recompiler/generator.h"
@@ -43,25 +48,28 @@ namespace N64Recomp {
         ReferenceJumpDetails get_reference_symbol_jump_details(size_t jump_index);
         void populate_import_symbol_jumps(size_t import_index, recomp_func_t* func);
         bool good = false;
-        // Storage for string literals referenced by recompiled code. These are allocated as unique_ptr arrays
-        // to prevent them from moving, as the referenced address is baked into the recompiled code.
+        // Owns the string literals the recompiled code references. Held as
+        // unique_ptr arrays so they never relocate — their addresses are
+        // hard-coded into the emitted code.
         std::vector<std::unique_ptr<char[]>> string_literals;
-        // Storage for jump tables referenced by recompiled code (vector of arrays of pointers). These are also
-        // allocated as unique_ptr arrays for the same reason as strings.
+        // Owns the jump tables the recompiled code references (each a heap
+        // array of pointers), unique_ptr-backed for the same fixed-address
+        // reason as the string literals.
         std::vector<std::unique_ptr<void*[]>> jump_tables;
-        // Recompiled code.
+        // The emitted host code.
         void* code;
-        // Size of the recompiled code.
+        // Byte length of the emitted host code.
         size_t code_size;
-        // Pointers to each individual function within the recompiled code.
+        // Entry pointer for each function inside the emitted code.
         std::vector<recomp_func_t*> functions;
     private:
-        // List of jump details and the corresponding jump instruction address. These jumps get populated after recompilation is complete
-        // during dependency resolution.
+        // Each unresolved jump's details paired with the address of its jump
+        // instruction. Filled in once recompilation finishes, during the
+        // dependency-resolution pass.
         std::vector<std::pair<ReferenceJumpDetails, void*>> reference_symbol_jumps;
-        // Mapping of import symbol index to any jumps to that import symbol.
+        // For each import symbol index, the jumps that target that import.
         std::unordered_multimap<size_t, void*> import_jumps_by_index;
-        // sljit executable offset.
+        // sljit's executable-offset adjustment.
         int64_t executable_offset;
 
         friend class LiveGenerator;
@@ -79,19 +87,22 @@ namespace N64Recomp {
         int32_t *reference_section_addresses;
         int32_t *local_section_addresses;
         void (*run_hook)(uint8_t* rdram, recomp_context* ctx, size_t hook_table_index);
-        // Maps function index in recompiler context to function's entry hook slot.
+        // Function index (in the recompiler context) -> that function's
+        // entry-hook slot.
         std::unordered_map<size_t, size_t> entry_func_hooks;
-        // Maps function index in recompiler context to function's return hook slot.
+        // Function index (in the recompiler context) -> that function's
+        // return-hook slot.
         std::unordered_map<size_t, size_t> return_func_hooks;
-        // Maps section index in the generated code to original section index. Used by regenerated
-        // code to relocate using the corresponding original section's address.
+        // Generated-code section index -> original section index. Regenerated
+        // code uses this to relocate against the matching original section's
+        // address.
         std::vector<size_t> original_section_indices;
     };
     class LiveGenerator final : public Generator {
     public:
         LiveGenerator(size_t num_funcs, const LiveGeneratorInputs& inputs);
         ~LiveGenerator();
-        // Prevent moving or copying.
+        // Neither copyable nor movable.
         LiveGenerator(const LiveGenerator& rhs) = delete;
         LiveGenerator(LiveGenerator&& rhs) = delete;
         LiveGenerator& operator=(const LiveGenerator& rhs) = delete;
@@ -134,7 +145,8 @@ namespace N64Recomp {
         void get_operand_string(Operand operand, UnaryOpType operation, const InstructionContext& context, std::string& operand_string) const;
         void get_binary_expr_string(BinaryOpType type, const BinaryOperands& operands, const InstructionContext& ctx, const std::string& output, std::string& expr_string) const;
         void get_notation(BinaryOpType op_type, std::string& func_string, std::string& infix_string) const;
-        // Loads the relocated address specified by the instruction context into the target register.
+        // Materializes the relocated address from the instruction context
+        // into the given register.
         void load_relocated_address(const InstructionContext& ctx, int reg) const;
         sljit_compiler* compiler;
         LiveGeneratorInputs inputs;

@@ -1,20 +1,26 @@
-// N64Recomp — modifications in this file by Matthew Stanley (mstan
-// fork). Distributed under the project's MIT License (see LICENSE).
-// Original file copyright remains with upstream authors.
+// recomp.h — runtime ABI shared between the recompiler, the runtime, and
+// every translation unit of recompiled guest code. It declares the guest
+// CPU context (recomp_context), the load/store/arithmetic/float-conversion
+// macros the generated C expands into, and the runtime entry points those
+// expansions call back into. Anything generated code names by symbol lives
+// here and must stay stable.
 //
-// Modified 2026 by Matthew Stanley:
-//   - Mask host-side rdram offset in MEM_W / MEM_WU / MEM_H / MEM_B /
-//     MEM_HU / MEM_BU / SD so out-of-range vaddrs wrap into the mapped 1GB
-//     rdram region instead of faulting (matches N64 hardware's
-//     silent address-bus wrap; converts host SEGVs from corrupt
-//     pointers into garbage reads we can keep diagnosing).
+// Copyright (c) 2026 Matthew Stanley. Distributed under the project's MIT
+// License; see the LICENSE file accompanying this distribution.
 //
-// Copyright (c) 2026 Matthew Stanley
+// One behavioral note worth recording up front: the byte-level memory
+// macros (MEM_W / MEM_WU / MEM_H / MEM_HU / MEM_B / MEM_BU and the SD
+// store) mask the computed host offset down to the mapped 1GB rdram
+// window via RECOMP_MEM_MASK. That mirrors how the console's RDRAM bus
+// silently wraps an out-of-range address rather than trapping, so a
+// recompiled load fed a corrupt or mis-sign-extended register reads
+// garbage from inside the window instead of taking a host access
+// violation. See RECOMP_MEM_MASK below for the full rationale.
 //
 // ---------------------------------------------------------------------
 
-#ifndef __RECOMP_H__
-#define __RECOMP_H__
+#ifndef N64RECOMP_RECOMP_H
+#define N64RECOMP_RECOMP_H
 
 #include <stdint.h>
 
@@ -24,36 +30,45 @@
 #include <fenv.h>
 #include <assert.h>
 
-// Compiler definition to disable inter-procedural optimization, allowing multiple functions to be in a single file without breaking interposition.
+// Each recompiled guest function must keep its own identity at link time:
+// no inter-procedural optimization may fold, inline, or specialize one into
+// another, otherwise interposition between functions sharing a translation
+// unit breaks. RECOMP_FUNC carries whatever per-compiler annotation achieves
+// that, and SET_FENV_ACCESS() emits the matching floating-point-environment
+// pragma where one exists.
 #if defined(__TINYC__)
-    // TinyCC — the in-process libtcc overlay/fragment shard backend compiles
-    // exactly ONE function per translation unit, so there is no interposition
-    // to defeat and tcc performs no inter-procedural optimization anyway. No
-    // attribute needed, and tcc has no FENV_ACCESS pragma.
+    // libtcc backend (in-process overlay/fragment shards): exactly one
+    // function per TU, so there is nothing to interpose against and tcc
+    // does no IPO regardless. No annotation, and tcc exposes no
+    // FENV_ACCESS pragma.
     #define RECOMP_FUNC
     #define SET_FENV_ACCESS()
 #elif defined(_MSC_VER) && !defined(__clang__) && !defined(__INTEL_COMPILER)
-    // MSVC's __declspec(noinline) seems to disable inter-procedural optimization entirely, so it's all that's needed.
+    // On MSVC, __declspec(noinline) is enough on its own to suppress the
+    // cross-function optimization we need to avoid.
     #define RECOMP_FUNC __declspec(noinline)
-    
-    // Use MSVC's fenv_access pragma.
+
+    // MSVC spells the pragma fenv_access.
     #define SET_FENV_ACCESS() _Pragma("fenv_access(on)")
 #elif defined(__clang__)
-    // Clang has no dedicated IPO attribute, so we use a combination of other attributes to give the desired behavior.
-    // The inline keyword allows multiple definitions during linking, and extern forces clang to emit an externally visible definition.
-    // Weak forces Clang to not perform any IPO as the symbol can be interposed, which prevents actual inlining due to the inline keyword.
-    // Add noinline on for good measure, which doesn't conflict with the inline keyword as they have different meanings.
+    // Clang offers no single "no IPO" attribute, so stack several. inline
+    // permits the repeated definitions that linking produces, extern forces
+    // an externally visible body, weak marks the symbol interposable (which
+    // is what actually blocks IPO and, with inline present, real inlining),
+    // and noinline is added belt-and-braces since it means something
+    // orthogonal to the inline keyword.
     #define RECOMP_FUNC extern inline __attribute__((weak,noinline))
 
-    // Use the standard STDC FENV_ACCESS pragma.
+    // Clang honors the standard STDC FENV_ACCESS pragma.
     #define SET_FENV_ACCESS() _Pragma("STDC FENV_ACCESS ON")
 #elif defined(__GNUC__) && !defined(__INTEL_COMPILER)
-    // Use GCC's attribute for disabling inter-procedural optimizations. Also enable the rounding-math compiler flag to disable
-    // constant folding so that arithmetic respects the floating point environment. This is needed because gcc doesn't implement
-    // any FENV_ACCESS pragma.
+    // GCC has a direct attribute (noipa) to forbid inter-procedural
+    // optimization. Pair it with the rounding-math optimization so constant
+    // folding stops collapsing arithmetic that must observe the live FP
+    // environment — GCC provides no FENV_ACCESS pragma to express that.
     #define RECOMP_FUNC __attribute__((noipa, optimize("rounding-math")))
 
-    // There's no FENV_ACCESS pragma in gcc, so this can be empty.
+    // GCC has no FENV_ACCESS pragma, so nothing to emit here.
     #define SET_FENV_ACCESS()
 #else
     #error "No RECOMP_FUNC definition for this compiler"
@@ -65,16 +80,16 @@
     #define RECOMP_MUSTTAIL
 #endif
 
-// Implementation of 64-bit multiply and divide instructions
+// 64-bit multiply and divide helpers (the MIPS DMULT/DMULTU/DDIV/DDIVU ops).
 #if defined(__TINYC__)
 
-// TinyCC path — used by the in-process libtcc overlay/fragment shard backend.
-// tcc 0.9.27 has neither __int128 nor the MSVC _mul128 intrinsics, so the
-// 64x64 -> 128 multiply is done manually from 32-bit limbs. The signed product
-// reuses the unsigned one and corrects the high word with the standard identity
-// hi_signed = hi_unsigned - (a<0 ? b : 0) - (b<0 ? a : 0). 64-bit divide/modulo
-// (DDIV/DDIVU below) are emitted by tcc via libtcc1 (__divdi3/__moddi3), so they
-// need no special-casing here.
+// libtcc backend (in-process overlay/fragment shards). tcc 0.9.27 lacks both
+// __int128 and the MSVC _mul128 family, so the 64x64 -> 128 product is built
+// by hand from four 32-bit limb partial products. The signed variant runs the
+// unsigned one and then fixes its high word with the usual correction
+// hi_signed = hi_unsigned - (a<0 ? b : 0) - (b<0 ? a : 0). The 64-bit
+// divide/modulo paths (DDIV/DDIVU, further down) come from tcc's own libtcc1
+// (__divdi3/__moddi3) and need nothing special here.
 static inline void DMULTU(uint64_t a, uint64_t b, uint64_t* lo64, uint64_t* hi64) {
     uint64_t a_lo = (uint32_t)a, a_hi = a >> 32;
     uint64_t b_lo = (uint32_t)b, b_hi = b >> 32;
@@ -152,15 +167,15 @@ typedef uint64_t gpr;
 #define SUB32(a, b) \
     ((gpr)(int32_t)((a) - (b)))
 
-// Mask the host-side rdram offset so out-of-range vaddrs wrap into
-// the mapped region instead of faulting. Without this, a recompiled
-// load whose register holds a corrupt or sign-mismatched value (e.g.
-// a small kuseg-style pointer that was sign-extended) computes a
-// host offset past the mapped 1GB rdram block and triggers a host
-// access violation. Real N64 hardware silently wraps such vaddrs
-// (RDRAM address bus only has so many bits); this mask reproduces
-// that behavior so the recompiled program reads garbage instead of
-// crashing the host. Must match recomp::mem_size (1GB) in
+// Confine every computed host-side rdram offset to the mapped window so an
+// out-of-range guest address wraps instead of faulting. A recompiled load
+// can hold a garbage or wrongly sign-extended register value (for instance a
+// short kuseg pointer that got sign-extended); without masking, the offset
+// lands past the 1GB rdram allocation and the host takes an access
+// violation. The console's RDRAM bus has a finite address width and simply
+// wraps such addresses, so masking reproduces that — the program reads junk
+// from inside the window rather than tearing down the host process. The
+// constant must equal recomp::mem_size (1GB) declared in
 // lib/N64ModernRuntime/librecomp/include/librecomp/addresses.hpp.
 #define RECOMP_MEM_MASK 0x3FFFFFFFu
 
@@ -199,48 +214,48 @@ static inline uint64_t load_doubleword(uint8_t* rdram, gpr reg, gpr offset) {
     load_doubleword(rdram, offset, reg)
 
 static inline gpr do_lwl(uint8_t* rdram, gpr initial_value, gpr offset, gpr reg) {
-    // Calculate the overall address
+    // Effective byte address.
     gpr address = (offset + reg);
 
-    // Load the aligned word
+    // Fetch the word containing it, aligned down.
     gpr word_address = address & ~0x3;
     uint32_t loaded_value = MEM_W(0, word_address);
 
-    // Mask the existing value and shift the loaded value appropriately
+    // Keep the bytes that stay, slot in the bytes the load supplies.
     gpr misalignment = address & 0x3;
     gpr masked_value = initial_value & (gpr)(uint32_t)~(0xFFFFFFFFu << (misalignment * 8));
     loaded_value <<= (misalignment * 8);
 
-    // Cast to int32_t to sign extend first
+    // int32_t cast first so the 32-bit result sign-extends into the gpr.
     return (gpr)(int32_t)(masked_value | loaded_value);
 }
 
 static inline gpr do_lwr(uint8_t* rdram, gpr initial_value, gpr offset, gpr reg) {
-    // Calculate the overall address
+    // Effective byte address.
     gpr address = (offset + reg);
     
-    // Load the aligned word
+    // Fetch the word containing it, aligned down.
     gpr word_address = address & ~0x3;
     uint32_t loaded_value = MEM_W(0, word_address);
 
-    // Mask the existing value and shift the loaded value appropriately
+    // Keep the bytes that stay, slot in the bytes the load supplies.
     gpr misalignment = address & 0x3;
     gpr masked_value = initial_value & (gpr)(uint32_t)~(0xFFFFFFFFu >> (24 - misalignment * 8));
     loaded_value >>= (24 - misalignment * 8);
 
-    // Cast to int32_t to sign extend first
+    // int32_t cast first so the 32-bit result sign-extends into the gpr.
     return (gpr)(int32_t)(masked_value | loaded_value);
 }
 
 static inline void do_swl(uint8_t* rdram, gpr offset, gpr reg, gpr val) {
-    // Calculate the overall address
+    // Effective byte address.
     gpr address = (offset + reg);
 
-    // Get the initial value of the aligned word
+    // Read back the current aligned word so the untouched bytes survive.
     gpr word_address = address & ~0x3;
     uint32_t initial_value = MEM_W(0, word_address);
 
-    // Mask the initial value and shift the input value appropriately
+    // Clear the bytes being overwritten, line the source bytes up to fill them.
     gpr misalignment = address & 0x3;
     uint32_t masked_initial_value = initial_value & ~(0xFFFFFFFFu >> (misalignment * 8));
     uint32_t shifted_input_value = ((uint32_t)val) >> (misalignment * 8);
@@ -248,14 +263,14 @@ static inline void do_swl(uint8_t* rdram, gpr offset, gpr reg, gpr val) {
 }
 
 static inline void do_swr(uint8_t* rdram, gpr offset, gpr reg, gpr val) {
-    // Calculate the overall address
+    // Effective byte address.
     gpr address = (offset + reg);
 
-    // Get the initial value of the aligned word
+    // Read back the current aligned word so the untouched bytes survive.
     gpr word_address = address & ~0x3;
     uint32_t initial_value = MEM_W(0, word_address);
 
-    // Mask the initial value and shift the input value appropriately
+    // Clear the bytes being overwritten, line the source bytes up to fill them.
     gpr misalignment = address & 0x3;
     uint32_t masked_initial_value = initial_value & ~(0xFFFFFFFFu << (24 - misalignment * 8));
     uint32_t shifted_input_value = ((uint32_t)val) << (24 - misalignment * 8);
@@ -263,14 +278,14 @@ static inline void do_swr(uint8_t* rdram, gpr offset, gpr reg, gpr val) {
 }
 
 static inline gpr do_ldl(uint8_t* rdram, gpr initial_value, gpr offset, gpr reg) {
-    // Calculate the overall address
+    // Effective byte address.
     gpr address = (offset + reg);
 
-    // Load the aligned dword
+    // Fetch the doubleword containing it, aligned down.
     gpr dword_address = address & ~0x7;
     uint64_t loaded_value = load_doubleword(rdram, 0, dword_address);
 
-    // Mask the existing value and shift the loaded value appropriately
+    // Keep the bytes that stay, slot in the bytes the load supplies.
     gpr misalignment = address & 0x7;
     gpr masked_value = initial_value & ~(0xFFFFFFFFFFFFFFFFu << (misalignment * 8));
     loaded_value <<= (misalignment * 8);
@@ -279,14 +294,14 @@ static inline gpr do_ldl(uint8_t* rdram, gpr initial_value, gpr offset, gpr reg)
 }
 
 static inline gpr do_ldr(uint8_t* rdram, gpr initial_value, gpr offset, gpr reg) {
-    // Calculate the overall address
+    // Effective byte address.
     gpr address = (offset + reg);
     
-    // Load the aligned dword
+    // Fetch the doubleword containing it, aligned down.
     gpr dword_address = address & ~0x7;
     uint64_t loaded_value = load_doubleword(rdram, 0, dword_address);
 
-    // Mask the existing value and shift the loaded value appropriately
+    // Keep the bytes that stay, slot in the bytes the load supplies.
     gpr misalignment = address & 0x7;
     gpr masked_value = initial_value & ~(0xFFFFFFFFFFFFFFFFu >> (56 - misalignment * 8));
     loaded_value >>= (56 - misalignment * 8);
@@ -295,14 +310,14 @@ static inline gpr do_ldr(uint8_t* rdram, gpr initial_value, gpr offset, gpr reg)
 }
 
 static inline void do_sdl(uint8_t* rdram, gpr offset, gpr reg, gpr val) {
-    // Calculate the overall address
+    // Effective byte address.
     gpr address = (offset + reg);
 
-    // Get the initial value of the aligned dword
+    // Read back the current aligned doubleword so the untouched bytes survive.
     gpr dword_address = address & ~0x7;
     uint64_t initial_value = load_doubleword(rdram, 0, dword_address);
 
-    // Mask the initial value and shift the input value appropriately
+    // Clear the bytes being overwritten, line the source bytes up to fill them.
     gpr misalignment = address & 0x7;
     uint64_t masked_initial_value = initial_value & ~(0xFFFFFFFFFFFFFFFFu >> (misalignment * 8));
     uint64_t shifted_input_value = val >> (misalignment * 8);
@@ -316,14 +331,14 @@ static inline void do_sdl(uint8_t* rdram, gpr offset, gpr reg, gpr val) {
 }
 
 static inline void do_sdr(uint8_t* rdram, gpr offset, gpr reg, gpr val) {
-    // Calculate the overall address
+    // Effective byte address.
     gpr address = (offset + reg);
 
-    // Get the initial value of the aligned dword
+    // Read back the current aligned doubleword so the untouched bytes survive.
     gpr dword_address = address & ~0x7;
     uint64_t initial_value = load_doubleword(rdram, 0, dword_address);
 
-    // Mask the initial value and shift the input value appropriately
+    // Clear the bytes being overwritten, line the source bytes up to fill them.
     gpr misalignment = address & 0x7;
     uint64_t masked_initial_value = initial_value & ~(0xFFFFFFFFFFFFFFFFu << (56 - misalignment * 8));
     uint64_t shifted_input_value = val << (56 - misalignment * 8);
@@ -339,20 +354,20 @@ static inline void do_sdr(uint8_t* rdram, gpr offset, gpr reg, gpr val) {
 static inline uint32_t get_cop1_cs() {
     uint32_t rounding_mode = 0;
     switch (fegetround()) {
-        // round to nearest value
+        // nearest
         case FE_TONEAREST:
         default:
             rounding_mode = 0;
             break;
-        // round to zero (truncate)
+        // toward zero (truncate)
         case FE_TOWARDZERO:
             rounding_mode = 1;
             break;
-        // round to positive infinity (ceil)
+        // toward +inf (ceil)
         case FE_UPWARD:
             rounding_mode = 2;
             break;
-        // round to negative infinity (floor)
+        // toward -inf (floor)
         case FE_DOWNWARD:
             rounding_mode = 3;
             break;
@@ -364,16 +379,16 @@ static inline void set_cop1_cs(uint32_t val) {
     uint32_t rounding_mode = val & 0x3;
     int round = FE_TONEAREST;
     switch (rounding_mode) {
-        case 0: // round to nearest value
+        case 0: // nearest
             round = FE_TONEAREST;
             break;
-        case 1: // round to zero (truncate)
+        case 1: // toward zero (truncate)
             round = FE_TOWARDZERO;
             break;
-        case 2: // round to positive infinity (ceil)
+        case 2: // toward +inf (ceil)
             round = FE_UPWARD;
             break;
-        case 3: // round to negative infinity (floor)
+        case 3: // toward -inf (floor)
             round = FE_DOWNWARD;
             break;
     }
@@ -437,7 +452,7 @@ static inline void set_cop1_cs(uint32_t val) {
 #define DEFAULT_ROUNDING_MODE 0
 
 static inline int32_t do_cvt_w_s(float val) {
-    // Rounding mode aware float to 32-bit int conversion.
+    // float -> 32-bit int honoring the current rounding mode.
     return (int32_t)lrintf(val);
 }
 
@@ -445,7 +460,7 @@ static inline int32_t do_cvt_w_s(float val) {
     do_cvt_w_s(val)
 
 static inline int64_t do_cvt_l_s(float val) {
-    // Rounding mode aware float to 64-bit int conversion.
+    // float -> 64-bit int honoring the current rounding mode.
     return (int64_t)llrintf(val);
 }
 
@@ -453,7 +468,7 @@ static inline int64_t do_cvt_l_s(float val) {
     do_cvt_l_s(val);
 
 static inline int32_t do_cvt_w_d(double val) {
-    // Rounding mode aware double to 32-bit int conversion.
+    // double -> 32-bit int honoring the current rounding mode.
     return (int32_t)lrint(val);
 }
 
@@ -461,7 +476,7 @@ static inline int32_t do_cvt_w_d(double val) {
     do_cvt_w_d(val)
 
 static inline int64_t do_cvt_l_d(double val) {
-    // Rounding mode aware double to 64-bit int conversion.
+    // double -> 64-bit int honoring the current rounding mode.
     return (int64_t)llrint(val);
 }
 
@@ -577,7 +592,8 @@ struct recomp_context {
     uint32_t dispatch_entry_rejected_target;
 };
 
-// Checks if the target is an even float register or that mips3 float mode is enabled
+// Asserts the FPR index is legal: either even, or any index once the context
+// has mips3 float mode turned on.
 #define CHECK_FR(ctx, idx) \
     assert(((idx) & 1) == 0 || (ctx)->mips3_float_mode)
 
@@ -590,8 +606,9 @@ gpr cop0_status_read(recomp_context* ctx);
 void switch_error(const char* func, uint32_t vram, uint32_t jtbl);
 void do_break(uint32_t vram);
 
-// The function signature for special functions that need a third argument.
-// These get called via generated shims to allow providing some information about the caller, such as mod id.
+// Signature for the special functions that take an extra third argument.
+// They are reached through generated shims, which is how per-caller context
+// (such as a mod id) gets threaded in.
 typedef void (recomp_func_ext_t)(uint8_t* rdram, recomp_context* ctx, uintptr_t arg);
 
 recomp_func_t* get_function(int32_t vram);
