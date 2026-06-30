@@ -1,26 +1,21 @@
-# N64: Recompiled
+# N64Recomp
 
-> **Fork notice** — This is a fork maintained for two Pokémon Stadium
-> recompilation projects that share these engine forks:
-> - [PokemonStadiumRecomp](https://github.com/mstan/PokemonStadiumRecomp) —
->   *Pokémon Stadium* (US)
-> - [PocketMonstersStadiumRecomp](https://github.com/mstan/PocketMonstersStadiumRecomp) —
->   *Pocket Monsters Stadium* (Japan)
->
-> The changes here exist to support those ports; they may lag behind upstream
-> and are not intended as a replacement for the canonical project. For
-> canonical N64Recomp, see
-> [N64Recomp/N64Recomp](https://github.com/N64Recomp/N64Recomp).
+N64Recomp is a static recompiler that translates a game's original N64 code
+into C that can be compiled for PC. It backs two Pokémon Stadium recompilation
+projects:
+- [PokemonStadiumRecomp](https://github.com/mstan/PokemonStadiumRecomp) —
+  *Pokémon Stadium* (US)
+- [PocketMonstersStadiumRecomp](https://github.com/mstan/PocketMonstersStadiumRecomp) —
+  *Pocket Monsters Stadium* (Japan)
 
-## Changes in this fork
+## Pokémon Stadium support
 
-N64Recomp is the tool that translates the game's original N64 code into C
-that can be compiled for PC. These changes were needed for it to handle
-Pokémon Stadium. Roughly from most to least visible:
+Handling Pokémon Stadium specifically required, roughly from most to least
+visible:
 
 - **Reads the game's code structure correctly, including its trickier
   parts.** The tool has to work out where each function starts and ends.
-  The original logic guessed wrong on functions that jump around using
+  Naive boundary-guessing trips on functions that jump around using
   lookup tables, producing broken or run-together code; this follows the
   code's real flow instead.
 - **Handles the parts of the game that are packed away and unpacked while
@@ -43,9 +38,9 @@ Pokémon Stadium. Roughly from most to least visible:
 - **Smaller things:** prints help instead of erroring when run with no
   arguments; records which files were modified.
 
-N64: Recompiled is a tool to statically recompile N64 binaries into C code that can be compiled for any platform. This can be used for ports or tools as well as for simulating behaviors significantly faster than interpreters or dynamic recompilation can. More widely, it can be used in any context where you want to run some part of an N64 binary in a standalone environment.
+N64Recomp is a tool to statically recompile N64 binaries into C code that can be compiled for any platform. This can be used for ports or tools as well as for simulating behaviors significantly faster than interpreters or dynamic recompilation can. More widely, it can be used in any context where you want to run some part of an N64 binary in a standalone environment.
 
-This is not the first project that uses static recompilation on game console binaries. A well known example is [jamulator](https://github.com/andrewrk/jamulator), which targets NES binaries. Additionally, this is not even the first project to apply static recompilation to N64-related projects: the [IDO static recompilation](https://github.com/decompals/ido-static-recomp) recompiles the SGI IRIX IDO compiler on modern systems to faciliate matching decompilation of N64 games. This project works similarly to the IDO static recomp project in some ways, and that project was a major inspiration for the original tool.
+This is not the first project that uses static recompilation on game console binaries. A well known example is [jamulator](https://github.com/andrewrk/jamulator), which targets NES binaries. Additionally, this is not even the first project to apply static recompilation to N64-related projects: the [IDO static recompilation](https://github.com/decompals/ido-static-recomp) recompiles the SGI IRIX IDO compiler on modern systems to faciliate matching decompilation of N64 games. This project works similarly to the IDO static recomp project in some ways, and that project was a major inspiration for this tool.
 
 ## Table of Contents
 * [How it Works](#how-it-works)

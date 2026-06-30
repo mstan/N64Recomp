@@ -49,3 +49,8 @@ rt64.log
 .idea
 cmake-build*
 .DS_Store
+/_build_*.log
+/_cfg_*.log
+/_build_target.bat
+/_build_rsp.bat
+/build_cli/
