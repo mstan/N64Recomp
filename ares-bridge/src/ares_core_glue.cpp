@@ -640,6 +640,74 @@ ares_status_t ares_read_memory(uint32_t vaddr, void *buf, size_t len) {
     return ARES_BRIDGE_INVALID_ARGUMENT;
 }
 
+/* Write — symmetric to ares_read_memory. RDRAM uses the peripheral-tagged
+ * write; RSP DMEM/IMEM use the plain Writable write. */
+ares_status_t ares_write_memory(uint32_t vaddr, const void *buf, size_t len) {
+    if (!buf && len) return ARES_BRIDGE_INVALID_ARGUMENT;
+    std::lock_guard<std::mutex> lock(g_state_mutex);
+    if (!g_state.system_loaded) return ARES_BRIDGE_NOT_INITIALIZED;
+
+    uint32_t paddr = vaddr & 0x1FFFFFFFu;
+    const uint8_t *src = static_cast<const uint8_t *>(buf);
+    auto &rdram = ares::Nintendo64::rdram;
+    auto &rsp   = ares::Nintendo64::rsp;
+
+    if (paddr < rdram.ram.size) {
+        if ((uint64_t)paddr + len > rdram.ram.size) return ARES_BRIDGE_INVALID_ARGUMENT;
+        for (size_t i = 0; i < len; i++)
+            rdram.ram.write<ares::Nintendo64::Byte>(paddr + (uint32_t)i, src[i], "oracle");
+        return ARES_BRIDGE_OK;
+    }
+    if (paddr >= 0x04000000u && paddr < 0x04001000u) {
+        uint32_t off = paddr - 0x04000000u;
+        if (off + len > 0x1000u) return ARES_BRIDGE_INVALID_ARGUMENT;
+        for (size_t i = 0; i < len; i++)
+            rsp.dmem.write<ares::Nintendo64::Byte>(off + (uint32_t)i, src[i]);
+        return ARES_BRIDGE_OK;
+    }
+    if (paddr >= 0x04001000u && paddr < 0x04002000u) {
+        uint32_t off = paddr - 0x04001000u;
+        if (off + len > 0x1000u) return ARES_BRIDGE_INVALID_ARGUMENT;
+        for (size_t i = 0; i < len; i++)
+            rsp.imem.write<ares::Nintendo64::Byte>(off + (uint32_t)i, src[i]);
+        return ARES_BRIDGE_OK;
+    }
+    return ARES_BRIDGE_INVALID_ARGUMENT;
+}
+
+ares_status_t ares_rsp_set_state(const uint32_t gpr[32], uint32_t pc,
+                                 uint32_t dma_mem, uint32_t dma_dram) {
+    if (!gpr) return ARES_BRIDGE_INVALID_ARGUMENT;
+    std::lock_guard<std::mutex> lock(g_state_mutex);
+    if (!g_state.system_loaded) return ARES_BRIDGE_NOT_INITIALIZED;
+    auto &rsp = ares::Nintendo64::rsp;
+    for (int i = 1; i < 32; i++) rsp.ipu.r[i].u32 = gpr[i];   // r0 hardwired 0
+    rsp.ipu.r[0].u32 = 0;
+    rsp.ipu.pc = (uint16_t)(pc & 0x0FFFu);
+    rsp.branch.reset();
+    rsp.oracleSetDma(dma_mem, dma_dram);   // SP DMA residue Stadium's boot expects
+    rsp.status.halted = 0;
+    rsp.status.broken = 0;
+    return ARES_BRIDGE_OK;
+}
+
+ares_status_t ares_rsp_run_until_halt(uint32_t max_steps, uint32_t *out_steps) {
+    std::lock_guard<std::mutex> lock(g_state_mutex);
+    if (!g_state.system_loaded) return ARES_BRIDGE_NOT_INITIALIZED;
+    uint32_t steps = ares::Nintendo64::rsp.oracleRunUntilHalt(max_steps);
+    if (out_steps) *out_steps = steps;
+    auto& n   = ares::Nintendo64::g_oracle_dmalog_n;
+    auto& log = ares::Nintendo64::g_oracle_dmalog;
+    uint32_t wr = 0, rd = 0;
+    for (uint32_t i = 0; i < n; i++) { if (log[i][0]==1) wr++; else rd++; }
+    std::fprintf(stderr, "[dma] %u transfers (%u read, %u write):\n", n, rd, wr);
+    for (uint32_t i = 0; i < n; i++) {
+        std::fprintf(stderr, "[dmarow] %3u %s dram=0x%06X dmem=0x%03X len=0x%X\n",
+            i, log[i][0]==1?"WR":"RD", log[i][1], log[i][2], log[i][3]);
+    }
+    return ARES_BRIDGE_OK;
+}
+
 ares_status_t ares_set_controller(int, const ares_input_t *) {
     glue_unimplemented("ares_set_controller",
         "Phase 6 — controller plumbing not wired yet.");
