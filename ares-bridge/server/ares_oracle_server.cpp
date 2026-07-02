@@ -677,6 +677,40 @@ std::string handle(const std::string& line) {
             sizeof(ares_audio_task_event_t));
         return buf;
     }
+    if (cmd == "audio_pcm_dump") {
+        /* Raw ares_audio_pcm_event_t records — per-task output PCM for
+         * the organic ear/PCM A/B. */
+        std::string path = get_str(line, "path");
+        uint64_t start = get_uint(line, "start", 0);
+        if (path.empty()) {
+            return R"({"ok":false,"error":"missing path"})";
+        }
+        FILE* f = std::fopen(path.c_str(), "wb");
+        if (!f) {
+            return R"({"ok":false,"error":"fopen failed"})";
+        }
+        uint64_t total = ares_audio_pcm_count();
+        uint64_t written = 0;
+        uint64_t first_written = 0;
+        for (uint64_t i = start; i < total; i++) {
+            ares_audio_pcm_event_t ev{};
+            if (!ares_audio_pcm_get(i, &ev)) continue;
+            if (std::fwrite(&ev, sizeof(ev), 1, f) == 1) {
+                if (written == 0) first_written = i;
+                written++;
+            }
+        }
+        std::fclose(f);
+        char buf[192];
+        std::snprintf(buf, sizeof(buf),
+            "{\"ok\":true,\"written\":%llu,\"first_idx\":%llu,"
+            "\"count\":%llu,\"event_size\":%zu}",
+            (unsigned long long)written,
+            (unsigned long long)first_written,
+            (unsigned long long)total,
+            sizeof(ares_audio_pcm_event_t));
+        return buf;
+    }
     if (cmd == "rsp_trace_set_enabled") {
         bool on = get_bool(line, "on", true);
         ares_rsp_trace_set_enabled(on ? 1 : 0);

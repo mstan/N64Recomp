@@ -259,6 +259,25 @@ uint64_t ares_audio_task_count(void);
  * recheck protocol as ares_rsp_trace_get). */
 int ares_audio_task_get(uint64_t idx, ares_audio_task_event_t *out);
 
+/* One audio task's output PCM (the 2-3 0x2E0-byte AI-buffer slices its
+ * aSaveBuffer commands targeted). Captured from RDRAM at the NEXT audio
+ * task's first instruction — the task is complete by then and nothing
+ * rewrites the slices until that buffer-rotation slot recurs (2-3 audio
+ * tasks later). idx matches the ares_audio_task_event_t that BUILT this
+ * output. pcm[] is the raw big-endian byte stream (int16 BE L/R). */
+#define ARES_AUDIO_PCM_SLICES 3u
+#define ARES_AUDIO_PCM_SLICE_BYTES 0x2E0u
+
+typedef struct {
+    uint64_t idx;          /* audio-task index this PCM belongs to */
+    uint32_t n_out;        /* valid slices (2 or 3), sorted by addr */
+    uint32_t addr[ARES_AUDIO_PCM_SLICES];   /* guest physical, ascending */
+    uint8_t  pcm[ARES_AUDIO_PCM_SLICES][ARES_AUDIO_PCM_SLICE_BYTES];
+} ares_audio_pcm_event_t;
+
+uint64_t ares_audio_pcm_count(void);
+int ares_audio_pcm_get(uint64_t idx, ares_audio_pcm_event_t *out);
+
 /* ------------------------------------------------------------------ */
 /* Build / capability introspection                                   */
 /* ------------------------------------------------------------------ */

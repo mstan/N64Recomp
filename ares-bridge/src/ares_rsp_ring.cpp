@@ -103,6 +103,20 @@ struct RingState {
     ares_audio_task_event_t audio_tasks[kAudioTaskCapacity] = {};
     std::atomic<uint64_t> audio_task_idx{0};
 
+    /* Output-PCM ring: one event per audio task, written at the NEXT
+     * audio task's start (when the output is complete in RDRAM). Same
+     * capacity/protocol as the task ring; entries share idx with the
+     * task ring event that built the output. */
+    ares_audio_pcm_event_t audio_pcm[kAudioTaskCapacity] = {};
+    std::atomic<uint64_t> audio_pcm_idx{0};
+
+    /* Deferred-capture state for the output-PCM ring: the save-target
+     * addresses parsed from the current task's command list, flushed
+     * when the following audio task starts. */
+    uint64_t pending_idx = 0;
+    uint32_t pending_n = 0;
+    uint32_t pending_addr[ARES_AUDIO_PCM_SLICES] = {};
+
     /* Previous hook-fire PC, for task-start edge detection. Tasks boot
      * at IMEM offset 0 (SP_PC is written 0x04001000 by osSpTaskStartGo)
      * and nothing inside rspboot/aspMain jumps back there, so the
@@ -134,6 +148,34 @@ void record_audio_task_start(ares::Nintendo64::RSP* rsp, uint64_t instr_seq) {
     const uint32_t type = dmem_read_u32(rsp, kOSTaskDmem + 0x00);
     if (type != 2 /* M_AUDTASK */) return;
 
+    /* Flush the PREVIOUS audio task's output PCM: its aSaveBuffer
+     * slices are complete in RDRAM now, and nothing rewrites them
+     * until the buffer rotation returns to those slots. */
+    auto& rdram = ares::Nintendo64::rdram;
+    if (g_ring.pending_n > 0) {
+        uint64_t pi = g_ring.audio_pcm_idx.load(std::memory_order_relaxed);
+        ares_audio_pcm_event_t& pe = g_ring.audio_pcm[pi & kAudioTaskMask];
+        pe.idx = ~0ull;
+        pe.n_out = g_ring.pending_n;
+        for (uint32_t s = 0; s < ARES_AUDIO_PCM_SLICES; s++) {
+            pe.addr[s] = (s < g_ring.pending_n) ? g_ring.pending_addr[s] : 0;
+        }
+        for (uint32_t s = 0; s < g_ring.pending_n; s++) {
+            uint32_t base = pe.addr[s] & 0x1FFFFFFFu;
+            if ((uint64_t)base + ARES_AUDIO_PCM_SLICE_BYTES > rdram.ram.size) {
+                pe.n_out = s;
+                break;
+            }
+            for (uint32_t i = 0; i < ARES_AUDIO_PCM_SLICE_BYTES; i++) {
+                pe.pcm[s][i] = (uint8_t)rdram.ram.read<ares::Nintendo64::Byte>(
+                    base + i, "oracle");
+            }
+        }
+        pe.idx = g_ring.pending_idx;
+        g_ring.audio_pcm_idx.store(pi + 1, std::memory_order_release);
+        g_ring.pending_n = 0;
+    }
+
     uint64_t my_idx = g_ring.audio_task_idx.load(std::memory_order_relaxed);
     ares_audio_task_event_t& ev = g_ring.audio_tasks[my_idx & kAudioTaskMask];
     /* Publish-last protocol: write idx after the payload so readers'
@@ -152,7 +194,6 @@ void record_audio_task_start(ares::Nintendo64::RSP* rsp, uint64_t instr_seq) {
 
     uint32_t want = ev.data_size;
     if (want > ARES_AUDIO_TASK_DATA_CAP) want = ARES_AUDIO_TASK_DATA_CAP;
-    auto& rdram = ares::Nintendo64::rdram;
     uint32_t paddr = ev.data_ptr & 0x1FFFFFFFu;
     if ((uint64_t)paddr + want > rdram.ram.size) {
         want = 0;
@@ -166,6 +207,41 @@ void record_audio_task_start(ares::Nintendo64::RSP* rsp, uint64_t instr_seq) {
 
     ev.idx = my_idx;
     g_ring.audio_task_idx.store(my_idx + 1, std::memory_order_release);
+
+    /* Parse THIS task's output slices for the deferred PCM capture:
+     * aSaveBuffer (op 6) with count 0x2E0, dmem 0 — the whole-slice
+     * AI-buffer saves (verified against organic capture: 2-3 per task,
+     * dram rotating over the AI buffers). Dedup + sort ascending so
+     * the offline metric sees playback order. */
+    g_ring.pending_idx = my_idx;
+    g_ring.pending_n = 0;
+    for (uint32_t i = 0; i + 8 <= want; i += 8) {
+        uint32_t w0 = ((uint32_t)ev.data[i] << 24) |
+                      ((uint32_t)ev.data[i + 1] << 16) |
+                      ((uint32_t)ev.data[i + 2] << 8) |
+                       (uint32_t)ev.data[i + 3];
+        if ((w0 >> 24) != 6 || ((w0 >> 12) & 0xFFF) != 0x2E0) continue;
+        uint32_t w1 = ((uint32_t)ev.data[i + 4] << 24) |
+                      ((uint32_t)ev.data[i + 5] << 16) |
+                      ((uint32_t)ev.data[i + 6] << 8) |
+                       (uint32_t)ev.data[i + 7];
+        uint32_t k = 0;
+        for (; k < g_ring.pending_n; k++) {
+            if (g_ring.pending_addr[k] == w1) break;   /* re-save: keep one */
+        }
+        if (k == g_ring.pending_n && g_ring.pending_n < ARES_AUDIO_PCM_SLICES) {
+            g_ring.pending_addr[g_ring.pending_n++] = w1;
+        }
+    }
+    for (uint32_t a = 0; a + 1 < g_ring.pending_n; a++) {
+        for (uint32_t b = a + 1; b < g_ring.pending_n; b++) {
+            if (g_ring.pending_addr[b] < g_ring.pending_addr[a]) {
+                uint32_t t = g_ring.pending_addr[a];
+                g_ring.pending_addr[a] = g_ring.pending_addr[b];
+                g_ring.pending_addr[b] = t;
+            }
+        }
+    }
 }
 
 /* The hook itself. Reads RSP state via the Ares public-ish API and
@@ -335,6 +411,26 @@ int ares_audio_task_get(uint64_t idx, ares_audio_task_event_t* out) {
     const auto& slot = g_ring.audio_tasks[idx & kAudioTaskMask];
     *out = slot;
     if (out->idx != idx) return 0;                    /* torn / overwritten */
+    return 1;
+}
+
+uint64_t ares_audio_pcm_count(void) {
+    ensure_hook_installed();
+    return g_ring.audio_pcm_idx.load(std::memory_order_acquire);
+}
+
+int ares_audio_pcm_get(uint64_t idx, ares_audio_pcm_event_t* out) {
+    if (!out) return 0;
+    uint64_t total = g_ring.audio_pcm_idx.load(std::memory_order_acquire);
+    if (idx >= total) return 0;
+    if (total - idx > kAudioTaskCapacity) return 0;   /* evicted */
+
+    const auto& slot = g_ring.audio_pcm[idx & kAudioTaskMask];
+    *out = slot;
+    /* pcm events share idx with the audio-task event that built the
+     * output, and the pcm ring writes exactly one event per audio task
+     * (starting from task 0), so slot idx == ring position. */
+    if (out->idx != idx) return 0;
     return 1;
 }
 
