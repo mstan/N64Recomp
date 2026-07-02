@@ -52,6 +52,12 @@
  *     → {"ok":true,"pc":"0x..."}
  *   read_gpr {reg}               reg = 0..31 (MIPS R4300 register index)
  *     → {"ok":true,"reg":N,"value":"0x..."}
+ *   read_cp0 {reg}               reg = 0..31 (MIPS CP0 register index)
+ *     → {"ok":true,"reg":N,"value":"0x..."}
+ *   read_fpr {reg}               reg = 0..31 (COP1/FPU register index)
+ *     → {"ok":true,"reg":N,"value":"0x..."}
+ *   read_fpu_control {reg}       reg = 0 or 31 (FCR0/FCSR)
+ *     → {"ok":true,"reg":N,"value":"0x..."}
  *   quit
  *     → exits the server
  *
@@ -421,6 +427,64 @@ std::string handle(const std::string& line) {
             reg, (unsigned long long)v);
         return buf;
     }
+    if (cmd == "read_cp0") {
+        int reg = get_int(line, "reg", -1);
+        if (reg < 0 || reg > 31) {
+            return R"({"ok":false,"error":"reg out of range [0,31]"})";
+        }
+        uint64_t v = 0;
+        ares_status_t r = ares_read_cp0_register(reg, &v);
+        if (r != ARES_BRIDGE_OK) {
+            char buf[96];
+            std::snprintf(buf, sizeof(buf),
+                "{\"ok\":false,\"error\":\"ares_read_cp0_register status=%d\"}",
+                (int)r);
+            return buf;
+        }
+        char buf[96];
+        std::snprintf(buf, sizeof(buf),
+            "{\"ok\":true,\"reg\":%d,\"value\":\"0x%016llx\"}",
+            reg, (unsigned long long)v);
+        return buf;
+    }
+    if (cmd == "read_fpr") {
+        int reg = get_int(line, "reg", -1);
+        if (reg < 0 || reg > 31) {
+            return R"({"ok":false,"error":"reg out of range [0,31]"})";
+        }
+        uint64_t v = 0;
+        ares_status_t r = ares_read_fpr(reg, &v);
+        if (r != ARES_BRIDGE_OK) {
+            char buf[96];
+            std::snprintf(buf, sizeof(buf),
+                "{\"ok\":false,\"error\":\"ares_read_fpr status=%d\"}", (int)r);
+            return buf;
+        }
+        char buf[96];
+        std::snprintf(buf, sizeof(buf),
+            "{\"ok\":true,\"reg\":%d,\"value\":\"0x%016llx\"}",
+            reg, (unsigned long long)v);
+        return buf;
+    }
+    if (cmd == "read_fpu_control") {
+        int reg = get_int(line, "reg", -1);
+        if (reg != 0 && reg != 31) {
+            return R"({"ok":false,"error":"reg must be 0 or 31"})";
+        }
+        uint32_t v = 0;
+        ares_status_t r = ares_read_fpu_control(reg, &v);
+        if (r != ARES_BRIDGE_OK) {
+            char buf[96];
+            std::snprintf(buf, sizeof(buf),
+                "{\"ok\":false,\"error\":\"ares_read_fpu_control status=%d\"}",
+                (int)r);
+            return buf;
+        }
+        char buf[80];
+        std::snprintf(buf, sizeof(buf),
+            "{\"ok\":true,\"reg\":%d,\"value\":\"0x%08x\"}", reg, (unsigned)v);
+        return buf;
+    }
     if (cmd == "read_hi_lo") {
         uint64_t hi = 0;
         uint64_t lo = 0;
@@ -481,7 +545,65 @@ std::string handle(const std::string& line) {
                 (reg ? "," : ""), (unsigned long long)v);
             out += gbuf;
         }
-        out += "]}";
+        out += R"(],"cp0":[)";
+        for (int reg = 0; reg < 32; reg++) {
+            uint64_t v = 0;
+            r = ares_read_cp0_register(reg, &v);
+            if (r != ARES_BRIDGE_OK) {
+                char buf[112];
+                std::snprintf(buf, sizeof(buf),
+                    "{\"ok\":false,\"error\":\"ares_read_cp0_register "
+                    "reg=%d status=%d\"}",
+                    reg, (int)r);
+                return buf;
+            }
+            char cbuf[40];
+            std::snprintf(cbuf, sizeof(cbuf), "%s\"0x%016llx\"",
+                (reg ? "," : ""), (unsigned long long)v);
+            out += cbuf;
+        }
+        out += R"(],"fpr":[)";
+        for (int reg = 0; reg < 32; reg++) {
+            uint64_t v = 0;
+            r = ares_read_fpr(reg, &v);
+            if (r != ARES_BRIDGE_OK) {
+                char buf[112];
+                std::snprintf(buf, sizeof(buf),
+                    "{\"ok\":false,\"error\":\"ares_read_fpr "
+                    "reg=%d status=%d\"}",
+                    reg, (int)r);
+                return buf;
+            }
+            char fbuf[40];
+            std::snprintf(fbuf, sizeof(fbuf), "%s\"0x%016llx\"",
+                (reg ? "," : ""), (unsigned long long)v);
+            out += fbuf;
+        }
+        uint32_t fcr0 = 0;
+        uint32_t fcsr = 0;
+        r = ares_read_fpu_control(0, &fcr0);
+        if (r != ARES_BRIDGE_OK) {
+            char buf[112];
+            std::snprintf(buf, sizeof(buf),
+                "{\"ok\":false,\"error\":\"ares_read_fpu_control "
+                "reg=0 status=%d\"}",
+                (int)r);
+            return buf;
+        }
+        r = ares_read_fpu_control(31, &fcsr);
+        if (r != ARES_BRIDGE_OK) {
+            char buf[112];
+            std::snprintf(buf, sizeof(buf),
+                "{\"ok\":false,\"error\":\"ares_read_fpu_control "
+                "reg=31 status=%d\"}",
+                (int)r);
+            return buf;
+        }
+        char tail[96];
+        std::snprintf(tail, sizeof(tail),
+            R"(],"fcr0":"0x%08x","fcsr":"0x%08x"})",
+            (unsigned)fcr0, (unsigned)fcsr);
+        out += tail;
         return out;
     }
     if (cmd == "rsp_trace_set_enabled") {

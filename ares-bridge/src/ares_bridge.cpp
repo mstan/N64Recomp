@@ -74,6 +74,18 @@ ares_status_t ares_read_cpu_register(int, uint64_t *) {
     bridge_abort("ares_read_cpu_register");
 }
 
+ares_status_t ares_read_cp0_register(int, uint64_t *) {
+    bridge_abort("ares_read_cp0_register");
+}
+
+ares_status_t ares_read_fpr(int, uint64_t *) {
+    bridge_abort("ares_read_fpr");
+}
+
+ares_status_t ares_read_fpu_control(int, uint32_t *) {
+    bridge_abort("ares_read_fpu_control");
+}
+
 ares_status_t ares_read_pc(uint32_t *) {
     bridge_abort("ares_read_pc");
 }

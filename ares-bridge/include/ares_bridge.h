@@ -118,6 +118,15 @@ ares_status_t ares_step_instruction(void);
 /* Read a general-purpose register. `reg` is one of ARES_REG_*. */
 ares_status_t ares_read_cpu_register(int reg, uint64_t *out);
 
+/* Read a CP0 control register. `reg` is one of the MIPS CP0 register indices. */
+ares_status_t ares_read_cp0_register(int reg, uint64_t *out);
+
+/* Read a raw FPU register lane. */
+ares_status_t ares_read_fpr(int reg, uint64_t *out);
+
+/* Read a COP1 control register. Ares currently exposes FCR0 and FCR31. */
+ares_status_t ares_read_fpu_control(int reg, uint32_t *out);
+
 /* Read the program counter. */
 ares_status_t ares_read_pc(uint32_t *out);
 

@@ -566,6 +566,33 @@ ares_status_t ares_read_cpu_register(int reg, uint64_t *out) {
     return ARES_BRIDGE_OK;
 }
 
+ares_status_t ares_read_cp0_register(int reg, uint64_t *out) {
+    if (!out) return ARES_BRIDGE_INVALID_ARGUMENT;
+    if (reg < 0 || reg >= 32) return ARES_BRIDGE_INVALID_ARGUMENT;
+    std::lock_guard<std::mutex> lock(g_state_mutex);
+    if (!g_state.system_loaded) return ARES_BRIDGE_NOT_INITIALIZED;
+    *out = ares::Nintendo64::cpu.getControlRegister((uint8_t)reg);
+    return ARES_BRIDGE_OK;
+}
+
+ares_status_t ares_read_fpr(int reg, uint64_t *out) {
+    if (!out) return ARES_BRIDGE_INVALID_ARGUMENT;
+    if (reg < 0 || reg >= 32) return ARES_BRIDGE_INVALID_ARGUMENT;
+    std::lock_guard<std::mutex> lock(g_state_mutex);
+    if (!g_state.system_loaded) return ARES_BRIDGE_NOT_INITIALIZED;
+    *out = ares::Nintendo64::cpu.fpu.r[reg].u64;
+    return ARES_BRIDGE_OK;
+}
+
+ares_status_t ares_read_fpu_control(int reg, uint32_t *out) {
+    if (!out) return ARES_BRIDGE_INVALID_ARGUMENT;
+    if (reg != 0 && reg != 31) return ARES_BRIDGE_INVALID_ARGUMENT;
+    std::lock_guard<std::mutex> lock(g_state_mutex);
+    if (!g_state.system_loaded) return ARES_BRIDGE_NOT_INITIALIZED;
+    *out = ares::Nintendo64::cpu.getControlRegisterFPU((uint8_t)reg);
+    return ARES_BRIDGE_OK;
+}
+
 ares_status_t ares_read_pc(uint32_t *out) {
     if (!out) return ARES_BRIDGE_INVALID_ARGUMENT;
     std::lock_guard<std::mutex> lock(g_state_mutex);
