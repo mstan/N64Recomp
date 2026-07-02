@@ -54,3 +54,7 @@ cmake-build*
 /_build_target.bat
 /_build_rsp.bat
 /build_cli/
+
+# Ares bridge local build/probe output
+/build_ares_bridge/
+/ares-bridge/_*.log
