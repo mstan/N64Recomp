@@ -160,6 +160,44 @@ std::string render_events(const std::vector<ares_rsp_trace_event_t>& events) {
     return out;
 }
 
+bool is_recomp_order(const std::string& order) {
+    return order == "recomp" || order == "recomp_host" || order == "raw";
+}
+
+ares_status_t read_memory_ordered(
+    uint32_t addr,
+    uint8_t* dst,
+    size_t len,
+    const std::string& order)
+{
+    if (!is_recomp_order(order)) {
+        return ares_read_memory(addr, dst, len);
+    }
+
+    uint32_t paddr = addr & 0x1FFFFFFFu;
+    constexpr uint32_t kRdramSize = 8u * 1024u * 1024u;
+    if ((uint64_t)paddr + (uint64_t)len > kRdramSize) {
+        return ARES_BRIDGE_INVALID_ARGUMENT;
+    }
+
+    uint32_t first = paddr & ~3u;
+    uint32_t last = (uint32_t)(((uint64_t)paddr + (uint64_t)len + 3u) & ~3ull);
+    if (last > kRdramSize || last < first) {
+        return ARES_BRIDGE_INVALID_ARGUMENT;
+    }
+
+    std::vector<uint8_t> guest((size_t)(last - first), 0);
+    ares_status_t r = ares_read_memory(first, guest.data(), guest.size());
+    if (r != ARES_BRIDGE_OK) {
+        return r;
+    }
+    for (size_t i = 0; i < len; i++) {
+        uint32_t guest_paddr = (paddr + (uint32_t)i) ^ 3u;
+        dst[i] = guest[(size_t)(guest_paddr - first)];
+    }
+    return ARES_BRIDGE_OK;
+}
+
 std::string handle(const std::string& line) {
     auto cmd = get_str(line, "cmd");
     if (cmd.empty()) {
@@ -259,11 +297,12 @@ std::string handle(const std::string& line) {
     if (cmd == "read_memory") {
         uint32_t addr = get_uint(line, "addr", 0);
         int len = get_int(line, "len", 0);
+        std::string order = get_str(line, "order");
         if (len < 1 || len > 4096) {
             return R"({"ok":false,"error":"len out of range [1,4096]"})";
         }
         std::vector<uint8_t> bytes((size_t)len, 0);
-        ares_status_t r = ares_read_memory(addr, bytes.data(), (size_t)len);
+        ares_status_t r = read_memory_ordered(addr, bytes.data(), (size_t)len, order);
         if (r != ARES_BRIDGE_OK) {
             char buf[128];
             std::snprintf(buf, sizeof(buf),
@@ -287,6 +326,66 @@ std::string handle(const std::string& line) {
         }
         out += R"("})";
         return out;
+    }
+    if (cmd == "read_memory_digest") {
+        uint32_t addr = get_uint(line, "addr", 0);
+        int len = get_int(line, "len", 0);
+        std::string order = get_str(line, "order");
+        if (len < 1 || len > 0x40000) {
+            return R"({"ok":false,"error":"len out of range [1,262144]"})";
+        }
+        std::vector<uint8_t> bytes((size_t)len, 0);
+        ares_status_t r = read_memory_ordered(addr, bytes.data(), (size_t)len, order);
+        if (r != ARES_BRIDGE_OK) {
+            char buf[160];
+            std::snprintf(buf, sizeof(buf),
+                "{\"ok\":false,\"error\":\"ares_read_memory status=%d\","
+                "\"addr\":%u,\"len\":%d}",
+                (int)r, (unsigned)addr, len);
+            return buf;
+        }
+
+        bool seen[256] = {};
+        uint32_t unique = 0;
+        uint32_t nonzero = 0;
+        int first_nonzero = -1;
+        int last_nonzero = -1;
+        uint64_t fnv = 1469598103934665603ull;
+        std::string first_hex;
+        first_hex.reserve(128);
+        char tmp[4];
+        for (int i = 0; i < len; i++) {
+            const uint8_t b = bytes[(size_t)i];
+            if (i < 64) {
+                std::snprintf(tmp, sizeof(tmp), "%02x", (unsigned)b);
+                first_hex.append(tmp, 2);
+            }
+            if (!seen[b]) {
+                seen[b] = true;
+                unique++;
+            }
+            if (b != 0) {
+                nonzero++;
+                if (first_nonzero < 0) {
+                    first_nonzero = i;
+                }
+                last_nonzero = i;
+            }
+            fnv ^= b;
+            fnv *= 1099511628211ull;
+        }
+
+        char hash_buf[32];
+        std::snprintf(hash_buf, sizeof(hash_buf), "%016llx",
+            (unsigned long long)fnv);
+        return R"({"ok":true,"addr":)" + std::to_string(addr) +
+               R"(,"len":)" + std::to_string(len) +
+               R"(,"nonzero_bytes":)" + std::to_string(nonzero) +
+               R"(,"unique_bytes":)" + std::to_string(unique) +
+               R"(,"first_nonzero":)" + std::to_string(first_nonzero) +
+               R"(,"last_nonzero":)" + std::to_string(last_nonzero) +
+               R"(,"fnv64":")" + hash_buf +
+               R"(","first64":")" + first_hex + R"("})";
     }
     if (cmd == "read_pc") {
         uint32_t pc = 0;
@@ -321,6 +420,69 @@ std::string handle(const std::string& line) {
             "{\"ok\":true,\"reg\":%d,\"value\":\"0x%016llx\"}",
             reg, (unsigned long long)v);
         return buf;
+    }
+    if (cmd == "read_hi_lo") {
+        uint64_t hi = 0;
+        uint64_t lo = 0;
+        ares_status_t r = ares_read_hi_lo(&hi, &lo);
+        if (r != ARES_BRIDGE_OK) {
+            char buf[96];
+            std::snprintf(buf, sizeof(buf),
+                "{\"ok\":false,\"error\":\"ares_read_hi_lo status=%d\"}",
+                (int)r);
+            return buf;
+        }
+        char buf[128];
+        std::snprintf(buf, sizeof(buf),
+            "{\"ok\":true,\"hi\":\"0x%016llx\",\"lo\":\"0x%016llx\"}",
+            (unsigned long long)hi, (unsigned long long)lo);
+        return buf;
+    }
+    if (cmd == "read_cpu_state") {
+        uint32_t pc = 0;
+        uint64_t hi = 0;
+        uint64_t lo = 0;
+        ares_status_t r = ares_read_pc(&pc);
+        if (r != ARES_BRIDGE_OK) {
+            char buf[96];
+            std::snprintf(buf, sizeof(buf),
+                "{\"ok\":false,\"error\":\"ares_read_pc status=%d\"}", (int)r);
+            return buf;
+        }
+        r = ares_read_hi_lo(&hi, &lo);
+        if (r != ARES_BRIDGE_OK) {
+            char buf[96];
+            std::snprintf(buf, sizeof(buf),
+                "{\"ok\":false,\"error\":\"ares_read_hi_lo status=%d\"}",
+                (int)r);
+            return buf;
+        }
+
+        std::string out;
+        char hdr[160];
+        std::snprintf(hdr, sizeof(hdr),
+            "{\"ok\":true,\"pc\":\"0x%08x\",\"hi\":\"0x%016llx\","
+            "\"lo\":\"0x%016llx\",\"gpr\":[",
+            (unsigned)pc, (unsigned long long)hi, (unsigned long long)lo);
+        out = hdr;
+        for (int reg = 0; reg < 32; reg++) {
+            uint64_t v = 0;
+            r = ares_read_cpu_register(reg, &v);
+            if (r != ARES_BRIDGE_OK) {
+                char buf[112];
+                std::snprintf(buf, sizeof(buf),
+                    "{\"ok\":false,\"error\":\"ares_read_cpu_register "
+                    "reg=%d status=%d\"}",
+                    reg, (int)r);
+                return buf;
+            }
+            char gbuf[40];
+            std::snprintf(gbuf, sizeof(gbuf), "%s\"0x%016llx\"",
+                (reg ? "," : ""), (unsigned long long)v);
+            out += gbuf;
+        }
+        out += "]}";
+        return out;
     }
     if (cmd == "rsp_trace_set_enabled") {
         bool on = get_bool(line, "on", true);
