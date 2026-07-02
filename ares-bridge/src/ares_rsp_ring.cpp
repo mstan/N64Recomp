@@ -67,6 +67,13 @@ constexpr uint32_t kSlidingCapacity = 1u << 14;   // 16384
 constexpr uint32_t kSlidingMask     = kSlidingCapacity - 1;
 constexpr uint32_t kBootCapacity    = 1u << 15;   // 32768
 
+/* Audio-task ring: 8192 entries x ~4.1 KiB = ~34 MiB. At Stadium's
+ * ~58 audio tasks/sec that is ~2.3 minutes of coverage — enough that
+ * an attract-mode A/B session can drain once at the end rather than
+ * polling. */
+constexpr uint32_t kAudioTaskCapacity = 1u << 13; // 8192
+constexpr uint32_t kAudioTaskMask     = kAudioTaskCapacity - 1;
+
 struct RingState {
     /* Sliding ring storage. The seq field on each event matches the
      * write_idx value when written, allowing readers to detect an
@@ -90,9 +97,76 @@ struct RingState {
     /* Recording on/off. Defaults to enabled; consumers can toggle
      * via ares_rsp_trace_set_enabled(). */
     std::atomic<bool> enabled{true};
+
+    /* Audio-task ring (see ares_audio_task_event_t in the header).
+     * Same single-writer / seq-recheck protocol as the sliding ring. */
+    ares_audio_task_event_t audio_tasks[kAudioTaskCapacity] = {};
+    std::atomic<uint64_t> audio_task_idx{0};
+
+    /* Previous hook-fire PC, for task-start edge detection. Tasks boot
+     * at IMEM offset 0 (SP_PC is written 0x04001000 by osSpTaskStartGo)
+     * and nothing inside rspboot/aspMain jumps back there, so the
+     * 0 -> executing edge fires exactly once per task. */
+    uint32_t last_pc = 0xFFFFFFFFu;
 };
 
 RingState g_ring;
+
+/* Big-endian u32 out of RSP DMEM. The Byte accessor returns the byte
+ * stream in N64 wire order (same ordering ares_read_memory yields), so
+ * the byte at the lowest address is the MSB. */
+uint32_t dmem_read_u32(ares::Nintendo64::RSP* rsp, uint32_t off) {
+    uint32_t v = 0;
+    for (int i = 0; i < 4; i++) {
+        v = (v << 8) |
+            (uint8_t)rsp->dmem.read<ares::Nintendo64::Byte>(off + (uint32_t)i);
+    }
+    return v;
+}
+
+/* Audio-task capture: called from the hook at each task's first
+ * instruction. Reads the OSTask out of DMEM 0xFC0 (where osSpTaskLoad
+ * put it) and, for M_AUDTASK, snapshots the Acmd list bytes from RDRAM
+ * at exactly this moment — the CPU finished building the list before
+ * it started the task, and cannot touch it again until the task ends. */
+void record_audio_task_start(ares::Nintendo64::RSP* rsp, uint64_t instr_seq) {
+    constexpr uint32_t kOSTaskDmem = 0xFC0;
+    const uint32_t type = dmem_read_u32(rsp, kOSTaskDmem + 0x00);
+    if (type != 2 /* M_AUDTASK */) return;
+
+    uint64_t my_idx = g_ring.audio_task_idx.load(std::memory_order_relaxed);
+    ares_audio_task_event_t& ev = g_ring.audio_tasks[my_idx & kAudioTaskMask];
+    /* Publish-last protocol: write idx after the payload so readers'
+     * seq recheck catches a mid-overwrite read. Stamp a sentinel first. */
+    ev.idx = ~0ull;
+
+    ev.instr_seq        = instr_seq;
+    ev.task_type        = type;
+    ev.task_flags       = dmem_read_u32(rsp, kOSTaskDmem + 0x04);
+    ev.ucode            = dmem_read_u32(rsp, kOSTaskDmem + 0x10);
+    ev.ucode_data       = dmem_read_u32(rsp, kOSTaskDmem + 0x18);
+    ev.output_buff      = dmem_read_u32(rsp, kOSTaskDmem + 0x28);
+    ev.output_buff_size = dmem_read_u32(rsp, kOSTaskDmem + 0x2C);
+    ev.data_ptr         = dmem_read_u32(rsp, kOSTaskDmem + 0x30);
+    ev.data_size        = dmem_read_u32(rsp, kOSTaskDmem + 0x34);
+
+    uint32_t want = ev.data_size;
+    if (want > ARES_AUDIO_TASK_DATA_CAP) want = ARES_AUDIO_TASK_DATA_CAP;
+    auto& rdram = ares::Nintendo64::rdram;
+    uint32_t paddr = ev.data_ptr & 0x1FFFFFFFu;
+    if ((uint64_t)paddr + want > rdram.ram.size) {
+        want = 0;
+    }
+    for (uint32_t i = 0; i < want; i++) {
+        ev.data[i] = (uint8_t)rdram.ram.read<ares::Nintendo64::Byte>(
+            paddr + i, "oracle");
+    }
+    ev.captured_len = want;
+    ev.pad_ = 0;
+
+    ev.idx = my_idx;
+    g_ring.audio_task_idx.store(my_idx + 1, std::memory_order_release);
+}
 
 /* The hook itself. Reads RSP state via the Ares public-ish API and
  * writes one event into both rings.
@@ -166,6 +240,13 @@ void record_one_instruction(void* rsp_instance) {
         g_ring.boot[g_ring.boot_count] = ev;
         g_ring.boot_count++;
     }
+
+    /* Task-start edge: first instruction of a task boots at IMEM
+     * offset 0. Feed the audio-task ring (it filters non-audio). */
+    if (ev.pc == 0 && g_ring.last_pc != 0) {
+        record_audio_task_start(rsp, my_seq);
+    }
+    g_ring.last_pc = ev.pc;
 }
 
 /* Hook installation. Originally an anonymous-namespace static-init
@@ -238,6 +319,23 @@ void ares_rsp_trace_set_enabled(int enabled) {
 
 int ares_rsp_trace_is_enabled(void) {
     return g_ring.enabled.load(std::memory_order_relaxed) ? 1 : 0;
+}
+
+uint64_t ares_audio_task_count(void) {
+    ensure_hook_installed();
+    return g_ring.audio_task_idx.load(std::memory_order_acquire);
+}
+
+int ares_audio_task_get(uint64_t idx, ares_audio_task_event_t* out) {
+    if (!out) return 0;
+    uint64_t total = g_ring.audio_task_idx.load(std::memory_order_acquire);
+    if (idx >= total) return 0;
+    if (total - idx > kAudioTaskCapacity) return 0;   /* evicted */
+
+    const auto& slot = g_ring.audio_tasks[idx & kAudioTaskMask];
+    *out = slot;
+    if (out->idx != idx) return 0;                    /* torn / overwritten */
+    return 1;
 }
 
 } // extern "C"

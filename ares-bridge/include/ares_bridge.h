@@ -217,6 +217,49 @@ void ares_rsp_trace_set_enabled(int enabled);
 int  ares_rsp_trace_is_enabled(void);
 
 /* ------------------------------------------------------------------ */
+/* Audio-task ring (always-on, queryable)                             */
+/* ------------------------------------------------------------------ */
+
+/* Bytes of the Acmd command list captured per audio task. Stadium's
+ * aspMain lists run ~0x400 bytes in attract; 4 KiB leaves headroom for
+ * busier scenes without bloating the ring. */
+#define ARES_AUDIO_TASK_DATA_CAP 4096u
+
+/* One captured audio (M_AUDTASK) RSP task. Recorded by the RSP
+ * per-instruction hook at the task's FIRST instruction (boot-ucode
+ * entry, pc==0): at that instant the OSTask sits in DMEM 0xFC0 and
+ * the CPU has finished building the Acmd list at data_ptr, so the
+ * RDRAM snapshot is exact — no post-frame staleness.
+ *
+ * Stable layout: do NOT reorder fields. Consumers may serialize this
+ * over TCP / files. data[] is in N64 wire order (big-endian byte
+ * stream, same ordering ares_read_memory returns). */
+typedef struct {
+    uint64_t idx;              /* monotonic audio-task counter (0-based) */
+    uint64_t instr_seq;        /* rsp trace seq at the task's first instr */
+    uint32_t task_type;        /* OSTask.type (always 2 = M_AUDTASK)     */
+    uint32_t task_flags;
+    uint32_t ucode;            /* OSTask.ucode (guest vaddr)             */
+    uint32_t ucode_data;       /* OSTask.ucode_data                      */
+    uint32_t data_ptr;         /* OSTask.data_ptr — the Acmd list        */
+    uint32_t data_size;        /* OSTask.data_size (bytes)               */
+    uint32_t output_buff;
+    uint32_t output_buff_size;
+    uint32_t captured_len;     /* valid bytes in data[] =
+                                * min(data_size, ARES_AUDIO_TASK_DATA_CAP) */
+    uint32_t pad_;
+    uint8_t  data[ARES_AUDIO_TASK_DATA_CAP];
+} ares_audio_task_event_t;
+
+/* Total audio tasks recorded since process start (includes evicted). */
+uint64_t ares_audio_task_count(void);
+
+/* Fetch by absolute task index. Returns 1 on success, 0 if evicted
+ * from the sliding ring or not yet written. Tear-safe (same seq
+ * recheck protocol as ares_rsp_trace_get). */
+int ares_audio_task_get(uint64_t idx, ares_audio_task_event_t *out);
+
+/* ------------------------------------------------------------------ */
 /* Build / capability introspection                                   */
 /* ------------------------------------------------------------------ */
 

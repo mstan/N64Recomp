@@ -606,6 +606,77 @@ std::string handle(const std::string& line) {
         out += tail;
         return out;
     }
+    if (cmd == "audio_task_count") {
+        char buf[96];
+        std::snprintf(buf, sizeof(buf),
+            "{\"ok\":true,\"count\":%llu,\"event_size\":%zu}",
+            (unsigned long long)ares_audio_task_count(),
+            sizeof(ares_audio_task_event_t));
+        return buf;
+    }
+    if (cmd == "audio_task_get") {
+        uint64_t idx = get_uint(line, "idx", 0);
+        ares_audio_task_event_t ev{};
+        if (!ares_audio_task_get(idx, &ev)) {
+            return R"({"ok":false,"error":"idx evicted or not yet written"})";
+        }
+        char hdr[512];
+        int off = std::snprintf(hdr, sizeof(hdr),
+            "{\"ok\":true,\"idx\":%llu,\"instr_seq\":%llu,"
+            "\"type\":%u,\"flags\":%u,\"ucode\":%u,\"ucode_data\":%u,"
+            "\"data_ptr\":%u,\"data_size\":%u,"
+            "\"output_buff\":%u,\"output_buff_size\":%u,"
+            "\"captured_len\":%u,\"data\":\"",
+            (unsigned long long)ev.idx, (unsigned long long)ev.instr_seq,
+            ev.task_type, ev.task_flags, ev.ucode, ev.ucode_data,
+            ev.data_ptr, ev.data_size,
+            ev.output_buff, ev.output_buff_size, ev.captured_len);
+        std::string out(hdr, (size_t)off);
+        out.reserve(out.size() + (size_t)ev.captured_len * 2 + 8);
+        for (uint32_t i = 0; i < ev.captured_len; i++) {
+            char hb[3];
+            std::snprintf(hb, sizeof(hb), "%02x", (unsigned)ev.data[i]);
+            out.append(hb, 2);
+        }
+        out += R"("})";
+        return out;
+    }
+    if (cmd == "audio_task_dump") {
+        /* Dump ring entries [start, count) that are still resident, as
+         * raw ares_audio_task_event_t records. The A/B driver reads the
+         * binary file directly — far cheaper than hex-over-TCP for a
+         * whole attract session. */
+        std::string path = get_str(line, "path");
+        uint64_t start = get_uint(line, "start", 0);
+        if (path.empty()) {
+            return R"({"ok":false,"error":"missing path"})";
+        }
+        FILE* f = std::fopen(path.c_str(), "wb");
+        if (!f) {
+            return R"({"ok":false,"error":"fopen failed"})";
+        }
+        uint64_t total = ares_audio_task_count();
+        uint64_t written = 0;
+        uint64_t first_written = 0;
+        for (uint64_t i = start; i < total; i++) {
+            ares_audio_task_event_t ev{};
+            if (!ares_audio_task_get(i, &ev)) continue;   /* evicted */
+            if (std::fwrite(&ev, sizeof(ev), 1, f) == 1) {
+                if (written == 0) first_written = i;
+                written++;
+            }
+        }
+        std::fclose(f);
+        char buf[192];
+        std::snprintf(buf, sizeof(buf),
+            "{\"ok\":true,\"written\":%llu,\"first_idx\":%llu,"
+            "\"count\":%llu,\"event_size\":%zu}",
+            (unsigned long long)written,
+            (unsigned long long)first_written,
+            (unsigned long long)total,
+            sizeof(ares_audio_task_event_t));
+        return buf;
+    }
     if (cmd == "rsp_trace_set_enabled") {
         bool on = get_bool(line, "on", true);
         ares_rsp_trace_set_enabled(on ? 1 : 0);
