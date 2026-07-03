@@ -98,6 +98,18 @@ ares_status_t ares_read_memory(uint32_t, void *, size_t) {
     bridge_abort("ares_read_memory");
 }
 
+ares_status_t ares_write_memory(uint32_t, const void *, size_t) {
+    bridge_abort("ares_write_memory");
+}
+
+ares_status_t ares_rsp_set_state(const uint32_t *, uint32_t, uint32_t, uint32_t) {
+    bridge_abort("ares_rsp_set_state");
+}
+
+ares_status_t ares_rsp_run_until_halt(uint32_t, uint32_t *) {
+    bridge_abort("ares_rsp_run_until_halt");
+}
+
 ares_status_t ares_set_controller(int, const ares_input_t *) {
     bridge_abort("ares_set_controller");
 }

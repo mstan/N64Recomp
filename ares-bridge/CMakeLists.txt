@@ -288,6 +288,22 @@ if(WITH_ARES_BRIDGE)
             FOLDER "ares-bridge/server"
         )
     endif()
+
+    # Single-task aspMain replay oracle (diffs recompiled-RSP audio vs ares).
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/server/ares_replay.cpp")
+        add_executable(ares_replay
+            server/ares_replay.cpp
+        )
+        target_link_libraries(ares_replay PRIVATE
+            ares_bridge
+        )
+        target_compile_features(ares_replay PRIVATE
+            cxx_std_20
+        )
+        set_target_properties(ares_replay PROPERTIES
+            FOLDER "ares-bridge/server"
+        )
+    endif()
 else()
     message(STATUS "ares-bridge: placeholder mode (set -DWITH_ARES_BRIDGE=ON to "
                    "enable real Ares integration)")

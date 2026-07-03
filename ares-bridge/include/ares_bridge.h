@@ -139,6 +139,29 @@ ares_status_t ares_read_hi_lo(uint64_t *hi, uint64_t *lo);
 ares_status_t ares_read_memory(uint32_t vaddr, void *buf, size_t len);
 
 /* ------------------------------------------------------------------ */
+/* Single-task RSP replay (oracle): inject state + run one task        */
+/* ------------------------------------------------------------------ */
+
+/* Write N bytes into a physical region (symmetric to ares_read_memory):
+ *   paddr 0x00000000-0x007FFFFF : RDRAM
+ *   paddr 0x04000000-0x04000FFF : RSP DMEM
+ *   paddr 0x04001000-0x04001FFF : RSP IMEM
+ * `vaddr` is masked to physical (KSEG0/1 alias). */
+ares_status_t ares_write_memory(uint32_t vaddr, const void *buf, size_t len);
+
+/* Set the RSP scalar register file (gpr[0] ignored — r0 is hardwired 0) and
+ * PC (IMEM-relative, 12-bit significant), clear halted/broken, and reset the
+ * branch unit, so the next ares_rsp_run_until_halt() begins executing the
+ * injected microcode from `pc`. */
+ares_status_t ares_rsp_set_state(const uint32_t gpr[32], uint32_t pc,
+                                 uint32_t dma_mem, uint32_t dma_dram);
+
+/* Run the RSP from its current injected state until it halts (BREAK), pumping
+ * DMA each step and draining in-flight DMA at the end. `max_steps` bounds a
+ * runaway. `*out_steps` (optional) receives the instruction count. */
+ares_status_t ares_rsp_run_until_halt(uint32_t max_steps, uint32_t *out_steps);
+
+/* ------------------------------------------------------------------ */
 /* Input                                                              */
 /* ------------------------------------------------------------------ */
 
